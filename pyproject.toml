@@ -16,3 +16,19 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E",  # 기본 스타일 오류
+    "F",  # 미사용 import, 정의되지 않은 이름 등 실수
+    "I",  # import 정렬
+    "B",  # 흔한 파이썬 함정
+]
+
+[tool.ruff.format]
+quote-style = "double"
