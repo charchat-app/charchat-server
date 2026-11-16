@@ -1,0 +1,26 @@
+name: charchat
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: charchat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER를 .env에 설정하세요}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD를 .env에 설정하세요}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB를 .env에 설정하세요}
+    ports:
+      # 로컬에서만 접근 가능하도록 loopback에만 바인딩
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # 데이터는 프로젝트 폴더가 아니라 Docker가 관리하는 named volume에 저장
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+    name: charchat_pgdata

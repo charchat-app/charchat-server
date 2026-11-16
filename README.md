@@ -49,13 +49,36 @@ tests/
 
 ## 실행
 
+사전 준비: Docker Desktop 실행 (Windows는 WSL2 백엔드 사용).
+
+**macOS / Linux**
 ```bash
-python -m venv .venv && source .venv/bin/activate
+cp .env.example .env              # 값 수정 (.env는 git에 올라가지 않음)
+docker compose up -d              # Postgres 기동
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env
 uvicorn app.main:app --reload
 pytest
 ```
+
+**Windows (PowerShell)**
+```powershell
+Copy-Item .env.example .env       # 값 수정 (.env는 git에 올라가지 않음)
+docker compose up -d              # Postgres 기동
+py -m venv .venv; .venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+uvicorn app.main:app --reload
+pytest
+```
+
+### Postgres (docker compose)
+
+- 이미지: `postgres:17`, 로컬 포트는 `127.0.0.1:${POSTGRES_PORT}`에만 연다.
+- 데이터는 Docker가 관리하는 named volume `charchat_pgdata`에 저장된다. 프로젝트 폴더에는 아무것도 쌓이지 않는다.
+- 접속 정보와 비밀번호는 `.env`에서만 읽는다. `.env`는 `.gitignore` 대상이다.
+- 중지: `docker compose down` (데이터 유지). 데이터까지 삭제: `docker compose down -v`.
+- 비밀번호를 바꿔도 기존 볼륨의 DB 비밀번호는 바뀌지 않는다. 바꾸려면 볼륨을 지우고 다시 띄우거나 DB 안에서 `ALTER USER`를 실행한다.
+- 다른 프로젝트가 5432를 쓰고 있으면 `.env`의 `POSTGRES_PORT`와 `DATABASE_URL`의 포트를 함께 바꾼다.
 
 ## 미정 사항
 
