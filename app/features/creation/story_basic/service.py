@@ -180,7 +180,7 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
                     ),
                 )
             )
-        key = name_compare_key(tag)
+        key = name_compare_key(strip_tag_mark(tag.strip()))
         if key and key in seen:
             issues.append(
                 FieldIssue(
@@ -198,9 +198,22 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
     return issues
 
 
+def strip_tag_mark(text: str) -> str:
+    """앞쪽 해시 기호(#)를 뗀다. '#로맨스'·'##로맨스' → '로맨스'.
+
+    #은 해시태그를 나타내는 표시일 뿐 태그 내용이 아니므로 저장·비교·검색 전에 뗀다.
+    그 밖의 원문(공백·대소문자)은 바꾸지 않는다.
+    """
+    return text.lstrip("#")
+
+
 def _dedupe(names: list[str]) -> list[str]:
-    """완전히 같은 표기만 하나로 합친다. 원문을 trim·대소문자 변환하지 않는다."""
-    return list(dict.fromkeys(names))
+    """앞쪽 #을 떼고, 완전히 같은 표기만 하나로 합친다. 원문을 trim·대소문자 변환하지 않는다.
+
+    '#'만 입력한 값은 떼고 나면 빈 문자열이라 태그로 저장하지 않는다.
+    """
+    stripped = [strip_tag_mark(n) for n in names]
+    return list(dict.fromkeys(s for s, n in zip(stripped, names, strict=True) if s or not n))
 
 
 def _to_response(conn: Connection, row: repo.Row) -> StoryResponse:
@@ -319,7 +332,7 @@ def suggest_tags(conn: Connection, query: str) -> list[TagSuggestionResponse]:
 
     대소문자·띄어쓰기를 무시한 비교 키의 앞부분 일치, 공개 스토리 수 많은 순.
     """
-    key = name_compare_key(query)
+    key = name_compare_key(strip_tag_mark(query.strip()))
     if key == "":
         return []
     rows = repo.suggest_tags(conn, key, TAG_SUGGESTION_LIMIT)
@@ -331,7 +344,7 @@ def search_public_stories_by_tag(conn: Connection, tag: str) -> list[PublicStory
 
     노출 순위·비중은 탐색 기능에서 정한다.
     """
-    key = name_compare_key(tag)
+    key = name_compare_key(strip_tag_mark(tag.strip()))
     if key == "":
         return []
     rows = repo.list_public_stories_by_tag(conn, key, TAG_SEARCH_LIMIT)

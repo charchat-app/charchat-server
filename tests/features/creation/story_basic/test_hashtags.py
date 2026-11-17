@@ -336,3 +336,30 @@ def test_omitted_tags_are_still_checked_on_completed_story(
     res = client.put(f"{URL}/{story['id']}", json=VALID, headers=OWNER)
     assert res.status_code == 422
     assert "TAG_TOO_LONG" in {i["code"] for i in res.json()["issues"]}
+
+
+# ---- 해시 기호(#) 처리: 표시 기호라 저장·비교·검색 전에 뗀다 ----
+
+
+def test_leading_hash_is_removed_before_saving(client: TestClient) -> None:
+    story = _create(client, ["#로맨스", "##판타지", "#", "로맨스"])
+    # '#로맨스'와 '로맨스'는 같은 태그, '#'만 입력한 값은 저장하지 않는다
+    assert story["tags"] == ["로맨스", "판타지"]
+    assert story["issues"] == []
+
+
+def test_hash_does_not_count_toward_tag_length(client: TestClient) -> None:
+    story = _create(client, ["#가나다라마바사아자차"])  # # 빼고 10자
+    assert story["tags"] == ["가나다라마바사아자차"]
+    assert story["issues"] == []
+
+
+def test_hash_in_suggestion_and_search_queries(client: TestClient, db: psycopg.Connection) -> None:
+    sid = _create(client, ["로맨스"])["id"]
+    _publish(db, sid)
+    assert client.get(TAGS, params={"q": "#로"}, headers=OWNER).json() == [
+        {"name": "로맨스", "public_story_count": 1}
+    ]
+    found = client.get(f"{TAGS}/stories", params={"tag": "#로맨스"}, headers=OWNER).json()
+    assert [s["id"] for s in found] == [sid]
+    assert client.get(TAGS, params={"q": "#"}, headers=OWNER).json() == []
