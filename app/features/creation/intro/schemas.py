@@ -4,6 +4,7 @@ from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
+from app.features.creation.initial_state.schemas import IntroScene
 from app.features.creation.speech_style.fewshot_schemas import ClientKey, DbId, FewshotMessage
 
 MAX_INTROS = 5
@@ -19,6 +20,8 @@ class Intro(BaseModel):
     title: str | None = None
     # 말풍선 형식은 2번 퓨샷과 같다.
     messages: list[FewshotMessage]
+    # CREATE-US-04 이 인트로의 시작 장면. 누락하면 거절해 실수로 장면을 지우지 않는다.
+    scene: IntroScene
 
     @field_validator("title")
     @classmethod

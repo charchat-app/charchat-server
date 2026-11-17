@@ -1,9 +1,10 @@
-"""2·3번 조각을 저장 상태와 함께 하나의 트랜잭션에 반영한다."""
+"""2·3·4번 조각을 저장 상태와 함께 하나의 트랜잭션에 반영한다."""
 
 import hashlib
 import json
 
 from app.features.creation.common.errors import app_error
+from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import service as intro_service
 from app.features.creation.save_visibility.schemas import CreationSaveResponse
 from app.features.creation.speech_style import fewshot_service, repository
@@ -18,6 +19,8 @@ def response(
     people=None,
     request_id=None,
     intros=None,
+    relations=None,
+    affinities=None,
 ):
     few = (
         fewshot_service.read_snapshot(connection, story)
@@ -29,6 +32,12 @@ def response(
         **few.model_dump(),
         expression=ExpressionFields(**fields) if fields else DEFAULT_EXPRESSION,
         intros=intro_service.read_intros(connection, story["id"]) if intros is None else intros,
+        relations=initial_state.read_relations(connection, story["id"])
+        if relations is None
+        else relations,
+        affinities=initial_state.read_affinities(connection, story["id"])
+        if affinities is None
+        else affinities,
     )
 
 
@@ -47,6 +56,7 @@ def validate_completed(connection, story_id, body):
     if sum(len(m.body or "") for g in body.fewshots for m in g.messages) > 2000:
         raise app_error(422, "FEWSHOTS_TOO_LONG", "퓨샷 전체를 2000자 이내로 작성해 주세요.")
     intro_service.validate_completed(body.intros)
+    initial_state.validate_completed(body.intros, body.relations, body.affinities)
     basic = connection.execute(
         "SELECT title,subtitle,world_description FROM stories WHERE id=%s", (story_id,)
     ).fetchone()
@@ -116,6 +126,12 @@ def save_creation(connection, story_id, owner_id, request_id, body):
         groups, people = fewshot_service.write_fewshots(connection, story_id, body)
         character_ids = {p["id"] for p in people}
         intros = intro_service.write_intros(connection, story_id, body.intros, character_ids)
+        relations = initial_state.write_relations(
+            connection, story_id, body.relations, character_ids
+        )
+        affinities = initial_state.write_affinities(
+            connection, story_id, body.affinities, character_ids
+        )
         repository.write_expression(connection, story_id, body.expression.model_dump(mode="json"))
         story.update(
             connection.execute(
@@ -123,7 +139,9 @@ def save_creation(connection, story_id, owner_id, request_id, body):
                 (target, story_id),
             ).fetchone()
         )
-        result = response(connection, story, groups, people, request_id, intros)
+        result = response(
+            connection, story, groups, people, request_id, intros, relations, affinities
+        )
         repository.remember_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )
