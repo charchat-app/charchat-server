@@ -12,15 +12,21 @@ from app.features.creation.story_basic.schemas import (
     CharacterResponse,
     CharacterWriteItem,
     FieldIssue,
+    PublicStorySummaryResponse,
     StoryCreateRequest,
     StoryResponse,
     StorySummaryResponse,
     StoryUpdateRequest,
+    TagSuggestionResponse,
 )
 
 DRAFT = "draft"
 MIN_CHARACTERS = 1
 MAX_CHARACTERS = 10
+MAX_TAGS = 10
+MAX_TAG_LENGTH = 10
+TAG_SUGGESTION_LIMIT = 20
+TAG_SEARCH_LIMIT = 50
 
 # 해시태그는 선택 입력이라 여기에 없다 (CREATE-US-01-AC06).
 REQUIRED_BASIC_FIELDS = {
@@ -133,6 +139,61 @@ def collect_character_issues(characters: list[CharacterDraft]) -> list[FieldIssu
     return issues
 
 
+def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
+    """해시태그 등록 조건 검사. 해시태그는 선택 입력이라 0개는 문제가 아니다 (AC06).
+
+    - AC15: 최대 10개 (태그 길이 제한과 별개)
+    - AC13: 태그 하나당 10자. 공백 포함 원문 글자 수(유니코드 코드 포인트)로 센다.
+      이모지·결합 문자의 글자 단위는 미결이라 코드 포인트 기준을 임시로 쓴다.
+    - 빈 태그(공백만 있는 값)는 유효한 태그가 아니다.
+    - 대소문자·띄어쓰기만 다른 태그(예: Romance·romance)는 같은 태그라 한 스토리에 한 번만 쓴다.
+    `tags[i]`의 i는 같은 표기를 합친(_dedupe) 목록 기준이다.
+    """
+    issues: list[FieldIssue] = []
+    if len(tags) > MAX_TAGS:
+        issues.append(
+            FieldIssue(
+                field="tags",
+                code="TAG_COUNT_EXCEEDED",
+                message=(
+                    f"해시태그는 최대 {MAX_TAGS}개까지 등록할 수 있습니다. (현재 {len(tags)}개)"
+                ),
+            )
+        )
+    seen: dict[str, int] = {}
+    for i, tag in enumerate(tags):
+        if _is_blank(tag):
+            issues.append(
+                FieldIssue(field=f"tags[{i}]", code="TAG_BLANK", message="빈 해시태그입니다.")
+            )
+        elif len(tag) > MAX_TAG_LENGTH:
+            issues.append(
+                FieldIssue(
+                    field=f"tags[{i}]",
+                    code="TAG_TOO_LONG",
+                    message=(
+                        f"'{tag}'는 {len(tag)}자예요. "
+                        f"해시태그는 {MAX_TAG_LENGTH}자까지 쓸 수 있습니다."
+                    ),
+                )
+            )
+        key = name_compare_key(tag)
+        if key and key in seen:
+            issues.append(
+                FieldIssue(
+                    field=f"tags[{i}]",
+                    code="TAG_DUPLICATE",
+                    message=(
+                        f"'{tag}'는 '{tags[seen[key]]}'와 같은 태그로 취급됩니다. "
+                        "영문 대소문자와 띄어쓰기는 구분하지 않습니다."
+                    ),
+                )
+            )
+        else:
+            seen.setdefault(key, i)
+    return issues
+
+
 def _dedupe(names: list[str]) -> list[str]:
     """완전히 같은 표기만 하나로 합친다. 원문을 trim·대소문자 변환하지 않는다."""
     return list(dict.fromkeys(names))
@@ -142,13 +203,15 @@ def _to_response(conn: Connection, row: repo.Row) -> StoryResponse:
     characters = [CharacterResponse(**c) for c in repo.list_characters(conn, row["id"])]
     issues = collect_basic_issues(row["title"], row["subtitle"], row["world_description"])
     issues += collect_character_issues([CharacterDraft(c.name, c.description) for c in characters])
+    tags = repo.list_story_tags(conn, row["id"])
+    issues += collect_tag_issues(tags)
     return StoryResponse(
         id=row["id"],
         save_state=row["save_state"],
         title=row["title"],
         subtitle=row["subtitle"],
         world_description=row["world_description"],
-        tags=repo.list_story_tags(conn, row["id"]),
+        tags=tags,
         characters=characters,
         saved_at=row["saved_at"],
         issues=issues,
@@ -228,8 +291,10 @@ def update_story(
             ]
         else:
             characters = [CharacterDraft(c.name, c.description) for c in req.characters]
+        tags = repo.list_story_tags(conn, story_id) if req.tags is None else _dedupe(req.tags)
         issues = collect_basic_issues(req.title, req.subtitle, req.world_description)
         issues += collect_character_issues(characters)
+        issues += collect_tag_issues(tags)
         if story["save_state"] != DRAFT and issues:
             raise StoryIncompleteError(
                 "공개·비공개로 저장한 스토리는 저장 조건을 모두 충족해야 저장할 수 있습니다.",
@@ -239,7 +304,31 @@ def update_story(
             conn, story_id, req.title, req.subtitle, req.world_description
         )
         if req.tags is not None:
-            repo.replace_story_tags(conn, story_id, _dedupe(req.tags))
+            repo.replace_story_tags(conn, story_id, tags)
         if req.characters is not None:
             _sync_characters(conn, story_id, req.characters)
         return _to_response(conn, row)
+
+
+def suggest_tags(conn: Connection, query: str) -> list[TagSuggestionResponse]:
+    """AC17: 제작 화면의 해시태그 자동검색.
+
+    대소문자·띄어쓰기를 무시한 비교 키의 앞부분 일치, 공개 스토리 수 많은 순.
+    """
+    key = name_compare_key(query)
+    if key == "":
+        return []
+    rows = repo.suggest_tags(conn, key, TAG_SUGGESTION_LIMIT)
+    return [TagSuggestionResponse(**r) for r in rows]
+
+
+def search_public_stories_by_tag(conn: Connection, tag: str) -> list[PublicStorySummaryResponse]:
+    """AC16: 해시태그로 공개 스토리를 찾는다. 대소문자·띄어쓰기를 무시하고 같은 태그로 본다.
+
+    노출 순위·비중은 탐색 기능에서 정한다.
+    """
+    key = name_compare_key(tag)
+    if key == "":
+        return []
+    rows = repo.list_public_stories_by_tag(conn, key, TAG_SEARCH_LIMIT)
+    return [PublicStorySummaryResponse(**r) for r in rows]
