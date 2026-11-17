@@ -8,7 +8,11 @@ class Settings(BaseSettings):
 
     app_name: str = "charchat-server"
     api_prefix: str = "/api/v1"
-    database_url: str | None = None  # DB 선택 확정 전까지 비워 둔다
+    database_url: str | None = None
+    # pytest 전용 DB. 이름이 _test로 끝나야 하며 테스트가 스키마를 지우고 다시 만든다.
+    test_database_url: str | None = None
+    # 브라우저에서 API를 부를 수 있는 출처. 기본값은 Expo 웹 개발 서버.
+    cors_origins: list[str] = ["http://localhost:8081"]
 
 
 settings = Settings()
