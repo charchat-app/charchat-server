@@ -201,7 +201,7 @@ def test_search_public_stories_by_tag_CREATE_US_01_AC16(
         _publish(db, sid)
     _publish(db, private, "private")
 
-    res = client.get(f"{TAGS}/로맨스/stories", headers=OWNER)
+    res = client.get(f"{TAGS}/stories", params={"tag": "로맨스"}, headers=OWNER)
     assert res.status_code == 200
     body = res.json()
     assert [s["id"] for s in body] == [second, first]  # 최근 저장 순, 다른 사용자 공개분 포함
@@ -213,7 +213,7 @@ def test_search_matches_exact_tag_only_CREATE_US_01_AC16(
     client: TestClient, db: psycopg.Connection
 ) -> None:
     _publish(db, _create(client, ["로맨스판타지"])["id"])
-    assert client.get(f"{TAGS}/로맨스/stories", headers=OWNER).json() == []
+    assert client.get(f"{TAGS}/stories", params={"tag": "로맨스"}, headers=OWNER).json() == []
 
 
 # ---- 태그 동일성: 대소문자·띄어쓰기는 같은 태그로 묶는다 (저장은 원문) ----
@@ -255,9 +255,15 @@ def test_search_ignores_case_and_spaces_CREATE_US_01_AC16(
     for sid in (upper, lower, spaced):
         _publish(db, sid)
 
-    found = [s["id"] for s in client.get(f"{TAGS}/romance/stories", headers=OWNER).json()]
+    found = [
+        s["id"]
+        for s in client.get(f"{TAGS}/stories", params={"tag": "romance"}, headers=OWNER).json()
+    ]
     assert sorted(found) == sorted([upper, lower])
-    found = [s["id"] for s in client.get(f"{TAGS}/판타지로맨스/stories", headers=OWNER).json()]
+    found = [
+        s["id"]
+        for s in client.get(f"{TAGS}/stories", params={"tag": "판타지로맨스"}, headers=OWNER).json()
+    ]
     assert found == [spaced]
 
 
@@ -272,3 +278,61 @@ def test_same_key_twice_in_one_story_is_reported(client: TestClient) -> None:
     story = _create(client, ["Romance", "로맨스", "romance"])
     assert _issues(story) == {f"tags[{story['tags'].index('romance')}]": {"TAG_DUPLICATE"}}
     assert set(story["tags"]) == {"Romance", "로맨스", "romance"}  # 원문은 보존
+
+
+# ---- 리뷰 반영: 태그 안내에 원문, '/' 포함 태그 검색, 완성 저장 거절 경로 ----
+
+
+def test_tag_issues_carry_original_value(client: TestClient, db: psycopg.Connection) -> None:
+    """저장 응답(서버 순서)과 거절 응답(요청 순서)의 tags[i]가 달라도 value로 같은 태그를 찾는다."""
+    long_tag = "가나다라마바사아자차카"
+    _publish(db, _create(client, ["로맨스"])["id"])  # '로맨스' tags 행을 먼저 만든다
+    story = _create(client, [long_tag, "로맨스"])
+    draft_issue = next(i for i in story["issues"] if i["code"] == "TAG_TOO_LONG")
+    assert draft_issue["value"] == long_tag
+
+    _publish(db, story["id"], "private")
+    res = client.put(
+        f"{URL}/{story['id']}", json={**VALID, "tags": [long_tag, "로맨스"]}, headers=OWNER
+    )
+    rejected = next(i for i in res.json()["issues"] if i["code"] == "TAG_TOO_LONG")
+    assert rejected["value"] == long_tag
+
+
+def test_search_tag_with_slash_CREATE_US_01_AC16(
+    client: TestClient, db: psycopg.Connection
+) -> None:
+    sid = _create(client, ["BL/GL"])["id"]
+    _publish(db, sid)
+    res = client.get(f"{TAGS}/stories", params={"tag": "BL/GL"}, headers=OWNER)
+    assert [s["id"] for s in res.json()] == [sid]
+
+
+@pytest.mark.parametrize(
+    ("tags", "code"),
+    [
+        (["Romance", "romance"], "TAG_DUPLICATE"),
+        (["  "], "TAG_BLANK"),
+        ([f"태그{i}" for i in range(11)], "TAG_COUNT_EXCEEDED"),
+    ],
+)
+def test_completed_story_rejects_invalid_tags(
+    client: TestClient, db: psycopg.Connection, tags: list[str], code: str
+) -> None:
+    story = _create(client, ["로맨스"])
+    _publish(db, story["id"])
+    res = client.put(f"{URL}/{story['id']}", json={**VALID, "tags": tags}, headers=OWNER)
+    assert res.status_code == 422
+    assert code in {i["code"] for i in res.json()["issues"]}
+    assert client.get(f"{URL}/{story['id']}", headers=OWNER).json()["tags"] == ["로맨스"]
+
+
+def test_omitted_tags_are_still_checked_on_completed_story(
+    client: TestClient, db: psycopg.Connection
+) -> None:
+    """tags를 생략한 저장도 저장돼 있던 오류 태그로 검사한다."""
+    story = _create(client, ["가나다라마바사아자차카"])
+    _publish(db, story["id"], "private")
+    res = client.put(f"{URL}/{story['id']}", json=VALID, headers=OWNER)
+    assert res.status_code == 422
+    assert "TAG_TOO_LONG" in {i["code"] for i in res.json()["issues"]}

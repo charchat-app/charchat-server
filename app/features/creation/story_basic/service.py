@@ -147,7 +147,7 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
       이모지·결합 문자의 글자 단위는 미결이라 코드 포인트 기준을 임시로 쓴다.
     - 빈 태그(공백만 있는 값)는 유효한 태그가 아니다.
     - 대소문자·띄어쓰기만 다른 태그(예: Romance·romance)는 같은 태그라 한 스토리에 한 번만 쓴다.
-    `tags[i]`의 i는 같은 표기를 합친(_dedupe) 목록 기준이다.
+    `tags[i]`의 i는 넘겨받은 목록 기준이라 응답마다 다를 수 있다. 태그는 `value`(원문)로 찾는다.
     """
     issues: list[FieldIssue] = []
     if len(tags) > MAX_TAGS:
@@ -164,13 +164,16 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
     for i, tag in enumerate(tags):
         if _is_blank(tag):
             issues.append(
-                FieldIssue(field=f"tags[{i}]", code="TAG_BLANK", message="빈 해시태그입니다.")
+                FieldIssue(
+                    field=f"tags[{i}]", code="TAG_BLANK", message="빈 해시태그입니다.", value=tag
+                )
             )
         elif len(tag) > MAX_TAG_LENGTH:
             issues.append(
                 FieldIssue(
                     field=f"tags[{i}]",
                     code="TAG_TOO_LONG",
+                    value=tag,
                     message=(
                         f"'{tag}'는 {len(tag)}자예요. "
                         f"해시태그는 {MAX_TAG_LENGTH}자까지 쓸 수 있습니다."
@@ -183,6 +186,7 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
                 FieldIssue(
                     field=f"tags[{i}]",
                     code="TAG_DUPLICATE",
+                    value=tag,
                     message=(
                         f"'{tag}'는 '{tags[seen[key]]}'와 같은 태그로 취급됩니다. "
                         "영문 대소문자와 띄어쓰기는 구분하지 않습니다."

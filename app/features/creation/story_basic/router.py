@@ -54,9 +54,14 @@ def suggest_tags(
     return service.suggest_tags(conn, q)
 
 
-@router.get("/tags/{tag}/stories", response_model=list[PublicStorySummaryResponse])
+@router.get("/tags/stories", response_model=list[PublicStorySummaryResponse])
 def search_stories_by_tag(
-    tag: str, user_id: CurrentUserId, conn: DbConn
+    tag: Annotated[str, Query(min_length=1, max_length=100, description="찾을 해시태그")],
+    user_id: CurrentUserId,
+    conn: DbConn,
 ) -> list[PublicStorySummaryResponse]:
-    """해시태그가 붙은 공개 스토리 (CREATE-US-01-AC16). 화면은 탐색 기능에서 연결한다."""
+    """해시태그가 붙은 공개 스토리 (CREATE-US-01-AC16). 화면은 탐색 기능에서 연결한다.
+
+    태그에 '/' 등이 들어가도 찾을 수 있게 경로가 아니라 쿼리(?tag=)로 받는다.
+    """
     return service.search_public_stories_by_tag(conn, tag)

@@ -69,6 +69,14 @@ class FieldIssue(BaseModel):
     field: str = Field(description="문제가 있는 필드. 예: title, characters[0].name")
     code: str = Field(description="프론트 분기용 코드. 예: REQUIRED")
     message: str
+    value: str | None = Field(
+        default=None,
+        description=(
+            "문제가 된 값의 원문. 해시태그 안내에 넣는다. tags[i]의 i는 응답마다 "
+            "순서 기준이 다를 수 있으므로(저장 응답은 서버 순서, 거절 응답은 요청 순서) "
+            "이 값으로 태그를 찾는다."
+        ),
+    )
 
 
 class StorySummaryResponse(BaseModel):
