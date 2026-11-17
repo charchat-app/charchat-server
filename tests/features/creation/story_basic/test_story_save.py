@@ -13,6 +13,8 @@ FULL = {
     "subtitle": "밤에만 문을 여는 서점의 비밀",
     "world_description": "도시 골목 끝, 자정에만 열리는 서점이 있다.\n주인은 말이 없다.",
     "tags": ["로맨스", "판타지"],
+    # 캐릭터 조건(1명 이상)을 충족해 기본 정보 검사만 보이게 한다. 캐릭터 검사는 test_characters.py
+    "characters": [{"name": "서윤", "description": "서점 주인. 말수가 적다."}],
 }
 
 
@@ -106,7 +108,7 @@ def test_whitespace_only_is_missing_and_kept_as_is_CREATE_US_01_AC02(client: Tes
 
 def test_empty_draft_is_saved_with_all_issues_CREATE_US_01_AC02(client: TestClient) -> None:
     story = _create(client, {})
-    assert _issue_fields(story) == {"title", "subtitle", "world_description"}
+    assert _issue_fields(story) == {"title", "subtitle", "world_description", "characters"}
 
 
 def test_completed_story_rejects_missing_required_and_keeps_saved_CREATE_US_01_AC02(

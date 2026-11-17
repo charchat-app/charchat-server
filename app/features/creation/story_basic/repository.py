@@ -81,3 +81,52 @@ def list_story_tags(conn: Connection, story_id: int) -> list[str]:
         (story_id,),
     ).fetchall()
     return [r["name"] for r in rows]
+
+
+def list_characters(conn: Connection, story_id: int) -> list[Row]:
+    return conn.execute(
+        """
+        SELECT id, name, description, position FROM characters
+        WHERE story_id = %s ORDER BY position, id
+        """,
+        (story_id,),
+    ).fetchall()
+
+
+def list_character_ids(conn: Connection, story_id: int) -> set[int]:
+    rows = conn.execute("SELECT id FROM characters WHERE story_id = %s", (story_id,)).fetchall()
+    return {r["id"] for r in rows}
+
+
+def delete_characters_except(conn: Connection, story_id: int, keep_ids: list[int]) -> None:
+    """목록에서 빠진 캐릭터를 삭제한다.
+
+    얼굴 이미지 연결·발화 말풍선·인트로별 상태·초기 호감도·관계는 스키마의 ON DELETE CASCADE로
+    함께 정리된다 (CREATE-US-02-AC15, 03-AC06, 04-AC16).
+    """
+    conn.execute(
+        "DELETE FROM characters WHERE story_id = %s AND NOT (id = ANY(%s::bigint[]))",
+        (story_id, keep_ids),
+    )
+
+
+def update_character(
+    conn: Connection, character_id: int, name: str | None, description: str | None, position: int
+) -> None:
+    # (story_id, position) UNIQUE는 지연 검사라 한 트랜잭션 안에서 순서를 맞바꿀 수 있다.
+    conn.execute(
+        "UPDATE characters SET name = %s, description = %s, position = %s WHERE id = %s",
+        (name, description, position, character_id),
+    )
+
+
+def insert_character(
+    conn: Connection, story_id: int, name: str | None, description: str | None, position: int
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO characters (story_id, name, description, position)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (story_id, name, description, position),
+    )
