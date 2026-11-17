@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.features.creation.common.names import name_compare_key
+from app.features.creation.story_basic.schemas import MAX_CHARACTERS_PER_REQUEST
 
 URL = "/api/v1/creation/stories"
 OWNER = {"X-User-Id": "1"}
@@ -240,3 +241,17 @@ def test_completed_story_rejects_invalid_characters(
     assert res.status_code == 422
     assert res.json()["code"] == "STORY_INCOMPLETE"
     assert len(client.get(f"{URL}/{story['id']}", headers=OWNER).json()["characters"]) == 1
+
+
+def test_request_over_hard_limit_is_rejected_without_saving(client: TestClient) -> None:
+    """등록 조건(10명)을 넘는 임시 저장은 보존하지만, 요청 상한(50명)을 넘으면 형식 오류다."""
+    story = _create(client, [_char("A")])
+    over = [_char(f"인물{i}") for i in range(MAX_CHARACTERS_PER_REQUEST + 1)]
+    res = client.put(f"{URL}/{story['id']}", json={**BASIC, "characters": over}, headers=OWNER)
+    assert res.status_code == 422
+    assert res.json()["code"] == "VALIDATION_ERROR"
+    saved = client.get(f"{URL}/{story['id']}", headers=OWNER).json()["characters"]
+    assert [c["name"] for c in saved] == ["A"]
+
+    res = client.post(URL, json={**BASIC, "characters": over}, headers=OWNER)
+    assert res.status_code == 422

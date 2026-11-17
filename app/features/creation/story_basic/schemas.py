@@ -8,6 +8,10 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+# 요청 하나에 담을 수 있는 캐릭터 수의 하드 상한. 등록 조건(1~10명)과 별개다.
+# 임시 저장은 조건을 넘는 입력도 보존해야 하므로 넉넉하게 두고, 과도한 요청만 형식 오류로 막는다.
+MAX_CHARACTERS_PER_REQUEST = 50
+
 
 class CharacterWriteItem(BaseModel):
     """캐릭터 한 명. 목록 순서가 곧 표시 순서다."""
@@ -23,7 +27,9 @@ class StoryCreateRequest(BaseModel):
     world_description: str | None = Field(default=None, description="세계관(서사)")
     tags: list[str] = Field(default_factory=list, description="해시태그 원문")
     characters: list[CharacterWriteItem] = Field(
-        default_factory=list, description="새 캐릭터 목록. id는 넣지 않는다"
+        default_factory=list,
+        max_length=MAX_CHARACTERS_PER_REQUEST,
+        description="새 캐릭터 목록. id는 넣지 않는다",
     )
 
 
@@ -40,7 +46,9 @@ class StoryUpdateRequest(BaseModel):
     world_description: str | None = Field(default=None, description="세계관(서사)")
     tags: list[str] | None = Field(default=None, description="해시태그 원문. null이면 유지")
     characters: list[CharacterWriteItem] | None = Field(
-        default=None, description="전체 캐릭터 목록. null이면 유지"
+        default=None,
+        max_length=MAX_CHARACTERS_PER_REQUEST,
+        description="전체 캐릭터 목록. null이면 유지",
     )
 
 
