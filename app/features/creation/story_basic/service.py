@@ -25,6 +25,8 @@ MIN_CHARACTERS = 1
 MAX_CHARACTERS = 10
 MAX_TAGS = 10
 MAX_TAG_LENGTH = 10
+# 제목·한 줄 소개·세계관과 모든 캐릭터 이름·상세의 합산 글자 수 한도 (CREATE-US-01-AC09)
+MAX_BASIC_TEXT_LENGTH = 3000
 TAG_SUGGESTION_LIMIT = 20
 TAG_SEARCH_LIMIT = 50
 
@@ -207,6 +209,46 @@ def strip_tag_mark(text: str) -> str:
     return text.strip().lstrip("#").strip()
 
 
+def basic_text_length(
+    title: str | None,
+    subtitle: str | None,
+    world_description: str | None,
+    characters: list[CharacterDraft],
+) -> int:
+    """AC09 합산 글자 수: 제목·한 줄 소개·세계관 + 모든 캐릭터 이름·상세.
+
+    공백·줄바꿈 포함, 유니코드 코드 포인트 단위(앱과 같은 기준). 해시태그·퓨샷·인트로는 제외한다.
+    """
+    parts = [title, subtitle, world_description]
+    for ch in characters:
+        parts += [ch.name, ch.description]
+    return sum(len(p) for p in parts if p)
+
+
+def collect_length_issues(
+    title: str | None,
+    subtitle: str | None,
+    world_description: str | None,
+    characters: list[CharacterDraft],
+) -> list[FieldIssue]:
+    """CREATE-US-01-AC09: 합산 3000자 초과 안내. 입력은 자르지 않고 임시 저장은 허용한다."""
+    total = basic_text_length(title, subtitle, world_description, characters)
+    if total <= MAX_BASIC_TEXT_LENGTH:
+        return []
+    return [
+        FieldIssue(
+            field="basic_text",
+            code="BASIC_TEXT_TOO_LONG",
+            value=str(total),
+            message=(
+                f"기본 설정과 캐릭터 글자 수 합계가 {total:,}자예요. "
+                f"{MAX_BASIC_TEXT_LENGTH:,}자 이내로 줄여 주세요. "
+                f"({total - MAX_BASIC_TEXT_LENGTH:,}자 초과)"
+            ),
+        )
+    ]
+
+
 def _dedupe(names: list[str]) -> list[str]:
     """표기를 정리(strip_tag_mark)한 뒤 완전히 같은 표기만 하나로 합친다.
 
@@ -218,7 +260,9 @@ def _dedupe(names: list[str]) -> list[str]:
 def _to_response(conn: Connection, row: repo.Row) -> StoryResponse:
     characters = [CharacterResponse(**c) for c in repo.list_characters(conn, row["id"])]
     issues = collect_basic_issues(row["title"], row["subtitle"], row["world_description"])
-    issues += collect_character_issues([CharacterDraft(c.name, c.description) for c in characters])
+    drafts = [CharacterDraft(c.name, c.description) for c in characters]
+    issues += collect_character_issues(drafts)
+    issues += collect_length_issues(row["title"], row["subtitle"], row["world_description"], drafts)
     tags = repo.list_story_tags(conn, row["id"])
     issues += collect_tag_issues(tags)
     return StoryResponse(
@@ -310,6 +354,7 @@ def update_story(
         tags = repo.list_story_tags(conn, story_id) if req.tags is None else _dedupe(req.tags)
         issues = collect_basic_issues(req.title, req.subtitle, req.world_description)
         issues += collect_character_issues(characters)
+        issues += collect_length_issues(req.title, req.subtitle, req.world_description, characters)
         issues += collect_tag_issues(tags)
         if story["save_state"] != DRAFT and issues:
             raise StoryIncompleteError(
