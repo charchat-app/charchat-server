@@ -180,7 +180,7 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
                     ),
                 )
             )
-        key = name_compare_key(strip_tag_mark(tag.strip()))
+        key = name_compare_key(strip_tag_mark(tag))
         if key and key in seen:
             issues.append(
                 FieldIssue(
@@ -199,21 +199,20 @@ def collect_tag_issues(tags: list[str]) -> list[FieldIssue]:
 
 
 def strip_tag_mark(text: str) -> str:
-    """앞쪽 해시 기호(#)를 뗀다. '#로맨스'·'##로맨스' → '로맨스'.
+    """태그 표기를 정리한다: 앞뒤 공백 → 앞쪽 해시 기호(#) → 다시 앞뒤 공백 순으로 뗀다.
 
-    #은 해시태그를 나타내는 표시일 뿐 태그 내용이 아니므로 저장·비교·검색 전에 뗀다.
-    그 밖의 원문(공백·대소문자)은 바꾸지 않는다.
+    '#로맨스'·'##로맨스'·' #로맨스'·'# 로맨스' → '로맨스'. 앱(normalizeTagInput)과 같은 규칙이다.
+    #과 앞뒤 공백은 입력 구분용이라 태그 내용이 아니다. 태그 안의 공백·대소문자는 바꾸지 않는다.
     """
-    return text.lstrip("#")
+    return text.strip().lstrip("#").strip()
 
 
 def _dedupe(names: list[str]) -> list[str]:
-    """앞쪽 #을 떼고, 완전히 같은 표기만 하나로 합친다. 원문을 trim·대소문자 변환하지 않는다.
+    """표기를 정리(strip_tag_mark)한 뒤 완전히 같은 표기만 하나로 합친다.
 
-    '#'만 입력한 값은 떼고 나면 빈 문자열이라 태그로 저장하지 않는다.
+    정리하고 나면 비는 값('#'만, 공백만)은 태그로 저장하지 않는다.
     """
-    stripped = [strip_tag_mark(n) for n in names]
-    return list(dict.fromkeys(s for s, n in zip(stripped, names, strict=True) if s or not n))
+    return list(dict.fromkeys(s for s in (strip_tag_mark(n) for n in names) if s))
 
 
 def _to_response(conn: Connection, row: repo.Row) -> StoryResponse:
@@ -332,7 +331,7 @@ def suggest_tags(conn: Connection, query: str) -> list[TagSuggestionResponse]:
 
     대소문자·띄어쓰기를 무시한 비교 키의 앞부분 일치, 공개 스토리 수 많은 순.
     """
-    key = name_compare_key(strip_tag_mark(query.strip()))
+    key = name_compare_key(strip_tag_mark(query))
     if key == "":
         return []
     rows = repo.suggest_tags(conn, key, TAG_SUGGESTION_LIMIT)
@@ -344,7 +343,7 @@ def search_public_stories_by_tag(conn: Connection, tag: str) -> list[PublicStory
 
     노출 순위·비중은 탐색 기능에서 정한다.
     """
-    key = name_compare_key(strip_tag_mark(tag.strip()))
+    key = name_compare_key(strip_tag_mark(tag))
     if key == "":
         return []
     rows = repo.list_public_stories_by_tag(conn, key, TAG_SEARCH_LIMIT)

@@ -59,9 +59,11 @@ def test_tag_length_counts_spaces_CREATE_US_01_AC13(client: TestClient) -> None:
     assert _issues(story) == {"tags[0]": {"TAG_TOO_LONG"}}
 
 
-def test_blank_tag_is_reported(client: TestClient) -> None:
-    story = _create(client, ["  "])
-    assert _issues(story) == {"tags[0]": {"TAG_BLANK"}}
+def test_blank_tag_is_not_saved(client: TestClient) -> None:
+    """공백만 있는 태그는 정리하면 빈 값이라 저장하지 않는다(# 만 입력한 경우와 같음)."""
+    story = _create(client, ["  ", "로맨스"])
+    assert story["tags"] == ["로맨스"]
+    assert story["issues"] == []
 
 
 def test_completed_story_rejects_long_tag_CREATE_US_01_AC13(
@@ -312,7 +314,6 @@ def test_search_tag_with_slash_CREATE_US_01_AC16(
     ("tags", "code"),
     [
         (["Romance", "romance"], "TAG_DUPLICATE"),
-        (["  "], "TAG_BLANK"),
         ([f"태그{i}" for i in range(11)], "TAG_COUNT_EXCEEDED"),
     ],
 )
@@ -363,3 +364,19 @@ def test_hash_in_suggestion_and_search_queries(client: TestClient, db: psycopg.C
     found = client.get(f"{TAGS}/stories", params={"tag": "#로맨스"}, headers=OWNER).json()
     assert [s["id"] for s in found] == [sid]
     assert client.get(TAGS, params={"q": "#"}, headers=OWNER).json() == []
+
+
+@pytest.mark.parametrize("raw", [" #로맨스", "# 로맨스", " # 로맨스 ", "	##로맨스"])
+def test_spaces_around_hash_are_removed(
+    client: TestClient, db: psycopg.Connection, raw: str
+) -> None:
+    """앞에 공백이 있어도 #을 떼서 '로맨스'와 같은 태그로 저장·검색한다."""
+    story = _create(client, [raw, "로맨스"])
+    assert story["tags"] == ["로맨스"]
+    assert story["issues"] == []
+    _publish(db, story["id"])
+    assert client.get(TAGS, params={"q": raw}, headers=OWNER).json() == [
+        {"name": "로맨스", "public_story_count": 1}
+    ]
+    found = client.get(f"{TAGS}/stories", params={"tag": raw}, headers=OWNER).json()
+    assert [s["id"] for s in found] == [story["id"]]
