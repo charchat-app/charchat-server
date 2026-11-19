@@ -72,14 +72,24 @@ def replace_relations(connection, story_id, relations):
             WHERE source_character_id IN {people} OR target_character_id IN {people}""",
         (story_id, story_id),
     )
-    for relation in relations:
-        source = int(relation.source_character_id) if relation.source_character_id else None
-        target = int(relation.target_character_id) if relation.target_character_id else None
-        connection.execute(
+    if not relations:
+        return
+    # 상한이 캐릭터 50명 기준(최대 2550개)이므로 한 번에 보낸다. 순서는 목록 순서 그대로다.
+    with connection.cursor() as cursor:
+        cursor.executemany(
             """INSERT INTO character_initial_relationships
                (source_kind,source_character_id,target_kind,target_character_id,label)
                VALUES (%s,%s,%s,%s,%s)""",
-            (relation.source_kind, source, relation.target_kind, target, relation.label),
+            [
+                (
+                    r.source_kind,
+                    r.source_character_id,
+                    r.target_kind,
+                    r.target_character_id,
+                    r.label,
+                )
+                for r in relations
+            ],
         )
 
 
@@ -102,11 +112,15 @@ def replace_affinities(connection, story_id, affinities):
            WHERE source_character_id IN (SELECT id FROM characters WHERE story_id=%s)""",
         (story_id,),
     )
-    for affinity in affinities:
-        target = int(affinity.target_character_id) if affinity.target_character_id else None
-        connection.execute(
+    if not affinities:
+        return
+    with connection.cursor() as cursor:
+        cursor.executemany(
             """INSERT INTO character_initial_affinities
                (source_character_id,target_kind,target_character_id,affinity_input)
                VALUES (%s,%s,%s,%s)""",
-            (int(affinity.source_character_id), affinity.target_kind, target, affinity.value),
+            [
+                (a.source_character_id, a.target_kind, a.target_character_id, a.value)
+                for a in affinities
+            ],
         )

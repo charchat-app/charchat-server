@@ -4,7 +4,8 @@ import re
 
 from app.features.creation.common.errors import app_error
 from app.features.creation.initial_state import repository as repo
-from app.features.creation.initial_state.schemas import IntroScene
+from app.features.creation.initial_state.schemas import ALL_DATE_FIELDS, TIME_FIELDS, IntroScene
+from app.features.creation.save_visibility.schemas import FieldIssue
 
 
 def empty_scene():
@@ -38,6 +39,34 @@ def read_scenes(connection, story_id):
             }
         )
     return scenes
+
+
+def clear_switched_inputs(connection, story_id, intros):
+    """CREATE-US-04-AC07: 날짜 방식·시간제를 바꾸면 이전 입력을 넘기지 않는다.
+
+    일반·세계관은 연·월·일 칸을, 12·24시간제는 시·분 칸을 같이 쓴다. 저장된 방식과 요청 방식이
+    다른데 이전에 저장한 값과 같은 원문이 그대로 오면 이전 방식의 입력으로 보고 비운다(NULL).
+    변환·숨김 보관은 하지 않으며, 새로 입력한 다른 값은 그대로 저장한다.
+    완성 저장 검사 전에 호출해 비운 결과로 검사하고 저장한다.
+    """
+    stored = read_scenes(connection, story_id)
+    for intro in intros:
+        before = stored.get(intro.id) if intro.id is not None else None
+        if before is None:
+            continue
+        scene = intro.scene
+        stale = []
+        if before["date_mode"] is not None and scene.date_mode != before["date_mode"]:
+            stale += sorted(ALL_DATE_FIELDS)
+        if scene.time_format != before["time_format"]:
+            stale += TIME_FIELDS
+        cleared = {
+            name: None
+            for name in stale
+            if getattr(scene, name) is not None and getattr(scene, name) == before[name]
+        }
+        if cleared:
+            intro.scene = scene.model_copy(update=cleared)
 
 
 def check_scene_people(intros, character_ids):
@@ -107,7 +136,13 @@ def write_relations(connection, story_id, relations, character_ids):
 
 
 def _integer_in(value, low, high):
-    return bool(re.fullmatch(r"[0-9]+", value or "")) and low <= int(value) <= high
+    # 자릿수를 상한에 맞춰 제한해 아주 긴 숫자 문자열도 int 변환 없이 거절한다.
+    digits = len(str(high))
+    return bool(re.fullmatch(rf"[0-9]{{1,{digits}}}", value or "")) and low <= int(value) <= high
+
+
+def _affinity_ok(value):
+    return bool(re.fullmatch(r"-?[0-9]{1,3}", value)) and -100 <= int(value) <= 100
 
 
 def _date_ok(scene):
@@ -135,43 +170,74 @@ def _time_ok(scene):
     return _integer_in(scene.hour_input, low, high) and _integer_in(scene.minute_input, 0, 59)
 
 
-def _over(value, name):
-    return value is not None and len(value) > LIMITS[name]
+TEXT_NAMES = {
+    "place": "장소",
+    "clothing": "착장",
+    "inner_thought": "속마음",
+    "era": "연호",
+    "reference_event": "기준 사건",
+    "label": "관계명",
+}
 
 
-def validate_completed(intros, relations, affinities):
-    """공개·비공개 저장 조건. Unicode 코드 포인트 단위, 원문을 바꾸지 않는다."""
+def _too_long(field, value, name):
+    if value is None or len(value) <= LIMITS[name]:
+        return []
+    over = len(value) - LIMITS[name]
+    return [
+        FieldIssue(
+            field=field,
+            code="INITIAL_TEXT_TOO_LONG",
+            value=str(over),
+            message=(
+                f"{TEXT_NAMES[name]}은(는) {LIMITS[name]}자 이내로 작성해 주세요. ({over:,}자 초과)"
+            ),
+        )
+    ]
+
+
+def collect_completed_issues(intros, relations, affinities) -> list[FieldIssue]:
+    """공개·비공개 저장 조건. Unicode 코드 포인트 단위, 원문을 바꾸지 않는다.
+
+    날짜·시간은 칸 묶음 단위로 `intros[i].scene.date`·`intros[i].scene.time`에 표시한다.
+    """
+    issues: list[FieldIssue] = []
     scenes = [intro.scene for intro in intros]
-    if not all(_date_ok(scene) for scene in scenes):
-        raise app_error(
-            422, "INITIAL_DATE_INVALID", "초기 날짜를 모두 올바르게 채우거나 비워 주세요."
+    issues += [
+        FieldIssue(
+            field=f"intros[{i}].scene.date",
+            code="INITIAL_DATE_INVALID",
+            message="초기 날짜를 모두 올바르게 채우거나 비워 주세요.",
         )
-    if not all(_time_ok(scene) for scene in scenes):
-        raise app_error(
-            422, "INITIAL_TIME_INVALID", "초기 시간을 모두 올바르게 채우거나 비워 주세요."
+        for i, scene in enumerate(scenes)
+        if not _date_ok(scene)
+    ]
+    issues += [
+        FieldIssue(
+            field=f"intros[{i}].scene.time",
+            code="INITIAL_TIME_INVALID",
+            message="초기 시간을 모두 올바르게 채우거나 비워 주세요.",
         )
-    if (
-        any(
-            _over(s.place, "place")
-            or _over(s.era, "era")
-            or _over(s.reference_event, "reference_event")
-            for s in scenes
+        for i, scene in enumerate(scenes)
+        if not _time_ok(scene)
+    ]
+    for i, scene in enumerate(scenes):
+        path = f"intros[{i}].scene"
+        for name in ("place", "era", "reference_event"):
+            issues += _too_long(f"{path}.{name}", getattr(scene, name), name)
+        for j, state in enumerate(scene.characters):
+            for name in ("clothing", "inner_thought"):
+                issues += _too_long(f"{path}.characters[{j}].{name}", getattr(state, name), name)
+    for k, relation in enumerate(relations):
+        issues += _too_long(f"relations[{k}].label", relation.label, "label")
+    issues += [
+        FieldIssue(
+            field=f"affinities[{k}].value",
+            code="AFFINITY_INVALID",
+            value=affinity.value,
+            message="초기 호감도는 -100~100 사이 정수로 입력해 주세요.",
         )
-        or any(
-            _over(c.clothing, "clothing") or _over(c.inner_thought, "inner_thought")
-            for s in scenes
-            for c in s.characters
-        )
-        or any(_over(r.label, "label") for r in relations)
-    ):
-        raise app_error(
-            422,
-            "INITIAL_TEXT_TOO_LONG",
-            "장소·착장·속마음·관계명·연호·기준 사건의 글자 수 한도를 확인해 주세요.",
-        )
-    if any(
-        not (re.fullmatch(r"-?[0-9]+", a.value) and -100 <= int(a.value) <= 100) for a in affinities
-    ):
-        raise app_error(
-            422, "AFFINITY_INVALID", "초기 호감도는 -100~100 사이 정수로 입력해 주세요."
-        )
+        for k, affinity in enumerate(affinities)
+        if not _affinity_ok(affinity.value)
+    ]
+    return issues

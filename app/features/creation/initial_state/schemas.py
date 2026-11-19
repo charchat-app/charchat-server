@@ -1,10 +1,11 @@
 """CREATE-US-04 초기 상태 계약. 원문 문자열로 보존해 부분·초과 입력도 임시 저장한다."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.features.creation.speech_style.fewshot_schemas import ClientKey, DbId
+from app.features.creation.story_basic.schemas import MAX_CHARACTERS_PER_REQUEST
 
 DATE_FIELDS = {
     "calendar": {"year_input", "month_input", "day_input"},
@@ -12,6 +13,20 @@ DATE_FIELDS = {
     "elapsed": {"reference_event", "elapsed_day_input"},
 }
 ALL_DATE_FIELDS = set().union(*DATE_FIELDS.values())
+TIME_FIELDS = ("hour_input", "minute_input")
+
+# 연·월·일·경과일·시·분·호감도 원문 길이 상한. 범위 밖 값(예: 10000)의 임시 저장은 허용하되,
+# 아주 긴 숫자 문자열은 형식 오류(422)로 막는다.
+NUMBER_INPUT_MAX_LENGTH = 20
+NumberInput = Annotated[str, Field(max_length=NUMBER_INPUT_MAX_LENGTH)]
+
+# 기본 정보 요청 상한(캐릭터 50명)에 맞춘 목록 상한. 임시 저장은 등록 조건(1~10명)을 넘는
+# 캐릭터 수도 보존하므로 10명 기준으로 막으면 공통 저장 전체가 실패한다.
+MAX_PEOPLE = MAX_CHARACTERS_PER_REQUEST + 1  # 캐릭터 + 유저
+# 관계: 유저 포함 인물 사이 방향쌍(유저→유저 제외) = 51×50
+MAX_RELATIONS = MAX_PEOPLE * (MAX_PEOPLE - 1)
+# 호감도: 캐릭터가 출발, 상대는 유저 + 다른 캐릭터 = 50×50
+MAX_AFFINITIES = MAX_CHARACTERS_PER_REQUEST * MAX_CHARACTERS_PER_REQUEST
 
 
 def _clean(value):
@@ -37,14 +52,14 @@ class IntroScene(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date_mode: Literal["calendar", "world", "elapsed"] | None = None
     era: str | None = None
-    year_input: str | None = None
-    month_input: str | None = None
-    day_input: str | None = None
+    year_input: NumberInput | None = None
+    month_input: NumberInput | None = None
+    day_input: NumberInput | None = None
     reference_event: str | None = None
-    elapsed_day_input: str | None = None
+    elapsed_day_input: NumberInput | None = None
     time_format: Literal["24h", "12h"] = "24h"
-    hour_input: str | None = None
-    minute_input: str | None = None
+    hour_input: NumberInput | None = None
+    minute_input: NumberInput | None = None
     meridiem: Literal["am", "pm"] | None = None
     place: str | None = None
     characters: list[SceneCharacter] = Field(default_factory=list)
@@ -141,7 +156,7 @@ class InitialAffinity(BaseModel):
     source_character_id: DbId
     target_kind: Literal["user", "character"]
     target_character_id: DbId | None = None
-    value: str
+    value: NumberInput
 
     @field_validator("value")
     @classmethod

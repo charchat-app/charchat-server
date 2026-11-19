@@ -463,3 +463,193 @@ def test_character_delete_cascades_only_their_state(context):
             (int(b),),
         ).fetchone()[0]
     assert left == 1
+
+
+def _saved_scene(client, story):
+    return client.get(url(story)).json()["intros"][0]
+
+
+def test_date_mode_switch_clears_previous_shared_inputs_CREATE_US_04_AC07(context):
+    """일반·세계관은 연·월·일 칸을 같이 쓴다. 방식을 바꿨는데 이전 값이 그대로 오면 비운다."""
+    client, _, story, _, dsn = context
+    people(dsn, story, "하린")
+    calendar = {"date_mode": "calendar", "year_input": "2026", "month_input": "3", "day_input": "1"}
+    put(client, story, payload([intro("i", scene=calendar)]), "calendar")
+    saved = _saved_scene(client, story)
+    # 세계관으로 바꾸고 연호만 넣었지만 앱이 이전 연·월·일을 지우지 않고 보낸 경우
+    switched = deepcopy(saved)
+    switched["scene"] = {**calendar, "date_mode": "world", "era": "신력"}
+    result = put(client, story, payload([switched]), "world")
+    assert result.status_code == 200, result.text
+    for scene in (result.json()["intros"][0]["scene"], _saved_scene(client, story)["scene"]):
+        assert (scene["date_mode"], scene["era"]) == ("world", "신력")
+        assert (scene["year_input"], scene["month_input"], scene["day_input"]) == (None,) * 3
+    # 완성 저장에서도 이전 날짜가 넘어가지 않아 세계관 날짜 미완성으로 거절된다.
+    put(client, story, payload([deepcopy(saved)]), "calendar-again")
+    again = deepcopy(_saved_scene(client, story))
+    again["scene"] = {**calendar, "date_mode": "world", "era": "신력"}
+    rejected = put(client, story, payload([again], state="private"), "world-private")
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "INITIAL_DATE_INVALID"
+    assert rejected.json()["issues"][0]["field"] == "intros[0].scene.date"
+
+
+def test_date_mode_switch_keeps_newly_entered_values_CREATE_US_04_AC07(context):
+    client, _, story, _, dsn = context
+    people(dsn, story, "하린")
+    calendar = {"date_mode": "calendar", "year_input": "2026", "month_input": "3", "day_input": "1"}
+    put(client, story, payload([intro("i", scene=calendar)]), "calendar")
+    switched = deepcopy(_saved_scene(client, story))
+    switched["scene"] = {
+        "date_mode": "world",
+        "era": "신력",
+        "year_input": "302",  # 새로 입력
+        "month_input": "3",  # 이전 값 그대로
+        "day_input": "5",  # 새로 입력
+    }
+    scene = put(client, story, payload([switched]), "world").json()["intros"][0]["scene"]
+    assert (scene["year_input"], scene["month_input"], scene["day_input"]) == ("302", None, "5")
+    # 방식을 바꾸지 않은 저장은 같은 값을 그대로 둔다.
+    same = deepcopy(_saved_scene(client, story))
+    kept = put(client, story, payload([same]), "same").json()["intros"][0]["scene"]
+    assert (kept["year_input"], kept["day_input"]) == ("302", "5")
+
+
+def test_time_format_switch_clears_previous_time_CREATE_US_04_AC07(context):
+    client, _, story, _, dsn = context
+    people(dsn, story, "하린")
+    put(
+        client,
+        story,
+        payload([intro("i", scene={"hour_input": "15", "minute_input": "30"})]),
+        "24h",
+    )
+    switched = deepcopy(_saved_scene(client, story))
+    switched["scene"].update(time_format="12h", meridiem="pm")
+    scene = put(client, story, payload([switched]), "12h").json()["intros"][0]["scene"]
+    assert (scene["time_format"], scene["meridiem"]) == ("12h", "pm")
+    assert (scene["hour_input"], scene["minute_input"]) == (None, None)
+    # 12시간제에서 새로 입력한 시각은 저장된다.
+    entered = deepcopy(_saved_scene(client, story))
+    entered["scene"].update(hour_input="3", minute_input="30")
+    scene = put(client, story, payload([entered]), "12h-entered").json()["intros"][0]["scene"]
+    assert (scene["hour_input"], scene["minute_input"]) == ("3", "30")
+    # 다시 24시간제로 바꾸며 이전 시각을 그대로 보내면 비운다.
+    back = deepcopy(_saved_scene(client, story))
+    back["scene"].update(time_format="24h", meridiem=None)
+    scene = put(client, story, payload([back]), "back-24h").json()["intros"][0]["scene"]
+    assert (scene["hour_input"], scene["minute_input"], scene["meridiem"]) == (None, None, None)
+
+
+def test_draft_with_more_than_ten_characters_saves_all_pairs(context):
+    """임시 저장은 캐릭터 11명 이상도 보존한다. 관계·호감도 상한은 캐릭터 50명 기준이다."""
+    client, _, story, _, dsn = context
+    ids = people(dsn, story, *[f"인물{n}" for n in range(12)])
+    everyone = [None, *ids]
+    relations = [
+        relation(f"r{i}-{j}", s, t, "관계")
+        for i, s in enumerate(everyone)
+        for j, t in enumerate(everyone)
+        if i != j
+    ]
+    affinities = [aff(s, t, "1") for s in ids for t in everyone if t != s]
+    assert (len(relations), len(affinities)) == (13 * 12, 12 * 12)
+    result = put(client, story, payload([intro("i")], relations, affinities=affinities), "many")
+    assert result.status_code == 200, result.text
+    data = client.get(url(story)).json()
+    assert (len(data["relations"]), len(data["affinities"])) == (156, 144)
+
+
+def test_relation_and_affinity_caps_follow_fifty_character_limit(context):
+    client, _, story, _, dsn = context
+    (a,) = people(dsn, story, "하린")
+    too_many_relations = [relation("r", a, None)] * (51 * 50 + 1)
+    too_many_affinities = [aff(a, None, "0")] * (50 * 50 + 1)
+    for relations, affinities in [(too_many_relations, []), ([], too_many_affinities)]:
+        result = put(client, story, payload([intro("i")], relations, affinities=affinities), "cap")
+        assert result.status_code == 422
+        assert result.json()["code"] == "VALIDATION_ERROR"
+        assert result.json()["errors"][0]["type"] == "too_long"
+
+
+@pytest.mark.parametrize(
+    "scene",
+    [
+        {"date_mode": "calendar", "year_input": "9" * 5000},
+        {"date_mode": "elapsed", "reference_event": "감금", "elapsed_day_input": "1" * 21},
+        {"hour_input": "1" * 5000, "minute_input": "0"},
+        {"hour_input": "1", "minute_input": "0" * 21},
+    ],
+)
+def test_very_long_number_inputs_are_rejected_as_validation_error(context, scene):
+    client, _, story, _, dsn = context
+    people(dsn, story, "하린")
+    result = put(client, story, payload([intro("i", scene=scene)]), "long")
+    assert result.status_code == 422
+    assert result.json()["code"] == "VALIDATION_ERROR"
+
+
+def test_very_long_affinity_is_rejected_as_validation_error(context):
+    client, _, story, _, dsn = context
+    (a,) = people(dsn, story, "하린")
+    result = put(client, story, payload([intro("i")], affinities=[aff(a, None, "1" * 5000)]), "x")
+    assert result.status_code == 422
+    assert result.json()["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize(
+    ("scene", "value", "code"),
+    [
+        (
+            {"date_mode": "calendar", "year_input": "0" * 19 + "1", "month_input": "1"},
+            None,
+            "INITIAL_DATE_INVALID",
+        ),
+        (
+            {"date_mode": "calendar", "year_input": "9" * 20, "month_input": "1", "day_input": "1"},
+            None,
+            "INITIAL_DATE_INVALID",
+        ),
+        ({"hour_input": "0" * 19 + "1", "minute_input": "0"}, None, "INITIAL_TIME_INVALID"),
+        ({}, "-" + "1" * 19, "AFFINITY_INVALID"),
+        ({}, "0" * 20, "AFFINITY_INVALID"),
+    ],
+)
+def test_completed_save_rejects_long_digit_inputs_without_server_error(context, scene, value, code):
+    """최대 길이 안의 긴 숫자도 자릿수 상한으로 거절한다(500이 아닌 422)."""
+    client, _, story, _, dsn = context
+    (a,) = people(dsn, story, "하린")
+    affinities = [aff(a, None, value)] if value is not None else []
+    result = put(
+        client,
+        story,
+        payload([intro("i", scene=scene)], state="private", affinities=affinities),
+        "long-completed",
+    )
+    assert result.status_code == 422, result.text
+    assert result.json()["code"] == code
+
+
+def test_completed_initial_state_rejection_lists_field_issues(context):
+    client, _, story, _, dsn = context
+    a, b = people(dsn, story, "하린", "도윤")
+    scene = {"place": "가" * 33, "characters": [{"character_id": b, "inner_thought": "나" * 104}]}
+    result = put(
+        client,
+        story,
+        payload(
+            [intro("i", scene=scene)],
+            [relation("r", a, None, "라" * 12)],
+            "private",
+            [aff(a, None, "101")],
+        ),
+        "issues",
+    )
+    assert result.status_code == 422
+    issues = {(i["field"], i["code"]): i["value"] for i in result.json()["issues"]}
+    assert issues == {
+        ("intros[0].scene.place", "INITIAL_TEXT_TOO_LONG"): "3",
+        ("intros[0].scene.characters[0].inner_thought", "INITIAL_TEXT_TOO_LONG"): "4",
+        ("relations[0].label", "INITIAL_TEXT_TOO_LONG"): "2",
+        ("affinities[0].value", "AFFINITY_INVALID"): "101",
+    }

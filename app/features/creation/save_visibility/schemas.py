@@ -5,6 +5,8 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, BaseModel, Field
 
 from app.features.creation.initial_state.schemas import (
+    MAX_AFFINITIES,
+    MAX_RELATIONS,
     InitialAffinity,
     InitialRelation,
     unique_affinities,
@@ -14,13 +16,12 @@ from app.features.creation.intro.schemas import Intro, IntroList
 from app.features.creation.speech_style.fewshot_schemas import FewshotsResponse, FewshotsSaveRequest
 from app.features.creation.speech_style.schemas import ExpressionFields
 
-# 캐릭터 최대 10명 + 유저: 방향별 최대 11×10개.
+# 기본 정보 요청 상한(캐릭터 50명) + 유저 기준 방향쌍 수. 계산은 initial_state/schemas.py.
 RelationList = Annotated[
-    list[InitialRelation], Field(max_length=110), AfterValidator(unique_relations)
+    list[InitialRelation], Field(max_length=MAX_RELATIONS), AfterValidator(unique_relations)
 ]
-# 캐릭터 최대 10명이 출발, 상대는 유저 + 다른 캐릭터 9명: 최대 10×10개.
 AffinityList = Annotated[
-    list[InitialAffinity], Field(max_length=100), AfterValidator(unique_affinities)
+    list[InitialAffinity], Field(max_length=MAX_AFFINITIES), AfterValidator(unique_affinities)
 ]
 
 

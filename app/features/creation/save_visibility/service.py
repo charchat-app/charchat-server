@@ -95,7 +95,7 @@ def collect_completed_issues(connection, story_id, body) -> list[FieldIssue]:
             )
         )
     issues += intro_service.collect_completed_issues(body.intros)
-    initial_state.validate_completed(body.intros, body.relations, body.affinities)
+    issues += initial_state.collect_completed_issues(body.intros, body.relations, body.affinities)
 
     # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 1번 기본 정보·캐릭터
     basic = repository.read_basic(connection, story_id)
@@ -226,6 +226,8 @@ def save_creation(connection, story_id, owner_id, request_id, body):
             )
         if body.mode == "auto" and (current != "draft" or target != "draft"):
             raise app_error(409, "AUTO_SAVE_NOT_ALLOWED", "자동 저장은 임시 저장에만 적용됩니다.")
+        # 방식·시간제를 바꾼 장면의 이전 입력을 비운 뒤 검사·저장한다 (CREATE-US-04-AC07).
+        initial_state.clear_switched_inputs(connection, story_id, body.intros)
         if target != "draft":
             validate_completed(connection, story_id, body)
         groups, people = fewshot_service.write_fewshots(connection, story_id, body)
