@@ -36,7 +36,7 @@ select = [
 [tool.ruff.format]
 quote-style = "double"
 
-# pip install -e . 에서 app 패키지만 설치한다(migrations·scripts 제외).
+# pip install -e . 에서 app 패키지만 설치한다(tests·scripts 제외).
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

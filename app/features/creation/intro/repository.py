@@ -61,10 +61,10 @@ def write_collection(connection, story_id, intros, old_intro_ids, old_message_id
                        WHERE id=%s AND intro_id=%s""",
                     (*values, message_id, intro_id),
                 )
-            messages.append({**message.model_dump(), "id": str(message_id)})
+            messages.append({**message.model_dump(), "id": message_id})
         result.append(
             {
-                "id": str(intro_id),
+                "id": intro_id,
                 "client_key": intro.client_key,
                 "title": intro.title,
                 "messages": messages,

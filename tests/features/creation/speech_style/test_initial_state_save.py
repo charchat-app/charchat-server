@@ -77,13 +77,11 @@ def people(dsn, story, *names):
         connection.execute("UPDATE stories SET subtitle='한 줄 소개' WHERE id=%s", (story["id"],))
         for position, name in enumerate(names):
             ids.append(
-                str(
-                    connection.execute(
-                        "INSERT INTO characters(story_id,name,description,position) "
-                        "VALUES (%s,%s,'상세',%s) RETURNING id",
-                        (story["id"], name, position),
-                    ).fetchone()[0]
-                )
+                connection.execute(
+                    "INSERT INTO characters(story_id,name,description,position) "
+                    "VALUES (%s,%s,'상세',%s) RETURNING id",
+                    (story["id"], name, position),
+                ).fetchone()[0]
             )
     return ids
 
@@ -236,13 +234,11 @@ def test_rejects_other_story_people(context):
         other = connection.execute(
             "INSERT INTO stories(owner_id) VALUES (999997) RETURNING id"
         ).fetchone()[0]
-        foreign = str(
-            connection.execute(
-                "INSERT INTO characters(story_id,name,description,position) "
-                "VALUES (%s,'남','상세',0) RETURNING id",
-                (other,),
-            ).fetchone()[0]
-        )
+        foreign = connection.execute(
+            "INSERT INTO characters(story_id,name,description,position) "
+            "VALUES (%s,'남','상세',0) RETURNING id",
+            (other,),
+        ).fetchone()[0]
     scene = {"characters": [{"character_id": foreign, "clothing": "x"}]}
     assert (
         put(client, story, payload([intro("i", scene=scene)]), "s").json()["code"]

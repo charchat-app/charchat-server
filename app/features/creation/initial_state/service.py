@@ -32,7 +32,7 @@ def read_scenes(connection, story_id):
     for row in repo.read_character_states(connection, story_id):
         scenes.setdefault(row["intro_id"], empty_scene())["characters"].append(
             {
-                "character_id": str(row["character_id"]),
+                "character_id": row["character_id"],
                 "clothing": row["clothing"],
                 "inner_thought": row["inner_thought"],
             }
@@ -58,13 +58,9 @@ def read_relations(connection, story_id):
         {
             "client_key": f"relation-{row['id']}",
             "source_kind": row["source_kind"],
-            "source_character_id": str(row["source_character_id"])
-            if row["source_character_id"] is not None
-            else None,
+            "source_character_id": row["source_character_id"],
             "target_kind": row["target_kind"],
-            "target_character_id": str(row["target_character_id"])
-            if row["target_character_id"] is not None
-            else None,
+            "target_character_id": row["target_character_id"],
             "label": row["label"],
         }
         for row in repo.read_relations(connection, story_id)
@@ -74,11 +70,9 @@ def read_relations(connection, story_id):
 def read_affinities(connection, story_id):
     return [
         {
-            "source_character_id": str(row["source_character_id"]),
+            "source_character_id": row["source_character_id"],
             "target_kind": row["target_kind"],
-            "target_character_id": str(row["target_character_id"])
-            if row["target_character_id"] is not None
-            else None,
+            "target_character_id": row["target_character_id"],
             # 열 기본값이 '0'이고, NULL은 지운 값("")으로 되돌려 원문을 보존한다.
             "value": row["affinity_input"] if row["affinity_input"] is not None else "",
         }

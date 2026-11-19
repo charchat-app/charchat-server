@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from app.features.creation.initial_state.schemas import (
     InitialAffinity,
@@ -41,3 +41,15 @@ class CreationSaveResponse(FewshotsResponse):
     intros: list[Intro]
     relations: list[InitialRelation]
     affinities: list[InitialAffinity]
+
+
+class FieldIssue(BaseModel):
+    """완성 저장(공개·비공개)을 막는 입력 문제 하나. 기본 정보 API의 FieldIssue와 같은 형식이다."""
+
+    field: str = Field(description="문제가 있는 필드. 예: intros[2].messages, tags[0]")
+    code: str = Field(description="프론트 분기용 코드. 예: INTRO_TOO_LONG")
+    message: str
+    value: str | None = Field(
+        default=None,
+        description="길이 초과는 초과 글자 수, 해시태그 문제는 태그 원문. 그 밖에는 null.",
+    )

@@ -212,5 +212,34 @@ def test_auto_draft_owner_deleted_and_cross_endpoint_idempotency(context):
         connection.execute(
             "UPDATE stories SET deleted_at=clock_timestamp() WHERE id=%s", (story["id"],)
         )
-    assert client.get(url(story)).status_code == 410
-    assert put(client, story, body(), "deleted").status_code == 410
+    for result in (client.get(url(story)), put(client, story, body(), "deleted")):
+        assert result.status_code == 404
+        assert result.json()["code"] == "STORY_NOT_FOUND"
+
+
+def test_completed_rejection_lists_field_issues_with_over_count(context):
+    client, _, story, _, dsn = context
+    complete(dsn, story)
+    with psycopg.connect(dsn) as connection:
+        connection.execute(
+            "INSERT INTO characters(story_id,name,description,position) "
+            "VALUES (%s,'하 린','상세',1),(%s,' Doyun','상세',2)",
+            (story["id"], story["id"]),
+        )
+    payload = body("private", text="😀" * 1003, few="가" * 2005)
+    result = put(client, story, payload)
+    assert result.status_code == 422
+    assert result.headers["content-type"].startswith("application/problem+json")
+    data = result.json()
+    assert data["code"] == "CUSTOM_STYLE_TOO_LONG"
+    issues = {(i["field"], i["code"]): i for i in data["issues"]}
+    assert set(data["issues"][0]) == {"field", "code", "value", "message"}
+    assert issues[("expression.custom_style", "CUSTOM_STYLE_TOO_LONG")]["value"] == "3"
+    assert issues[("fewshots", "FEWSHOTS_TOO_LONG")]["value"] == "5"
+    # common/names.py 규칙: 앞뒤 띄어쓰기는 형식 오류, 대소문자·띄어쓰기 무시 중복
+    names = [i for i in data["issues"] if i["code"] == "INVALID_CHARACTER_NAME"]
+    assert sorted(i["field"] for i in names) == [
+        "characters[0].name",  # '하린'·'하 린' 중복
+        "characters[1].name",
+        "characters[2].name",  # ' Doyun' 앞 띄어쓰기
+    ]

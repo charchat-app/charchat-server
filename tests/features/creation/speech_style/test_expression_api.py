@@ -31,9 +31,9 @@ def put(client, url, fields=None, key="request-one", **extra):
     )
 
 
-def test_requests_without_dev_user_header_are_rejected(local_dsn):
+def test_requests_without_dev_user_header_are_rejected(db_url):
     # 다른 이름의 소유자 헤더나 잘못된 값으로는 사용자를 정할 수 없다.
-    with TestClient(create_app(local_dsn)) as client:
+    with TestClient(create_app(db_url)) as client:
         for headers in [{}, {"X-Owner-Id": "1"}, {"X-User-Id": "0"}, {"X-User-Id": "abc"}]:
             response = client.get("/api/v1/creation/stories/1/expression", headers=headers)
             assert response.status_code == 401
@@ -122,8 +122,10 @@ def test_owner_and_deleted_story_are_protected(context):
         connection.execute(
             "UPDATE stories SET deleted_at=clock_timestamp() WHERE id=%s", (story["id"],)
         )
-    assert client.get(endpoint(story)).status_code == 410
-    assert put(client, endpoint(story)).status_code == 410
+    # 기본 정보 API와 같이 삭제된 스토리는 404 STORY_NOT_FOUND로 숨긴다.
+    for response in (client.get(endpoint(story)), put(client, endpoint(story))):
+        assert response.status_code == 404
+        assert response.json()["code"] == "STORY_NOT_FOUND"
 
 
 def test_completed_story_requires_common_save(context):
@@ -166,7 +168,7 @@ def test_same_request_concurrently_commits_once(context):
     with psycopg.connect(dsn) as connection:
         assert (
             connection.execute(
-                "SELECT count(*) FROM expression_write_requests WHERE owner_id=%s", (owner_id,)
+                "SELECT count(*) FROM creation_write_requests WHERE owner_id=%s", (owner_id,)
             ).fetchone()[0]
             == 1
         )
@@ -187,3 +189,20 @@ def test_request_contract_and_cors(context):
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:8089"
+
+
+def test_story_id_is_number_in_responses(context):
+    client, _, story, _, _ = context
+    assert client.get(endpoint(story)).json()["story_id"] == story["id"]
+    assert put(client, endpoint(story)).json()["story_id"] == story["id"]
+
+
+def test_custom_style_with_nul_is_rejected_without_echo(context):
+    client, _, story, _, _ = context
+    fields = {**DEFAULT, "style_mode": "custom", "custom_style": "개인 입력\x00"}
+    response = put(client, endpoint(story), fields)
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["code"] == "VALIDATION_ERROR"
+    assert "개인 입력" not in response.text
+    assert client.get(endpoint(story)).json()["expression"] == DEFAULT
