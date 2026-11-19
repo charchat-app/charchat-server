@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 StyleCode = Literal[
     "dynamic", "lyrical", "tense", "humorous", "plain", "delicate", "romantic", "warm"
@@ -20,6 +20,14 @@ class ExpressionFields(BaseModel):
     style_mode: Literal["none", "preset", "custom"]
     preset_styles: list[StyleCode] = Field(max_length=2)
     custom_style: str | None
+
+    @field_validator("custom_style")
+    @classmethod
+    def check_custom_style(cls, value):
+        # 퓨샷 본문과 같은 검사. PostgreSQL text는 NUL을 저장할 수 없어 422로 먼저 거절한다.
+        if value is not None and "\x00" in value:
+            raise ValueError("저장할 수 없는 문자가 있습니다. 원문을 수정해 주세요.")
+        return value
 
     @model_validator(mode="after")
     def validate_style(self) -> "ExpressionFields":
@@ -40,7 +48,7 @@ class ExpressionSaveRequest(BaseModel):
 
 
 class ExpressionResponse(BaseModel):
-    story_id: str
+    story_id: int
     title: str | None
     save_state: Literal["draft", "private", "public"]
     saved_at: datetime

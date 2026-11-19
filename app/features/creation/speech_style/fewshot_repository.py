@@ -67,6 +67,6 @@ def write_collection(connection, story_id, groups, old_group_ids, old_message_id
                        WHERE id=%s AND fewshot_id=%s""",
                     (*values, message_id, group_id),
                 )
-            messages.append({**message.model_dump(), "id": str(message_id)})
-        result.append({"id": str(group_id), "client_key": group.client_key, "messages": messages})
+            messages.append({**message.model_dump(), "id": message_id})
+        result.append({"id": group_id, "client_key": group.client_key, "messages": messages})
     return result

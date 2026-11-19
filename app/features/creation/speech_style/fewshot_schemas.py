@@ -3,21 +3,10 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
-def valid_id(value: str) -> str:
-    if (
-        not value.isascii()
-        or not value.isdecimal()
-        or value.startswith("0")
-        or int(value) > 9223372036854775807
-    ):
-        raise ValueError("양의 bigint 문자열이 필요합니다.")
-    return value
-
-
-DbId = Annotated[str, Field(max_length=19), AfterValidator(valid_id)]
+# 기본 정보 API와 같이 DB id는 숫자(양의 bigint)로 주고받는다.
+DbId = Annotated[int, Field(gt=0, le=9223372036854775807)]
 ClientKey = Annotated[str, Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")]
 
 

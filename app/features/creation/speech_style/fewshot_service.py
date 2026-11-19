@@ -14,7 +14,7 @@ from app.features.creation.speech_style.service import require_story
 
 
 def characters(connection, story_id):
-    return [{**row, "id": str(row["id"])} for row in repo.read_characters(connection, story_id)]
+    return [dict(row) for row in repo.read_characters(connection, story_id)]
 
 
 def get_characters(connection, story_id, owner_id):
@@ -23,13 +23,13 @@ def get_characters(connection, story_id, owner_id):
         connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         require_story(repository.find_story(connection, story_id, owner_id))
         return FewshotCharactersResponse(
-            story_id=str(story_id), characters=characters(connection, story_id)
+            story_id=story_id, characters=characters(connection, story_id)
         )
 
 
 def snapshot(story, groups, people, request_id=None):
     return FewshotsResponse(
-        story_id=str(story["id"]),
+        story_id=story["id"],
         title=story["title"],
         save_state=story["save_state"],
         saved_at=story["saved_at"],
@@ -54,18 +54,16 @@ def read_snapshot(connection, story):
     for row in messages:
         grouped.setdefault(row["fewshot_id"], []).append(
             {
-                "id": str(row["id"]),
+                "id": row["id"],
                 "client_key": f"message-{row['id']}",
                 "speaker_kind": row["speaker_kind"],
-                "character_id": str(row["character_id"])
-                if row["character_id"] is not None
-                else None,
+                "character_id": row["character_id"],
                 "body": row["body"],
             }
         )
     groups = [
         {
-            "id": str(g["id"]),
+            "id": g["id"],
             "client_key": f"group-{g['id']}",
             "messages": grouped.get(g["id"], []),
         }
@@ -75,7 +73,7 @@ def read_snapshot(connection, story):
 
 
 def save_fewshots(connection, story_id, owner_id, request_id, body):
-    payload = {"operation": "fewshots", "story_id": str(story_id), **body.model_dump(mode="json")}
+    payload = {"operation": "fewshots", "story_id": story_id, **body.model_dump(mode="json")}
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
@@ -107,10 +105,8 @@ def save_fewshots(connection, story_id, owner_id, request_id, body):
 def write_fewshots(connection, story_id, body):
     people = characters(connection, story_id)
     character_ids = {p["id"] for p in people}
-    old_groups = {str(g["id"]) for g in repo.read_groups(connection, story_id)}
-    old_messages = {
-        str(m["id"]): str(m["fewshot_id"]) for m in repo.read_messages(connection, story_id)
-    }
+    old_groups = {g["id"] for g in repo.read_groups(connection, story_id)}
+    old_messages = {m["id"]: m["fewshot_id"] for m in repo.read_messages(connection, story_id)}
     for group in body.fewshots:
         if group.id is not None and group.id not in old_groups:
             raise app_error(422, "INVALID_FEWSHOT_REFERENCE", "예시의 연결 정보를 확인해 주세요.")
@@ -129,7 +125,7 @@ def write_fewshots(connection, story_id, body):
         connection,
         story_id,
         body.fewshots,
-        {int(g) for g in old_groups},
-        {int(m) for m in old_messages},
+        old_groups,
+        set(old_messages),
     )
     return groups, people
