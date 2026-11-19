@@ -32,13 +32,11 @@ def put(client, story, groups, key="fewshots-one"):
 
 def character(dsn, story_id, name="하린"):
     with psycopg.connect(dsn) as connection:
-        return str(
-            connection.execute(
-                """INSERT INTO characters(story_id,name,description,position)
-                   VALUES (%s,%s,%s,0) RETURNING id""",
-                (story_id, name, "가상 캐릭터"),
-            ).fetchone()[0]
-        )
+        return connection.execute(
+            """INSERT INTO characters(story_id,name,description,position)
+               VALUES (%s,%s,%s,0) RETURNING id""",
+            (story_id, name, "가상 캐릭터"),
+        ).fetchone()[0]
 
 
 def test_empty_read_does_not_create_rows(context):
@@ -115,10 +113,10 @@ def test_reference_checks_unknown_id_cross_story_and_parent_change(context):
         == 422
     )
     assert (
-        put(client, story, [group("g", [message("m", identity="9223372036854775807")])]).status_code
+        put(client, story, [group("g", [message("m", identity=9223372036854775807)])]).status_code
         == 422
     )
-    assert put(client, story, [group("g", identity="9223372036854775807")]).status_code == 422
+    assert put(client, story, [group("g", identity=9223372036854775807)]).status_code == 422
     response = put(client, story, [group("ga", [message("ma")]), group("gb")], "valid")
     groups = response.json()["fewshots"]
     groups[1]["messages"] = groups[0]["messages"]
@@ -169,7 +167,7 @@ def test_idempotency_concurrency_and_replay_do_not_recreate_or_overwrite(context
         )
         assert (
             connection.execute(
-                "SELECT count(*) FROM expression_write_requests WHERE owner_id=%s", (owner,)
+                "SELECT count(*) FROM creation_write_requests WHERE owner_id=%s", (owner,)
             ).fetchone()[0]
             == 2
         )
@@ -243,8 +241,9 @@ def test_owner_deleted_completed_and_cross_endpoint_key_reuse(context):
         connection.execute(
             "UPDATE stories SET deleted_at=clock_timestamp() WHERE id=%s", (story["id"],)
         )
-    assert client.get(url(story)).status_code == 410
-    assert put(client, story, [], "deleted").status_code == 410
+    for response in (client.get(url(story)), put(client, story, [], "deleted")):
+        assert response.status_code == 404
+        assert response.json()["code"] == "STORY_NOT_FOUND"
 
 
 def test_character_projection_reads_live_metadata_without_body_or_writes(context):
@@ -278,4 +277,28 @@ def test_character_projection_reads_live_metadata_without_body_or_writes(context
             "UPDATE stories SET deleted_at=clock_timestamp() WHERE id=%s",
             (story["id"],),
         )
-    assert client.get(endpoint).status_code == 410
+    assert client.get(endpoint).status_code == 404
+
+
+def test_ids_are_numbers_and_string_ids_are_still_accepted(context):
+    client, _, story, _, dsn = context
+    cid = character(dsn, story["id"])
+    saved = put(client, story, [group("g", [message("m", kind="character", character=cid)])])
+    data = saved.json()
+    assert data["story_id"] == story["id"]
+    assert data["characters"][0]["id"] == cid
+    group_id = data["fewshots"][0]["id"]
+    saved_message = data["fewshots"][0]["messages"][0]
+    assert all(isinstance(v, int) for v in (group_id, saved_message["id"], cid))
+    assert saved_message["character_id"] == cid
+    # 이전 앱이 보내던 문자열 id도 같은 숫자로 받아들인다.
+    legacy = [
+        group(
+            "g",
+            [message("m", "수정", "character", str(cid), str(saved_message["id"]))],
+            str(group_id),
+        )
+    ]
+    again = put(client, story, legacy, "legacy-string-ids")
+    assert again.status_code == 200
+    assert again.json()["fewshots"][0]["messages"][0]["id"] == saved_message["id"]

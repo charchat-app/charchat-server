@@ -73,6 +73,21 @@ CREATE TRIGGER stories_lifecycle_guard
 -- 스토리 및 모든 변경 자식을 한 트랜잭션으로 저장하고 실패 시 전부 롤백한다.
 -- 저장·삭제는 스토리 행 잠금을 공유한다. revision 비교/실시간 알림/자동 병합은 추가하지 않는다.
 
+-- 생성 API 공통: Idempotency-Key 요청 기록(서버 저장소에서 추가, 킥오프 초안 반영 필요).
+-- 2번 표현·퓨샷 임시 저장과 7번 공통 저장(/creation)이 같은 테이블을 쓴다.
+CREATE TABLE creation_write_requests (
+    owner_id bigint NOT NULL,
+    request_id text NOT NULL,
+    story_id bigint NOT NULL REFERENCES stories(id),
+    request_hash text NOT NULL,
+    response jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (owner_id, request_id)
+);
+-- 응답 기록과 저장 내용을 같은 트랜잭션에 커밋한다. 같은 키·같은 내용 재전송은 기록한 응답을
+-- 돌려주고, 같은 키·다른 내용은 거절해 오래된 재전송이 최신 저장을 덮어쓰지 않게 한다.
+-- 보존/정리 정책은 별도 결정한다.
+
 -- 미완성 임시 저장을 위해 제목·소개·세계관의 NULL/초과 입력을 보존한다.
 -- 공개/비공개 저장 시 필수값·합산 길이를 서비스에서 검증한다.
 

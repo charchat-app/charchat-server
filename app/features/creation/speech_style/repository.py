@@ -23,13 +23,13 @@ def read_expression(connection: psycopg.Connection, story_id: int):
 def lock_request(connection: psycopg.Connection, owner_id: int, request_id: str):
     connection.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-        (f"charchat-expression:{owner_id}:{request_id}",),
+        (f"charchat-creation-write:{owner_id}:{request_id}",),
     )
 
 
 def find_request(connection: psycopg.Connection, owner_id: int, request_id: str):
     return connection.execute(
-        """SELECT request_hash, response FROM expression_write_requests
+        """SELECT request_hash, response FROM creation_write_requests
            WHERE owner_id=%s AND request_id=%s""",
         (owner_id, request_id),
     ).fetchone()
@@ -72,7 +72,7 @@ def remember_request(
     response: dict,
 ):
     connection.execute(
-        """INSERT INTO expression_write_requests
+        """INSERT INTO creation_write_requests
            (owner_id, request_id, story_id, request_hash, response) VALUES (%s,%s,%s,%s,%s)""",
         (owner_id, request_id, story_id, request_hash, Jsonb(response)),
     )
