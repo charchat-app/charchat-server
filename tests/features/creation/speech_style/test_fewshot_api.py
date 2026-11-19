@@ -302,3 +302,26 @@ def test_ids_are_numbers_and_string_ids_are_still_accepted(context):
     again = put(client, story, legacy, "legacy-string-ids")
     assert again.status_code == 200
     assert again.json()["fewshots"][0]["messages"][0]["id"] == saved_message["id"]
+
+
+def test_boolean_ids_are_rejected_and_saved_state_is_kept(context):
+    client, _, story, _, dsn = context
+    cid = character(dsn, story["id"])
+    saved = put(client, story, [group("g", [message("m", kind="character", character=cid)])])
+    assert saved.status_code == 200
+    original = client.get(url(story)).json()
+    group_id = original["fewshots"][0]["id"]
+    message_id = original["fewshots"][0]["messages"][0]["id"]
+    # 저장된 id가 1이어도 JSON 불리언 true를 id 1로 바꾸지 않는다.
+    assert (group_id, message_id, cid) == (1, 1, 1)
+    cases = [
+        [group("g", [message("m", identity=message_id)], True)],
+        [group("g", [message("m", identity=True)], group_id)],
+        [group("g", [message("m", kind="character", character=True)], group_id)],
+    ]
+    for index, groups in enumerate(cases):
+        response = put(client, story, groups, f"boolean-{index}")
+        assert response.status_code == 422, response.text
+        assert response.headers["content-type"].startswith("application/problem+json")
+        assert response.json()["code"] == "VALIDATION_ERROR"
+    assert client.get(url(story)).json() == original

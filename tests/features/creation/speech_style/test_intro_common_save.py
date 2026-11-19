@@ -303,3 +303,24 @@ def test_ids_in_intro_responses_are_numbers(context):
     assert isinstance(saved["intros"][0]["id"], int)
     assert isinstance(saved["intros"][0]["messages"][0]["id"], int)
     assert saved["intros"][0]["messages"][0]["character_id"] == hero
+
+
+def test_boolean_intro_ids_are_rejected_and_saved_state_is_kept(context):
+    # 퓨샷과 같은 DbId: JSON true를 id 1로 바꾸지 않는다.
+    client, _, story, _, dsn = context
+    hero = add_character(dsn, story, "하린", 0)
+    saved = put(client, story, payload([intro("i1", "A", [message("a", "본문")])]), "first")
+    assert saved.status_code == 200
+    before = client.get(url(story)).json()
+    first = before["intros"][0]
+    assert (first["id"], first["messages"][0]["id"], hero) == (1, 1, 1)
+    cases = [
+        [intro("i1", "B", [message("a", "본문", message_id=1)], True)],
+        [intro("i1", "B", [message("a", "본문", message_id=True)], 1)],
+        [intro("i1", "B", [message("a", "본문", "character", True, 1)], 1)],
+    ]
+    for index, intros in enumerate(cases):
+        response = put(client, story, payload(intros), f"boolean-{index}")
+        assert response.status_code == 422, response.text
+        assert response.json()["code"] == "VALIDATION_ERROR"
+    assert client.get(url(story)).json() == before

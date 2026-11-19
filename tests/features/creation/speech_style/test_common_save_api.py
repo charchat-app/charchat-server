@@ -243,3 +243,76 @@ def test_completed_rejection_lists_field_issues_with_over_count(context):
         "characters[1].name",
         "characters[2].name",  # ' Doyun' 앞 띄어쓰기
     ]
+
+
+def add_presets(dsn, story, names):
+    with psycopg.connect(dsn) as connection:
+        for position, name in enumerate(names):
+            connection.execute(
+                "INSERT INTO story_user_presets(story_id,name,position) VALUES (%s,%s,%s)",
+                (story["id"], name, position),
+            )
+
+
+def test_multiple_exact_user_placeholder_presets_are_allowed(context):
+    # schema.sql: 여러 {{user}} 프리셋 허용. 정확한 {{user}} 표기는 이름 중복 비교에서 뺀다.
+    client, _, story, _, dsn = context
+    complete(dsn, story)
+    add_presets(dsn, story, ["{{user}}", "{{user}}", "직접 이름"])
+    result = put(client, story, body("private"))
+    assert result.status_code == 200, result.text
+    assert result.json()["save_state"] == "private"
+
+
+@pytest.mark.parametrize("blank", [None, "", "  "])
+def test_blank_user_preset_name_is_field_issue(context, blank):
+    # schema.sql: 완성 저장에서는 제공한 각 프리셋의 이름이 필수다.
+    client, _, story, _, dsn = context
+    complete(dsn, story)
+    add_presets(dsn, story, ["{{user}}", blank])
+    before = client.get(url(story)).json()
+    result = put(client, story, body("private"))
+    assert result.status_code == 422
+    assert result.json()["code"] == "USER_PRESET_NAME_REQUIRED"
+    assert [(i["field"], i["code"]) for i in result.json()["issues"]] == [
+        ("user_presets[1].name", "USER_PRESET_NAME_REQUIRED")
+    ]
+    assert client.get(url(story)).json() == before
+
+
+def test_preset_name_duplicates_character_and_other_preset(context):
+    # 직접 입력 이름은 캐릭터·다른 직접 이름과 대소문자·띄어쓰기를 무시하고 비교한다.
+    client, _, story, _, dsn = context
+    complete(dsn, story)
+    add_presets(dsn, story, ["하 린", "{{user}}", "Alex", "a lex", "{{USER}}"])
+    result = put(client, story, body("private"))
+    assert result.status_code == 422
+    names = [i["field"] for i in result.json()["issues"] if i["code"] == "INVALID_CHARACTER_NAME"]
+    assert sorted(names) == [
+        "characters[0].name",
+        "user_presets[0].name",
+        "user_presets[2].name",
+        "user_presets[3].name",
+    ]
+    assert client.get(url(story)).json()["save_state"] == "draft"
+
+
+def test_tag_issue_index_follows_basic_info_tag_order(context):
+    # 기본 정보 GET은 tags.id 순으로 태그를 준다. 완성 저장 오류 tags[i]도 같은 순서다.
+    client, _, story, _, dsn = context
+    complete(dsn, story)
+    with psycopg.connect(dsn) as connection:
+        for name in ["zzzzzzzzzzz", "a"]:
+            tag_id = connection.execute(
+                "INSERT INTO tags(name) VALUES (%s) RETURNING id", (name,)
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO story_tags(story_id,tag_id) VALUES (%s,%s)", (story["id"], tag_id)
+            )
+    basic = client.get(f"/api/v1/creation/stories/{story['id']}")
+    assert basic.status_code == 200, basic.text
+    assert basic.json()["tags"] == ["zzzzzzzzzzz", "a"]
+    result = put(client, story, body("private"))
+    assert result.status_code == 422
+    tags = [i for i in result.json()["issues"] if i["code"] == "INVALID_TAGS"]
+    assert [(i["field"], i["value"]) for i in tags] == [("tags[0]", "zzzzzzzzzzz")]

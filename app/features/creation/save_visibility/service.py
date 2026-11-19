@@ -21,6 +21,7 @@ MAX_CHARACTERS = 10
 MAX_TAGS = 10
 TAG_LIMIT = 10
 BASIC_FIELDS = ("title", "subtitle", "world_description")
+USER_PLACEHOLDER = "{{user}}"
 
 
 def response(
@@ -142,8 +143,22 @@ def collect_completed_issues(connection, story_id, body) -> list[FieldIssue]:
 
     # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 5번 유저 프리셋 이름
     presets = repository.read_preset_names(connection, story_id)
+    # 캐릭터의 빈 이름은 위 기본 설정 검사에서 이미 알린다.
     named = [(f"characters[{i}].name", p["name"]) for i, p in enumerate(people)]
-    named += [(f"user_presets[{i}].name", name) for i, name in enumerate(presets)]
+    for index, name in enumerate(presets):
+        field = f"user_presets[{index}].name"
+        if _blank(name):
+            # schema.sql: 완성 저장에서는 제공한 각 프리셋의 이름이 필수다.
+            issues.append(
+                FieldIssue(
+                    field=field,
+                    code="USER_PRESET_NAME_REQUIRED",
+                    message="유저 프리셋의 이름을 입력해 주세요.",
+                )
+            )
+        elif name != USER_PLACEHOLDER:
+            # schema.sql: 정확한 {{user}} 표기는 여러 프리셋에 쓸 수 있어 중복 비교에서 뺀다.
+            named.append((field, name))
     by_key = defaultdict(list)
     for field, name in named:
         if _blank(name):

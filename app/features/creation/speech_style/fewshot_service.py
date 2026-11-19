@@ -91,10 +91,7 @@ def save_fewshots(connection, story_id, owner_id, request_id, body):
                 409, "FULL_SAVE_REQUIRED", "완성된 스토리는 공통 저장 흐름으로 수정해야 합니다."
             )
         groups, people = write_fewshots(connection, story_id, body)
-        story["saved_at"] = connection.execute(
-            "UPDATE stories SET saved_at=clock_timestamp() WHERE id=%s RETURNING saved_at",
-            (story_id,),
-        ).fetchone()["saved_at"]
+        story["saved_at"] = repository.touch_saved_at(connection, story_id)
         response = snapshot(story, groups, people, request_id)
         repository.remember_request(
             connection, owner_id, request_id, story_id, digest, response.model_dump(mode="json")

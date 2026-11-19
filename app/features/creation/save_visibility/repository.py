@@ -22,9 +22,10 @@ def read_characters(connection, story_id):
 
 def read_tag_names(connection, story_id):
     # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 1번 tags
+    # 오류 필드 tags[i]가 기본 정보 GET(story_basic, tags.id 순)과 같은 태그를 가리키게 한다.
     rows = connection.execute(
         """SELECT t.name FROM tags t JOIN story_tags s ON s.tag_id=t.id
-           WHERE s.story_id=%s ORDER BY t.name""",
+           WHERE s.story_id=%s ORDER BY t.id""",
         (story_id,),
     ).fetchall()
     return [row["name"] for row in rows]
