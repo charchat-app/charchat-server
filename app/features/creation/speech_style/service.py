@@ -77,3 +77,45 @@ def save_expression(
             response.model_dump(mode="json"),
         )
         return response
+
+
+# 아래는 7번 공통 저장(save_visibility)이 이 기능의 repository를 직접 import하지 않도록 여는
+# 공개 함수다. 요청 기록(creation_write_requests)은 생성 API 공통 테이블이며,
+# common/으로 옮길지는 KAN-13에서 정한다.
+
+
+def find_owned_story(connection: psycopg.Connection, story_id: int, owner_id: int, *, lock=False):
+    """소유자의 삭제되지 않은 스토리. 없으면 404 STORY_NOT_FOUND."""
+    story = repository.find_story(connection, story_id, owner_id, lock=lock)
+    require_story(story)
+    return story
+
+
+def read_expression_fields(connection: psycopg.Connection, story_id: int) -> ExpressionFields:
+    fields = repository.read_expression(connection, story_id)
+    return ExpressionFields(**fields) if fields else DEFAULT_EXPRESSION
+
+
+def write_expression_fields(
+    connection: psycopg.Connection, story_id: int, fields: ExpressionFields
+):
+    return repository.write_expression(connection, story_id, fields.model_dump(mode="json"))
+
+
+def lock_write_request(connection: psycopg.Connection, owner_id: int, request_id: str):
+    repository.lock_request(connection, owner_id, request_id)
+
+
+def find_write_request(connection: psycopg.Connection, owner_id: int, request_id: str):
+    return repository.find_request(connection, owner_id, request_id)
+
+
+def remember_write_request(
+    connection: psycopg.Connection,
+    owner_id: int,
+    request_id: str,
+    story_id: int,
+    request_hash: str,
+    response: dict,
+):
+    repository.remember_request(connection, owner_id, request_id, story_id, request_hash, response)
