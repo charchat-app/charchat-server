@@ -3,10 +3,25 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-# 기본 정보 API와 같이 DB id는 숫자(양의 bigint)로 주고받는다.
-DbId = Annotated[int, Field(gt=0, le=9223372036854775807)]
+
+def _reject_bool(value):
+    # int 변환은 JSON true/false를 1/0으로 바꾼다. id 자리의 불리언은 변환 전에 거절한다.
+    if isinstance(value, bool):
+        raise ValueError("id는 숫자여야 합니다.")
+    return value
+
+
+# 기본 정보 API와 같이 DB id는 숫자(양의 bigint)로 주고받는다. 이전 앱의 숫자 문자열도 받는다.
+DbId = Annotated[int, BeforeValidator(_reject_bool), Field(gt=0, le=9223372036854775807)]
 ClientKey = Annotated[str, Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")]
 
 

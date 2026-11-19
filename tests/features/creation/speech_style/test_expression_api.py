@@ -4,11 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 import pytest
-from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.features.creation.common.errors import app_error
 from app.features.creation.speech_style import repository
-from app.main import create_app
 
 DEFAULT = {
     "point_of_view": "third_person",
@@ -31,14 +30,13 @@ def put(client, url, fields=None, key="request-one", **extra):
     )
 
 
-def test_requests_without_dev_user_header_are_rejected(db_url):
+def test_requests_without_dev_user_header_are_rejected(client):
     # 다른 이름의 소유자 헤더나 잘못된 값으로는 사용자를 정할 수 없다.
-    with TestClient(create_app(db_url)) as client:
-        for headers in [{}, {"X-Owner-Id": "1"}, {"X-User-Id": "0"}, {"X-User-Id": "abc"}]:
-            response = client.get("/api/v1/creation/stories/1/expression", headers=headers)
-            assert response.status_code == 401
-            assert response.headers["content-type"].startswith("application/problem+json")
-            assert response.json()["code"] == "UNAUTHENTICATED"
+    for headers in [{}, {"X-Owner-Id": "1"}, {"X-User-Id": "0"}, {"X-User-Id": "abc"}]:
+        response = client.get("/api/v1/creation/stories/1/expression", headers=headers)
+        assert response.status_code == 401
+        assert response.headers["content-type"].startswith("application/problem+json")
+        assert response.json()["code"] == "UNAUTHENTICATED"
 
 
 def test_get_default_is_read_only_CREATE_US_02_AC01(context):
@@ -179,16 +177,17 @@ def test_request_contract_and_cors(context):
     assert client.put(endpoint(story), json={"expression": DEFAULT}).status_code == 422
     assert put(client, endpoint(story), owner_id=999).status_code == 422
     assert client.get("/api/v1/creation/stories/9223372036854775808/expression").status_code == 422
+    origin = settings.cors_origins[0]
     response = client.options(
         endpoint(story),
         headers={
-            "Origin": "http://localhost:8089",
+            "Origin": origin,
             "Access-Control-Request-Method": "PUT",
             "Access-Control-Request-Headers": "content-type,idempotency-key",
         },
     )
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "http://localhost:8089"
+    assert response.headers["access-control-allow-origin"] == origin
 
 
 def test_story_id_is_number_in_responses(context):

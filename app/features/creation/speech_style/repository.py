@@ -57,6 +57,11 @@ def write_expression(connection: psycopg.Connection, story_id: int, fields: dict
             fields["custom_style"],
         ),
     )
+    return touch_saved_at(connection, story_id)
+
+
+def touch_saved_at(connection: psycopg.Connection, story_id: int):
+    """표현·퓨샷 저장이 공유하는 스토리 마지막 저장 시각 갱신."""
     return connection.execute(
         "UPDATE stories SET saved_at=clock_timestamp() WHERE id=%s RETURNING saved_at",
         (story_id,),
