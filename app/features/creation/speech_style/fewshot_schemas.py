@@ -1,0 +1,99 @@
+"""CREATE-US-02 퓨샷 전체 편집 컬렉션 계약. 배열 순서가 저장 순서다."""
+
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+def _reject_bool(value):
+    # int 변환은 JSON true/false를 1/0으로 바꾼다. id 자리의 불리언은 변환 전에 거절한다.
+    if isinstance(value, bool):
+        raise ValueError("id는 숫자여야 합니다.")
+    return value
+
+
+# 기본 정보 API와 같이 DB id는 숫자(양의 bigint)로 주고받는다. 이전 앱의 숫자 문자열도 받는다.
+DbId = Annotated[int, BeforeValidator(_reject_bool), Field(gt=0, le=9223372036854775807)]
+ClientKey = Annotated[str, Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")]
+
+
+class FewshotMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: DbId | None = None
+    client_key: ClientKey
+    speaker_kind: Literal["user", "character", "narrator"]
+    character_id: DbId | None = None
+    body: str | None = None
+
+    @model_validator(mode="after")
+    def check_speaker(self):
+        if (self.speaker_kind == "character") != (self.character_id is not None):
+            raise ValueError("발화자와 캐릭터 연결을 확인하세요.")
+        return self
+
+    @field_validator("body")
+    @classmethod
+    def check_body(cls, value):
+        if value is not None and "\x00" in value:
+            raise ValueError("저장할 수 없는 문자가 있습니다. 원문을 수정해 주세요.")
+        return value
+
+
+class FewshotGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: DbId | None = None
+    client_key: ClientKey
+    messages: list[FewshotMessage]
+
+
+class FewshotsSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fewshots: list[FewshotGroup]
+
+    @model_validator(mode="after")
+    def unique_references(self):
+        keys, groups, messages = set(), set(), set()
+        for group in self.fewshots:
+            for item in [group, *group.messages]:
+                if item.client_key in keys:
+                    raise ValueError("편집 식별자는 중복할 수 없습니다.")
+                keys.add(item.client_key)
+            if group.id is not None:
+                if group.id in groups:
+                    raise ValueError("예시 ID는 중복할 수 없습니다.")
+                groups.add(group.id)
+            for message in group.messages:
+                if message.id is not None:
+                    if message.id in messages:
+                        raise ValueError("메시지 ID는 중복할 수 없습니다.")
+                    messages.add(message.id)
+        return self
+
+
+class FewshotCharacter(BaseModel):
+    id: DbId
+    name: str | None
+    position: int
+
+
+class FewshotCharactersResponse(BaseModel):
+    story_id: DbId
+    characters: list[FewshotCharacter]
+
+
+class FewshotsResponse(BaseModel):
+    story_id: DbId
+    title: str | None
+    save_state: Literal["draft", "private", "public"]
+    saved_at: datetime
+    characters: list[FewshotCharacter]
+    fewshots: list[FewshotGroup]
+    request_id: str | None = None
