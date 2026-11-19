@@ -49,13 +49,11 @@ def put(client, story, body, key):
 
 def add_character(dsn, story, name, position):
     with psycopg.connect(dsn) as connection:
-        return str(
-            connection.execute(
-                "INSERT INTO characters(story_id,name,description,position) "
-                "VALUES (%s,%s,'상세',%s) RETURNING id",
-                (story["id"], name, position),
-            ).fetchone()[0]
-        )
+        return connection.execute(
+            "INSERT INTO characters(story_id,name,description,position) "
+            "VALUES (%s,%s,'상세',%s) RETURNING id",
+            (story["id"], name, position),
+        ).fetchone()[0]
 
 
 def complete_basics(dsn, story):
@@ -255,3 +253,50 @@ def test_intro_write_rolls_back_with_common_save(context, monkeypatch):
     monkeypatch.setattr(repository, "remember_request", fail)
     assert put(client, story, payload([]), "rollback").status_code == 503
     assert client.get(url(story)).json() == before
+
+
+@pytest.mark.parametrize("state", ["private", "public"])
+def test_completed_save_reports_each_intro_issue_CREATE_US_03_AC03(context, state):
+    client, _, story, _, dsn = context
+    complete_basics(dsn, story)
+    intros = [
+        intro("i0", "첫째", [message("a", "본문")]),
+        intro("i1", "", [message("b", "본문")]),
+        intro("i2", "셋째", [message("c", "가" * 1500), message("d", "😀" * 512)]),
+    ]
+    result = put(client, story, payload(intros, state), "issues")
+    assert result.status_code == 422
+    data = result.json()
+    assert data["code"] == "INTRO_TITLE_REQUIRED"
+    assert data["issues"] == [
+        {
+            "field": "intros[1].title",
+            "code": "INTRO_TITLE_REQUIRED",
+            "value": None,
+            "message": "인트로의 상황 제목을 작성해 주세요.",
+        },
+        {
+            "field": "intros[2].messages",
+            "code": "INTRO_TOO_LONG",
+            "value": "12",
+            "message": (
+                "인트로 본문이 2,012자예요. 인트로마다 2,000자 이내로 줄여 주세요. (12자 초과)"
+            ),
+        },
+    ]
+    assert client.get(url(story)).json()["save_state"] == "draft"
+
+
+def test_ids_in_intro_responses_are_numbers(context):
+    client, _, story, _, dsn = context
+    hero = add_character(dsn, story, "하린", 0)
+    saved = put(
+        client,
+        story,
+        payload([intro("i", "A", [message("m", "대사", "character", hero)])]),
+        "ids",
+    ).json()
+    assert saved["story_id"] == story["id"]
+    assert isinstance(saved["intros"][0]["id"], int)
+    assert isinstance(saved["intros"][0]["messages"][0]["id"], int)
+    assert saved["intros"][0]["messages"][0]["character_id"] == hero
