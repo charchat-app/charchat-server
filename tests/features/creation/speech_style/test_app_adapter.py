@@ -14,7 +14,7 @@ import uvicorn
 
 
 @pytest.mark.app_integration
-def test_actual_app_adapter_round_trip(context):
+def test_actual_app_adapter_round_trip(adapter_context):
     # 명시한 앱 체크아웃에서만 실행한다. 공유 DB 주소는 읽지 않는다.
     app_root = os.environ.get("CHARCHAT_TEST_APP_ROOT")
     if not app_root:
@@ -22,7 +22,7 @@ def test_actual_app_adapter_round_trip(context):
     script = Path(app_root).resolve() / "scripts/test-expression-server.cjs"
     if not script.is_file() or not shutil.which("node"):
         pytest.fail("앱 검사 소스와 Node가 필요합니다.")
-    _, app, story, _, dsn = context
+    app, story, dsn = adapter_context
     with psycopg.connect(dsn) as connection:
         connection.execute(
             "UPDATE stories SET subtitle='합동 검사 소개' WHERE id=%s", (story["id"],)
