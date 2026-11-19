@@ -30,6 +30,7 @@ def intro(key, title, messages, intro_id=None):
         "client_key": key,
         "title": title,
         "messages": messages,
+        "scene": {},
     }
 
 
@@ -38,6 +39,8 @@ def payload(intros, state="draft", fewshots=None):
         "expression": DEFAULT_EXPRESSION.model_dump(),
         "fewshots": fewshots or [],
         "intros": intros,
+        "relations": [],
+        "affinities": [],
         "save_state": state,
         "mode": "manual",
     }

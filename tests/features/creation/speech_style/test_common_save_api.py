@@ -52,8 +52,11 @@ def body(state="draft", text="", few="", mode="manual"):
                         "body": "*비가 내린다.*",
                     }
                 ],
+                "scene": {},
             }
         ],
+        "relations": [],
+        "affinities": [],
         "save_state": state,
         "mode": mode,
     }
@@ -78,6 +81,8 @@ def current_payload(response, state=None):
         "expression": deepcopy(response["expression"]),
         "fewshots": deepcopy(response["fewshots"]),
         "intros": deepcopy(response["intros"]),
+        "relations": deepcopy(response["relations"]),
+        "affinities": deepcopy(response["affinities"]),
         "save_state": state or response["save_state"],
         "mode": "manual",
     }

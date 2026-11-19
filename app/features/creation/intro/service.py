@@ -1,12 +1,15 @@
 """CREATE-US-03 인트로 조회·컬렉션 저장·참조 검증·완성 저장 조건."""
 
 from app.features.creation.common.errors import app_error
+from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import repository as repo
 from app.features.creation.intro.schemas import INTRO_BODY_LIMIT, INTRO_TITLE_LIMIT
 from app.features.creation.save_visibility.schemas import FieldIssue
 
 
 def read_intros(connection, story_id):
+    # CREATE-US-04 인트로별 장면을 함께 돌려준다. 행이 없으면 미지정 장면.
+    scenes = initial_state.read_scenes(connection, story_id)
     grouped = {}
     for row in repo.read_messages(connection, story_id):
         grouped.setdefault(row["intro_id"], []).append(
@@ -24,6 +27,7 @@ def read_intros(connection, story_id):
             "client_key": f"intro-{intro['id']}",
             "title": intro["title"],
             "messages": grouped.get(intro["id"], []),
+            "scene": scenes.get(intro["id"]) or initial_state.empty_scene(),
         }
         for intro in repo.read_intros(connection, story_id)
     ]
@@ -46,7 +50,11 @@ def write_intros(connection, story_id, intros, character_ids):
                 )
             if message.character_id is not None and message.character_id not in character_ids:
                 raise app_error(422, "INVALID_SPEAKER", "같은 스토리의 인물을 선택해 주세요.")
-    return repo.write_collection(connection, story_id, intros, old_intros, set(old_messages))
+    initial_state.check_scene_people(intros, character_ids)
+    result = repo.write_collection(connection, story_id, intros, old_intros, set(old_messages))
+    for intro, saved in zip(intros, result, strict=True):
+        saved["scene"] = initial_state.write_scene(connection, saved["id"], intro.scene)
+    return result
 
 
 def collect_completed_issues(intros) -> list[FieldIssue]:

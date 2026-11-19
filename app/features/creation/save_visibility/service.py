@@ -1,4 +1,4 @@
-"""2·3번 조각을 저장 상태와 함께 하나의 트랜잭션에 반영한다."""
+"""2·3·4번 조각을 저장 상태와 함께 하나의 트랜잭션에 반영한다."""
 
 import hashlib
 import json
@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from app.features.creation.common.errors import app_error
 from app.features.creation.common.names import has_surrounding_space, name_compare_key
+from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import service as intro_service
 from app.features.creation.save_visibility import repository
 from app.features.creation.save_visibility.schemas import CreationSaveResponse, FieldIssue
@@ -30,6 +31,8 @@ def response(
     people=None,
     request_id=None,
     intros=None,
+    relations=None,
+    affinities=None,
 ):
     few = (
         fewshot_service.read_snapshot(connection, story)
@@ -40,6 +43,12 @@ def response(
         **few.model_dump(),
         expression=speech_style.read_expression_fields(connection, story["id"]),
         intros=intro_service.read_intros(connection, story["id"]) if intros is None else intros,
+        relations=initial_state.read_relations(connection, story["id"])
+        if relations is None
+        else relations,
+        affinities=initial_state.read_affinities(connection, story["id"])
+        if affinities is None
+        else affinities,
     )
 
 
@@ -87,6 +96,7 @@ def collect_completed_issues(connection, story_id, body) -> list[FieldIssue]:
             )
         )
     issues += intro_service.collect_completed_issues(body.intros)
+    issues += initial_state.collect_completed_issues(body.intros, body.relations, body.affinities)
 
     # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 1번 기본 정보·캐릭터
     basic = repository.read_basic(connection, story_id)
@@ -231,14 +241,24 @@ def save_creation(connection, story_id, owner_id, request_id, body):
             )
         if body.mode == "auto" and (current != "draft" or target != "draft"):
             raise app_error(409, "AUTO_SAVE_NOT_ALLOWED", "자동 저장은 임시 저장에만 적용됩니다.")
+        # 방식·시간제를 바꾼 장면의 이전 입력을 비운 뒤 검사·저장한다 (CREATE-US-04-AC07).
+        initial_state.clear_switched_inputs(connection, story_id, body.intros)
         if target != "draft":
             validate_completed(connection, story_id, body)
         groups, people = fewshot_service.write_fewshots(connection, story_id, body)
         character_ids = {p["id"] for p in people}
         intros = intro_service.write_intros(connection, story_id, body.intros, character_ids)
+        relations = initial_state.write_relations(
+            connection, story_id, body.relations, character_ids
+        )
+        affinities = initial_state.write_affinities(
+            connection, story_id, body.affinities, character_ids
+        )
         speech_style.write_expression_fields(connection, story_id, body.expression)
         story.update(repository.update_save_state(connection, story_id, target))
-        result = response(connection, story, groups, people, request_id, intros)
+        result = response(
+            connection, story, groups, people, request_id, intros, relations, affinities
+        )
         speech_style.remember_write_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )

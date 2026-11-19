@@ -1,18 +1,38 @@
-"""7번 공통 저장 중 2·3번 소유 영역과 저장 상태 계약."""
+"""7번 공통 저장 중 2·3·4번 소유 영역과 저장 상태 계약."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
+from app.features.creation.initial_state.schemas import (
+    MAX_AFFINITIES,
+    MAX_RELATIONS,
+    InitialAffinity,
+    InitialRelation,
+    unique_affinities,
+    unique_relations,
+)
 from app.features.creation.intro.schemas import Intro, IntroList
 from app.features.creation.speech_style.fewshot_schemas import FewshotsResponse, FewshotsSaveRequest
 from app.features.creation.speech_style.schemas import ExpressionFields
+
+# 기본 정보 요청 상한(캐릭터 50명) + 유저 기준 방향쌍 수. 계산은 initial_state/schemas.py.
+RelationList = Annotated[
+    list[InitialRelation], Field(max_length=MAX_RELATIONS), AfterValidator(unique_relations)
+]
+AffinityList = Annotated[
+    list[InitialAffinity], Field(max_length=MAX_AFFINITIES), AfterValidator(unique_affinities)
+]
 
 
 class CreationSaveRequest(FewshotsSaveRequest):
     expression: ExpressionFields
     # 누락을 허용하지 않아 실수로 전체 인트로를 삭제하지 않게 한다. 빈 배열은 전체 삭제다.
     intros: IntroList
+    # CREATE-US-04 스토리 공통 초기 관계. 빈 배열은 전체 미지정이다.
+    relations: RelationList
+    # CREATE-US-04-AC09 방향별 초기 호감도. 관계와 독립이며 빈 배열은 모든 조합 0이다.
+    affinities: AffinityList
     save_state: Literal["draft", "private", "public"]
     mode: Literal["manual", "auto"] = "manual"
 
@@ -20,6 +40,8 @@ class CreationSaveRequest(FewshotsSaveRequest):
 class CreationSaveResponse(FewshotsResponse):
     expression: ExpressionFields
     intros: list[Intro]
+    relations: list[InitialRelation]
+    affinities: list[InitialAffinity]
 
 
 class FieldIssue(BaseModel):
