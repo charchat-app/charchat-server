@@ -1,14 +1,18 @@
 """CREATE-US-01 엔드포인트. 스토리 기본 정보·세계관·해시태그 저장과 재조회."""
 
-from fastapi import APIRouter
+from typing import Annotated
+
+from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUserId, DbConn
 from app.features.creation.story_basic import service
 from app.features.creation.story_basic.schemas import (
+    PublicStorySummaryResponse,
     StoryCreateRequest,
     StoryResponse,
     StorySummaryResponse,
     StoryUpdateRequest,
+    TagSuggestionResponse,
 )
 
 router = APIRouter(tags=["creation:story_basic"])
@@ -38,3 +42,26 @@ def update_story(
 ) -> StoryResponse:
     """기본 정보를 저장한다."""
     return service.update_story(conn, user_id, story_id, body)
+
+
+@router.get("/tags", response_model=list[TagSuggestionResponse])
+def suggest_tags(
+    q: Annotated[str, Query(min_length=1, max_length=100, description="입력 중인 해시태그")],
+    user_id: CurrentUserId,
+    conn: DbConn,
+) -> list[TagSuggestionResponse]:
+    """해시태그 자동검색 후보와 공개 스토리 수 (CREATE-US-01-AC17)."""
+    return service.suggest_tags(conn, q)
+
+
+@router.get("/tags/stories", response_model=list[PublicStorySummaryResponse])
+def search_stories_by_tag(
+    tag: Annotated[str, Query(min_length=1, max_length=100, description="찾을 해시태그")],
+    user_id: CurrentUserId,
+    conn: DbConn,
+) -> list[PublicStorySummaryResponse]:
+    """해시태그가 붙은 공개 스토리 (CREATE-US-01-AC16). 화면은 탐색 기능에서 연결한다.
+
+    태그에 '/' 등이 들어가도 찾을 수 있게 경로가 아니라 쿼리(?tag=)로 받는다.
+    """
+    return service.search_public_stories_by_tag(conn, tag)
