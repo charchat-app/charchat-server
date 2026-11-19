@@ -90,9 +90,13 @@ class IntroScene(BaseModel):
         ids = [c.character_id for c in self.characters]
         if len(set(ids)) != len(ids):
             raise ValueError("같은 캐릭터 상태를 중복할 수 없습니다.")
-        # 착장·속마음이 모두 빈 캐릭터는 미지정이므로 행을 만들지 않는다.
-        self.characters = [c for c in self.characters if c.clothing or c.inner_thought]
+        # 착장·속마음이 모두 빈 캐릭터도 요청 배열에 남겨 오류 위치(characters[i])를 요청과
+        # 맞춘다. 빈 항목은 저장 직전에 뺀다(filled_characters).
         return self
+
+    def filled_characters(self):
+        """착장·속마음 중 하나라도 있는 캐릭터 상태. 모두 빈 캐릭터는 미지정(행 없음)이다."""
+        return [c for c in self.characters if c.clothing or c.inner_thought]
 
 
 class InitialRelation(BaseModel):

@@ -71,13 +71,17 @@ def clear_switched_inputs(connection, story_id, intros):
 
 def check_scene_people(intros, character_ids):
     for intro in intros:
-        if any(state.character_id not in character_ids for state in intro.scene.characters):
+        # 저장하지 않는 빈 상태는 이전처럼 인물 검사에서도 제외한다.
+        filled = intro.scene.filled_characters()
+        if any(state.character_id not in character_ids for state in filled):
             raise app_error(
                 422, "INVALID_SCENE_CHARACTER", "같은 스토리의 캐릭터 상태만 저장할 수 있습니다."
             )
 
 
 def write_scene(connection, intro_id, scene):
+    # 빈 캐릭터 상태는 완성 검사 뒤 저장 직전에 뺀다. 응답도 저장된 내용과 같게 돌려준다.
+    scene = scene.model_copy(update={"characters": scene.filled_characters()})
     repo.write_scene(connection, intro_id, scene)
     return scene.model_dump()
 

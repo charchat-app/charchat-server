@@ -576,6 +576,7 @@ def test_relation_and_affinity_caps_follow_fifty_character_limit(context):
     "scene",
     [
         {"date_mode": "calendar", "year_input": "9" * 5000},
+        {"date_mode": "calendar", "year_input": "1", "month_input": "1" * 21, "day_input": "1"},
         {"date_mode": "elapsed", "reference_event": "감금", "elapsed_day_input": "1" * 21},
         {"hour_input": "1" * 5000, "minute_input": "0"},
         {"hour_input": "1", "minute_input": "0" * 21},
@@ -601,7 +602,13 @@ def test_very_long_affinity_is_rejected_as_validation_error(context):
     ("scene", "value", "code"),
     [
         (
-            {"date_mode": "calendar", "year_input": "0" * 19 + "1", "month_input": "1"},
+            # 일·월이 유효해 연도 자릿수 검사만으로 거절되는지 확인한다.
+            {
+                "date_mode": "calendar",
+                "year_input": "0" * 19 + "1",
+                "month_input": "1",
+                "day_input": "1",
+            },
             None,
             "INITIAL_DATE_INVALID",
         ),
@@ -653,3 +660,67 @@ def test_completed_initial_state_rejection_lists_field_issues(context):
         ("relations[0].label", "INITIAL_TEXT_TOO_LONG"): "2",
         ("affinities[0].value", "AFFINITY_INVALID"): "101",
     }
+
+
+def test_completed_issue_uses_request_index_after_empty_character_state(context):
+    """착장·속마음이 빈 항목도 요청 배열 인덱스를 차지한다. 빈 항목은 저장하지 않는다."""
+    client, _, story, _, dsn = context
+    a, b = people(dsn, story, "하린", "도윤")
+    scene = {
+        "characters": [
+            {"character_id": a, "clothing": "", "inner_thought": None},
+            {"character_id": b, "clothing": None, "inner_thought": "나" * 101},
+        ]
+    }
+    result = put(client, story, payload([intro("i", scene=scene)], state="private"), "empty-first")
+    assert result.status_code == 422
+    assert [(i["field"], i["value"]) for i in result.json()["issues"]] == [
+        ("intros[0].scene.characters[1].inner_thought", "1")
+    ]
+    assert client.get(url(story)).json()["save_state"] == "draft"
+    scene["characters"][1]["inner_thought"] = "나" * 100
+    saved = put(client, story, payload([intro("i", scene=scene)], state="private"), "fixed")
+    assert saved.status_code == 200, saved.text
+    expected = [{"character_id": b, "clothing": None, "inner_thought": "나" * 100}]
+    assert saved.json()["intros"][0]["scene"]["characters"] == expected
+    assert _saved_scene(client, story)["scene"]["characters"] == expected
+
+
+def test_fifty_characters_save_every_relation_and_affinity_direction(context):
+    """기본 정보 상한 50명일 때 모든 방향쌍(관계 51×50, 호감도 50×50)을 저장한다."""
+    client, _, story, _, dsn = context
+    ids = people(dsn, story, *[f"인물{n}" for n in range(50)])
+    everyone = [None, *ids]
+    relations = [
+        relation(f"r{i}-{j}", s, t, "관계")
+        for i, s in enumerate(everyone)
+        for j, t in enumerate(everyone)
+        if i != j
+    ]
+    affinities = [aff(s, t, "1") for s in ids for t in everyone if t != s]
+    assert (len(relations), len(affinities)) == (51 * 50, 50 * 50)
+    result = put(client, story, payload([intro("i")], relations, affinities=affinities), "fifty")
+    assert result.status_code == 200, result.text
+    data = client.get(url(story)).json()
+    assert (len(data["relations"]), len(data["affinities"])) == (2550, 2500)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        lambda a: payload([intro("i", scene={"characters": [{"character_id": True}]})]),
+        lambda a: payload([intro("i")], [relation("r", True, None, "친구")]),
+        lambda a: payload([intro("i")], [relation("r", a, True, "친구")]),
+        lambda a: payload([intro("i")], affinities=[aff(True, None, "1")]),
+        lambda a: payload([intro("i")], affinities=[aff(a, True, "1")]),
+    ],
+)
+def test_boolean_person_ids_are_rejected(context, case):
+    # 퓨샷과 같은 DbId: JSON true를 캐릭터 id 1로 바꾸지 않는다.
+    client, _, story, _, dsn = context
+    (a,) = people(dsn, story, "하린")
+    assert a == 1
+    result = put(client, story, case(a), "boolean")
+    assert result.status_code == 422, result.text
+    assert result.json()["code"] == "VALIDATION_ERROR"
+    assert client.get(url(story)).json()["intros"] == []
