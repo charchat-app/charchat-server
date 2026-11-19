@@ -5,12 +5,19 @@
 """
 
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, Field
 
 # 요청 하나에 담을 수 있는 캐릭터 수의 하드 상한. 등록 조건(1~10명)과 별개다.
 # 임시 저장은 조건을 넘는 입력도 보존해야 하므로 넉넉하게 두고, 과도한 요청만 형식 오류로 막는다.
 MAX_CHARACTERS_PER_REQUEST = 50
+
+# 해시태그도 같은 이유의 하드 상한. 등록 조건(최대 10개·태그당 10자)은 issues로 안내한다.
+MAX_TAGS_PER_REQUEST = 50
+MAX_TAG_INPUT_LENGTH = 100
+
+TagInput = Annotated[str, Field(max_length=MAX_TAG_INPUT_LENGTH)]
 
 
 class CharacterWriteItem(BaseModel):
@@ -25,7 +32,9 @@ class StoryCreateRequest(BaseModel):
     title: str | None = None
     subtitle: str | None = Field(default=None, description="한 줄 소개")
     world_description: str | None = Field(default=None, description="세계관(서사)")
-    tags: list[str] = Field(default_factory=list, description="해시태그 원문")
+    tags: list[TagInput] = Field(
+        default_factory=list, max_length=MAX_TAGS_PER_REQUEST, description="해시태그 원문"
+    )
     characters: list[CharacterWriteItem] = Field(
         default_factory=list,
         max_length=MAX_CHARACTERS_PER_REQUEST,
@@ -44,7 +53,9 @@ class StoryUpdateRequest(BaseModel):
     title: str | None = None
     subtitle: str | None = Field(default=None, description="한 줄 소개")
     world_description: str | None = Field(default=None, description="세계관(서사)")
-    tags: list[str] | None = Field(default=None, description="해시태그 원문. null이면 유지")
+    tags: list[TagInput] | None = Field(
+        default=None, max_length=MAX_TAGS_PER_REQUEST, description="해시태그 원문. null이면 유지"
+    )
     characters: list[CharacterWriteItem] | None = Field(
         default=None,
         max_length=MAX_CHARACTERS_PER_REQUEST,
@@ -58,6 +69,14 @@ class FieldIssue(BaseModel):
     field: str = Field(description="문제가 있는 필드. 예: title, characters[0].name")
     code: str = Field(description="프론트 분기용 코드. 예: REQUIRED")
     message: str
+    value: str | None = Field(
+        default=None,
+        description=(
+            "문제가 된 값의 원문. 해시태그 안내에 넣는다. tags[i]의 i는 응답마다 "
+            "순서 기준이 다를 수 있으므로(저장 응답은 서버 순서, 거절 응답은 요청 순서) "
+            "이 값으로 태그를 찾는다."
+        ),
+    )
 
 
 class StorySummaryResponse(BaseModel):
@@ -88,3 +107,20 @@ class StoryResponse(BaseModel):
     issues: list[FieldIssue] = Field(
         description="완성 저장 조건 위반 목록. 비어 있으면 기본 정보·캐릭터 조건을 충족한다."
     )
+
+
+class TagSuggestionResponse(BaseModel):
+    """해시태그 자동검색 후보 (CREATE-US-01-AC17)."""
+
+    name: str
+    public_story_count: int = Field(description="이 태그가 붙은 공개 스토리 수. 비공개·임시 제외")
+
+
+class PublicStorySummaryResponse(BaseModel):
+    """해시태그 검색 결과의 공개 스토리 한 줄 (CREATE-US-01-AC16)."""
+
+    id: int
+    title: str | None
+    subtitle: str | None
+    tags: list[str]
+    saved_at: datetime
