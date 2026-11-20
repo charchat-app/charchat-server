@@ -278,13 +278,12 @@ def _save_story_images(connection, story_id, owner_id, request_id, body):
             previous_copy = working_copy.write_images(connection, story_id, document, requested)
             repository.refresh_orphaned(connection, previous_copy | requested)
         else:
-            touched_characters = [c.character_id for c in body.characters]
-            before = repository.linked_image_ids(connection, story_id, touched_characters)
-            repository.replace_story_images(connection, story_id, body.story_image_ids)
-            for character in body.characters:
-                repository.replace_character_images(
-                    connection, character.character_id, character.image_ids
-                )
+            before = _replace_lists(
+                connection,
+                story_id,
+                body.story_image_ids,
+                {c.character_id: c.image_ids for c in body.characters},
+            )
             # AC08: 공개·비공개 스토리는 저장 뒤에도 캐릭터마다 이미지가 있어야 한다.
             # 조건을 깨면 예외로 트랜잭션 전체를 되돌린다(미등록 스토리는 그대로 저장).
             if story["save_state"] != "draft":
@@ -307,6 +306,57 @@ def _save_story_images(connection, story_id, owner_id, request_id, body):
             response.model_dump(mode="json"),
         )
         return response, released
+
+
+def _replace_lists(
+    connection, story_id: int, story_image_ids: list[int], characters: dict[int, list[int]]
+) -> set[int]:
+    """스토리 이미지 목록과 담긴 캐릭터의 이미지 목록을 바꾼다.
+
+    바꾸기 전에 연결돼 있던 이미지 ID를 돌려준다.
+    """
+    before = repository.linked_image_ids(connection, story_id, list(characters))
+    repository.replace_story_images(connection, story_id, story_image_ids)
+    for character_id, image_ids in characters.items():
+        repository.replace_character_images(connection, character_id, image_ids)
+    return before
+
+
+def apply_working_copy(connection: psycopg.Connection, story_id: int) -> set[int]:
+    """공통 「저장」에서 이미지 임시 저장본도 함께 반영한다(안 B: 저장하면 사진까지 한 번에).
+
+    호출 측 트랜잭션 안에서 부르고, 반영한 뒤 호출 측이 완성 검사(캐릭터마다 이미지 1장 이상)를
+    한다. 검사가 실패하면 트랜잭션 전체가 되돌아가 사진도 반영되지 않고 임시 저장본도 남는다.
+    임시 저장 뒤 지워진 캐릭터의 목록은 건너뛴다.
+    커밋 뒤 지울 후보(연결이 끊긴 이미지 ID)를 돌려준다.
+    """
+    copy = working_copy.read(connection, story_id)
+    draft = copy["images"] if copy else None
+    if draft is None:
+        return set()
+    existing = {c["id"] for c in repository.list_characters(connection, story_id)}
+    characters = {
+        c["character_id"]: c["image_ids"]
+        for c in draft["characters"]
+        if c["character_id"] in existing
+    }
+    requested = set(draft["story_image_ids"])
+    for image_ids in characters.values():
+        requested.update(image_ids)
+    before = _replace_lists(connection, story_id, draft["story_image_ids"], characters)
+    previous_copy = working_copy.clear_images(connection, story_id)
+    repository.refresh_orphaned(connection, before | requested | previous_copy)
+    repository.touch_saved_at(connection, story_id)
+    return (before | previous_copy) - requested
+
+
+def images_working_copy_saved_at(connection: psycopg.Connection, story_id: int):
+    """이미지 임시 저장본 시각. 없으면 None.
+
+    공통 저장 화면이 「저장」할 사진이 있는지 알 때 쓴다.
+    """
+    copy = working_copy.read(connection, story_id)
+    return copy["images_saved_at"] if copy and copy["images"] is not None else None
 
 
 logger = logging.getLogger(__name__)

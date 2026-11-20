@@ -75,8 +75,15 @@ def get_creation(connection, story_id, owner_id):
         story = speech_style.find_owned_story(connection, story_id, owner_id)
         copy = working_copy.read(connection, story_id)
         if copy and copy["creation"] is not None:
-            return working_response(connection, story, copy["creation"], copy["creation_saved_at"])
-        return response(connection, story)
+            result = working_response(
+                connection, story, copy["creation"], copy["creation_saved_at"]
+            )
+        else:
+            result = response(connection, story)
+        result.images_working_copy_saved_at = images_service.images_working_copy_saved_at(
+            connection, story_id
+        )
+        return result
 
 
 def too_long(field, code, length, limit, message):
@@ -237,7 +244,18 @@ def validate_completed(connection, story_id, body):
         )
 
 
-def save_creation(connection, story_id, owner_id, request_id, body):
+def save_creation(connection, story_id, owner_id, request_id, body, storage=None):
+    """2~4번 공통 저장. 「저장」이면 이미지 임시 저장본도 함께 검사·반영한다(안 B).
+
+    반영으로 연결이 끊긴 예전 사진은 커밋 뒤 바로 지운다(다른 곳에서 쓰는 사진은 남는다).
+    """
+    result, released = _save_creation(connection, story_id, owner_id, request_id, body)
+    if storage is not None and released:
+        images_service.release_images(connection, storage, released)
+    return result
+
+
+def _save_creation(connection, story_id, owner_id, request_id, body):
     payload = {
         "operation": "creation-save-v4",
         "story_id": str(story_id),
@@ -253,7 +271,7 @@ def save_creation(connection, story_id, owner_id, request_id, body):
         if previous:
             if previous["request_hash"] != digest:
                 raise app_error(409, "IDEMPOTENCY_KEY_REUSED", "같은 요청키의 내용이 다릅니다.")
-            return CreationSaveResponse.model_validate(previous["response"])
+            return CreationSaveResponse.model_validate(previous["response"]), set()
         current, target = story["save_state"], body.save_state
         temporary = body.kind == "temporary" or body.mode == "auto"
         if temporary and current != "draft":
@@ -262,10 +280,13 @@ def save_creation(connection, story_id, owner_id, request_id, body):
             document = body.model_dump(mode="json", exclude={"kind", "mode"})
             saved_at = working_copy.write_creation(connection, story_id, document)
             result = working_response(connection, story, document, saved_at, request_id)
+            result.images_working_copy_saved_at = images_service.images_working_copy_saved_at(
+                connection, story_id
+            )
             speech_style.remember_write_request(
                 connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
             )
-            return result
+            return result, set()
         if temporary:
             # 미등록 스토리의 임시 저장은 본 테이블에 바로 쓴다. 공개 상태는 바꾸지 않는다.
             target = current
@@ -279,6 +300,9 @@ def save_creation(connection, story_id, owner_id, request_id, body):
             )
         # 방식·시간제를 바꾼 장면의 이전 입력을 비운 뒤 검사·저장한다 (CREATE-US-04-AC07).
         initial_state.clear_switched_inputs(connection, story_id, body.intros)
+        # 안 B: 사진 임시 저장본을 먼저 반영해, 완성 검사가 편집 화면의 사진 기준으로 하게 한다.
+        # 검사나 저장이 실패하면 트랜잭션 전체가 되돌아가 사진도 그대로, 임시 저장본도 남는다.
+        released = images_service.apply_working_copy(connection, story_id)
         if target != "draft":
             validate_completed(connection, story_id, body)
         groups, people = fewshot_service.write_fewshots(connection, story_id, body)
@@ -300,4 +324,4 @@ def save_creation(connection, story_id, owner_id, request_id, body):
         speech_style.remember_write_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )
-        return result
+        return result, released

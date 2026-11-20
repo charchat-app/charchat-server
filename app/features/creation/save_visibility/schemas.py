@@ -50,6 +50,8 @@ class CreationSaveResponse(FewshotsResponse):
     affinities: list[InitialAffinity]
     # 값이 있으면 위 내용은 아직 저장(반영)하지 않은 임시 저장본이다. 이용자는 이전 저장본을 본다.
     working_copy_saved_at: datetime | None = None
+    # 값이 있으면 6번 사진에 아직 반영하지 않은 임시 저장본이 있다. 「저장」하면 함께 반영한다.
+    images_working_copy_saved_at: datetime | None = None
 
 
 class FieldIssue(BaseModel):
