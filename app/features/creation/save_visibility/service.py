@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from app.features.creation.common.errors import app_error
 from app.features.creation.common.names import has_surrounding_space, name_compare_key
+from app.features.creation.images import service as images_service
 from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import service as intro_service
 from app.features.creation.save_visibility import repository
@@ -140,6 +141,10 @@ def collect_completed_issues(connection, story_id, body) -> list[FieldIssue]:
                 "1번 기본 설정 전체가 3000자를 초과했습니다.",
             )
         )
+    # 6번 이미지(CREATE-US-06-AC08): 등장 캐릭터마다 이미지 1장 이상
+    issues += [
+        FieldIssue(**issue) for issue in images_service.collect_image_issues(connection, story_id)
+    ]
 
     # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 5번 유저 프리셋 이름
     presets = repository.read_preset_names(connection, story_id)
