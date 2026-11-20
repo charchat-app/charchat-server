@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 
 import psycopg
 
@@ -96,13 +97,31 @@ def upload_image(
     return to_item(row)
 
 
-def find_file(connection: psycopg.Connection, storage: ImageStorage, storage_key: str):
-    """저장 키로 파일을 찾는다. 키는 추측할 수 없는 무작위 값이라 키를 아는 요청만 열람한다."""
+@dataclass(frozen=True)
+class ImageFile:
+    path: Path
+    mime_type: str
+    is_public: bool  # 공개 스토리 반영본에 연결돼 누구나 볼 수 있는지
+
+
+def find_file(
+    connection: psycopg.Connection,
+    storage: ImageStorage,
+    storage_key: str,
+    viewer_id: int | None,
+) -> ImageFile:
+    """저장 키로 파일을 찾는다.
+
+    공개 스토리의 반영본에 연결된 이미지는 누구나 볼 수 있다. 그 밖의 이미지(미등록·비공개
+    스토리, 아직 연결하지 않은 업로드)는 소유자만 볼 수 있다. 권한이 없으면 이미지가
+    있는지도 알리지 않도록 없는 이미지와 같은 404로 응답한다.
+    """
     row = repository.find_file_image(connection, storage_key)
-    path = storage.path_of(storage_key) if row else None
+    allowed = row is not None and (row["is_public"] or row["owner_id"] == viewer_id)
+    path = storage.path_of(storage_key) if allowed else None
     if path is None:
         raise app_error(404, "IMAGE_NOT_FOUND", "이미지를 찾을 수 없습니다.")
-    return path, row["mime_type"]
+    return ImageFile(path=path, mime_type=row["mime_type"], is_public=row["is_public"])
 
 
 def build_response(connection, story, request_id: str | None = None) -> StoryImagesResponse:

@@ -192,7 +192,24 @@ def touch_saved_at(connection: psycopg.Connection, story_id: int):
     ).fetchone()["saved_at"]
 
 
+# 공개(삭제되지 않은 public) 스토리의 반영본에 연결된 이미지만 누구나 볼 수 있다.
+# 미등록·비공개 스토리, 업로드만 하고 연결하지 않은 이미지, 개인 프로필·대화 사진은 소유자 전용이다.
+_PUBLIC_SQL = """
+    EXISTS (SELECT 1 FROM story_images r JOIN stories s ON s.id = r.story_id
+            WHERE r.image_id = i.id AND s.save_state = 'public' AND s.deleted_at IS NULL)
+    OR EXISTS (SELECT 1 FROM character_images r
+               JOIN characters c ON c.id = r.character_id
+               JOIN stories s ON s.id = c.story_id
+               WHERE r.image_id = i.id AND s.save_state = 'public' AND s.deleted_at IS NULL)
+    OR EXISTS (SELECT 1 FROM story_user_presets r JOIN stories s ON s.id = r.story_id
+               WHERE r.image_id = i.id AND s.save_state = 'public' AND s.deleted_at IS NULL)
+"""
+
+
 def find_file_image(connection: psycopg.Connection, storage_key: str):
+    """파일 조회 권한 판단용: 형식·소유자와 공개 스토리 연결 여부."""
     return connection.execute(
-        "SELECT id, mime_type FROM images WHERE storage_key = %s", (storage_key,)
+        f"""SELECT i.id, i.mime_type, i.owner_id, ({_PUBLIC_SQL}) AS is_public
+            FROM images i WHERE i.storage_key = %s""",
+        (storage_key,),
     ).fetchone()
