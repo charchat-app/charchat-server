@@ -9,7 +9,7 @@ from app.features.creation.common.names import has_surrounding_space, name_compa
 from app.features.creation.images import service as images_service
 from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import service as intro_service
-from app.features.creation.save_visibility import repository
+from app.features.creation.save_visibility import repository, working_copy
 from app.features.creation.save_visibility.schemas import CreationSaveResponse, FieldIssue
 from app.features.creation.speech_style import fewshot_service
 from app.features.creation.speech_style import service as speech_style
@@ -53,10 +53,29 @@ def response(
     )
 
 
+def working_response(connection, story, document, saved_at, request_id=None):
+    """임시 저장본으로 만든 응답. 스토리 정보·캐릭터 목록은 현재 값을 쓴다."""
+    base = fewshot_service.snapshot(
+        story, document["fewshots"], fewshot_service.characters(connection, story["id"]), request_id
+    )
+    return CreationSaveResponse(
+        **base.model_dump(),
+        expression=document["expression"],
+        intros=document["intros"],
+        relations=document["relations"],
+        affinities=document["affinities"],
+        working_copy_saved_at=saved_at,
+    )
+
+
 def get_creation(connection, story_id, owner_id):
+    """편집 화면용 조회. 임시 저장본이 있으면 그것을, 없으면 저장본을 돌려준다."""
     with connection.transaction():
         connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         story = speech_style.find_owned_story(connection, story_id, owner_id)
+        copy = working_copy.read(connection, story_id)
+        if copy and copy["creation"] is not None:
+            return working_response(connection, story, copy["creation"], copy["creation_saved_at"])
         return response(connection, story)
 
 
@@ -220,7 +239,7 @@ def validate_completed(connection, story_id, body):
 
 def save_creation(connection, story_id, owner_id, request_id, body):
     payload = {
-        "operation": "creation-save-v3",
+        "operation": "creation-save-v4",
         "story_id": str(story_id),
         **body.model_dump(mode="json"),
     }
@@ -236,16 +255,28 @@ def save_creation(connection, story_id, owner_id, request_id, body):
                 raise app_error(409, "IDEMPOTENCY_KEY_REUSED", "같은 요청키의 내용이 다릅니다.")
             return CreationSaveResponse.model_validate(previous["response"])
         current, target = story["save_state"], body.save_state
-        if (current != "draft" and target == "draft") or (
+        temporary = body.kind == "temporary" or body.mode == "auto"
+        if temporary and current != "draft":
+            # 비공개·공개 스토리의 임시 저장: 이용자가 보는 저장본은 그대로, 임시 저장본에만 쓴다.
+            # 검사 없이 원문을 보존한다. 공개 상태 선택(save_state)도 함께 기억한다.
+            document = body.model_dump(mode="json", exclude={"kind", "mode"})
+            saved_at = working_copy.write_creation(connection, story_id, document)
+            result = working_response(connection, story, document, saved_at, request_id)
+            speech_style.remember_write_request(
+                connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
+            )
+            return result
+        if temporary:
+            # 미등록 스토리의 임시 저장은 본 테이블에 바로 쓴다. 공개 상태는 바꾸지 않는다.
+            target = current
+        elif (current != "draft" and target == "draft") or (
             current == "public" and target == "private"
         ):
             raise app_error(
                 409,
                 "SAVE_STATE_TRANSITION",
-                "완성 저장은 임시 저장으로, 공개는 비공개로 되돌릴 수 없습니다.",
+                "비공개·공개한 스토리는 미등록으로, 공개는 비공개로 되돌릴 수 없습니다.",
             )
-        if body.mode == "auto" and (current != "draft" or target != "draft"):
-            raise app_error(409, "AUTO_SAVE_NOT_ALLOWED", "자동 저장은 임시 저장에만 적용됩니다.")
         # 방식·시간제를 바꾼 장면의 이전 입력을 비운 뒤 검사·저장한다 (CREATE-US-04-AC07).
         initial_state.clear_switched_inputs(connection, story_id, body.intros)
         if target != "draft":
@@ -261,6 +292,8 @@ def save_creation(connection, story_id, owner_id, request_id, body):
         )
         speech_style.write_expression_fields(connection, story_id, body.expression)
         story.update(repository.update_save_state(connection, story_id, target))
+        # 저장(반영)하면 2~4번 임시 저장본은 더 필요 없다.
+        working_copy.clear_creation(connection, story_id)
         result = response(
             connection, story, groups, people, request_id, intros, relations, affinities
         )

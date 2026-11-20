@@ -46,6 +46,8 @@ class StoryImagesResponse(BaseModel):
     # AC08: 필수 이미지가 없는 등장 캐릭터. 임시 저장은 허용하고 완성 저장에서만 막는다.
     characters_missing_images: list[int]
     request_id: str | None = None
+    # 값이 있으면 위 목록은 아직 저장(반영)하지 않은 임시 저장본이다. 이용자는 이전 저장본을 본다.
+    working_copy_saved_at: datetime | None = None
 
 
 def _no_duplicates(ids: list[int], label: str) -> None:
@@ -78,6 +80,9 @@ class StoryImagesSaveRequest(BaseModel):
 
     story_image_ids: list[int] = Field(max_length=MAX_STORY_IMAGES)
     characters: list[CharacterImagesInput] = Field(default_factory=list)
+    # 저장 상태. temporary(임시 저장)는 비공개·공개 스토리에서 임시 저장본에만 둔다.
+    # 미등록 스토리는 아무도 보지 않으므로 임시 저장도 바로 반영한다.
+    kind: Literal["temporary", "save"] = "save"
 
     @model_validator(mode="after")
     def check_ids(self) -> "StoryImagesSaveRequest":

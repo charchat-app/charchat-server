@@ -151,7 +151,10 @@ def test_exact_unicode_boundaries_completed_edits_and_transitions(context):
     assert edited.status_code == 200
     assert edited.json()["fewshots"][0]["id"] == result["fewshots"][0]["id"]
     assert put(client, story, {**payload, "save_state": "draft"}, "back-draft").status_code == 409
-    assert put(client, story, {**payload, "mode": "auto"}, "auto-completed").status_code == 409
+    # 자동 저장은 언제나 임시 저장이다. 완성 스토리는 임시 저장본에만 둔다(2026-11-20 결정).
+    auto = put(client, story, {**payload, "mode": "auto"}, "auto-completed")
+    assert auto.status_code == 200
+    assert auto.json()["working_copy_saved_at"] is not None
     public = put(client, story, {**payload, "save_state": "public"}, "publish")
     assert public.status_code == 200
     assert put(client, story, payload, "back-private").status_code == 409
@@ -193,10 +196,10 @@ def test_common_retry_concurrency_old_replay_and_full_rollback(context, monkeypa
 def test_auto_draft_owner_deleted_and_cross_endpoint_idempotency(context):
     client, _, story, _, dsn = context
     assert put(client, story, body(mode="auto")).status_code == 200
-    assert (
-        put(client, story, body("public", mode="auto"), "bad-auto").json()["code"]
-        == "AUTO_SAVE_NOT_ALLOWED"
-    )
+    # 자동 저장은 임시 저장이라 공개 상태를 바꾸지 않는다(검사도 하지 않는다).
+    auto_public = put(client, story, body("public", mode="auto"), "auto-public")
+    assert auto_public.status_code == 200
+    assert auto_public.json()["save_state"] == "draft"
     assert (
         client.put(
             f"/api/v1/creation/stories/{story['id']}/expression",
