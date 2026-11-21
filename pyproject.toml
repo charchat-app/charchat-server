@@ -7,6 +7,8 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.4",
     "psycopg[binary,pool]>=3.2",
+    # 이미지 업로드(multipart/form-data) 수신. FastAPI UploadFile에 필요하다(CREATE-US-06).
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

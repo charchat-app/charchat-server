@@ -9,6 +9,7 @@ import pytest
 from app.features.creation.common.errors import app_error
 from app.features.creation.speech_style import repository
 from app.features.creation.speech_style.schemas import DEFAULT_EXPRESSION
+from tests.features.creation.images.helpers import give_face_images
 
 
 def url(story):
@@ -74,6 +75,7 @@ def complete(dsn, story):
             "VALUES (%s,'하린','원래 상세',0)",
             (story["id"],),
         )
+        give_face_images(connection, story["id"])
 
 
 def current_payload(response, state=None):
@@ -226,6 +228,7 @@ def test_completed_rejection_lists_field_issues_with_over_count(context):
             "VALUES (%s,'하 린','상세',1),(%s,' Doyun','상세',2)",
             (story["id"], story["id"]),
         )
+        give_face_images(connection, story["id"])
     payload = body("private", text="😀" * 1003, few="가" * 2005)
     result = put(client, story, payload)
     assert result.status_code == 422

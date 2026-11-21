@@ -6,6 +6,7 @@ import psycopg
 import pytest
 
 from app.features.creation.speech_style.schemas import DEFAULT_EXPRESSION
+from tests.features.creation.images.helpers import give_face_images
 
 
 def url(story):
@@ -83,6 +84,7 @@ def people(dsn, story, *names):
                     (story["id"], name, position),
                 ).fetchone()[0]
             )
+        give_face_images(connection, story["id"])
     return ids
 
 

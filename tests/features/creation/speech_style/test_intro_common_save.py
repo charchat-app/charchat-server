@@ -8,6 +8,7 @@ import pytest
 from app.features.creation.common.errors import app_error
 from app.features.creation.speech_style import repository
 from app.features.creation.speech_style.schemas import DEFAULT_EXPRESSION
+from tests.features.creation.images.helpers import give_face_images
 
 
 def url(story):
@@ -52,11 +53,13 @@ def put(client, story, body, key):
 
 def add_character(dsn, story, name, position):
     with psycopg.connect(dsn) as connection:
-        return connection.execute(
+        character_id = connection.execute(
             "INSERT INTO characters(story_id,name,description,position) "
             "VALUES (%s,%s,'상세',%s) RETURNING id",
             (story["id"], name, position),
         ).fetchone()[0]
+        give_face_images(connection, story["id"])
+        return character_id
 
 
 def complete_basics(dsn, story):
