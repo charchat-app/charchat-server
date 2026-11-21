@@ -89,17 +89,20 @@ def test_count_limits_story_ten_character_five_CREATE_US_06_AC03(api, db):
     assert put(api, story_id, [story_images[0], story_images[0]], key="r5").status_code == 422
 
 
-def test_replace_keeps_slot_and_order_and_marks_old_unused_CREATE_US_06_AC07(api, db):
+def test_replace_keeps_slot_and_order_and_deletes_old_on_save_CREATE_US_06_AC07(api, db, storage):
     story_id, (harin, _) = create_story(db)
     a, b, c = (uploaded_id(api) for _ in range(3))
     put(api, story_id, [], {harin: [a, b, c]})
+    old_key = db.execute("SELECT storage_key FROM images WHERE id=%s", (b,)).fetchone()
 
     new = uploaded_id(api)
     replaced = put(api, story_id, [], {harin: [a, new, c]}, key="replace")
     assert replaced.status_code == 200
     harin_images = replaced.json()["characters"][0]["images"]
     assert ids_of(harin_images) == [a, new, c]
-    assert orphaned(db, b) is not None
+    # 2026-11-20 결정: 예전 사진은 보관하지 않고 저장할 때 바로 지운다(파일과 행 모두).
+    assert db.execute("SELECT 1 FROM images WHERE id=%s", (b,)).fetchone() is None
+    assert storage.path_of(old_key["storage_key"]) is None
     assert orphaned(db, new) is None
 
 
@@ -128,7 +131,8 @@ def test_draft_allows_deleting_last_image_and_reports_missing_CREATE_US_06_AC08(
     assert body["characters_missing_images"] == [harin]
     # 보내지 않은 캐릭터의 이미지는 바뀌지 않는다.
     assert ids_of(body["characters"][1]["images"]) == [b]
-    assert orphaned(db, a) is not None
+    # 미등록 스토리는 저장이 곧 반영이므로 지운 사진은 바로 정리된다.
+    assert db.execute("SELECT 1 FROM images WHERE id=%s", (a,)).fetchone() is None
 
 
 def test_cover_falls_back_to_first_character_first_image_CREATE_US_06_AC09(api, db):

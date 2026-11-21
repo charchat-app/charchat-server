@@ -22,6 +22,7 @@ from app.features.creation.images.schemas import (
     StoryImagesSaveRequest,
 )
 from app.features.creation.images.storage import ImageStorage
+from app.features.creation.save_visibility import working_copy
 from app.features.creation.speech_style import service as speech_style
 
 # 파일 앞부분(매직 넘버)으로 실제 형식을 판단한다. 파일 이름·Content-Type은 믿지 않는다.
@@ -124,11 +125,25 @@ def find_file(
 
 
 def build_response(connection, story, request_id: str | None = None) -> StoryImagesResponse:
+    """편집 화면용 목록. 이미지 임시 저장본이 있으면 그 목록을, 없으면 저장본을 쓴다."""
     story_id = story["id"]
     story_images = [to_item(r) for r in repository.read_story_images(connection, story_id)]
     by_character: dict[int, list[ImageItem]] = {}
     for row in repository.read_character_images(connection, story_id):
         by_character.setdefault(row["character_id"], []).append(to_item(row))
+    copy = working_copy.read(connection, story_id)
+    draft = copy["images"] if copy else None
+    if draft is not None:
+        # 임시 저장본에 담은 목록만 바꾸고, 담지 않은 캐릭터는 저장본 그대로 둔다(저장과 같은 규칙).
+        ids = set(draft["story_image_ids"])
+        for character in draft["characters"]:
+            ids.update(character["image_ids"])
+        items = {r["id"]: to_item(r) for r in repository.read_images(connection, sorted(ids))}
+        story_images = [items[i] for i in draft["story_image_ids"] if i in items]
+        for character in draft["characters"]:
+            by_character[character["character_id"]] = [
+                items[i] for i in character["image_ids"] if i in items
+            ]
     characters = [
         CharacterImages(character_id=c["id"], name=c["name"], images=by_character.get(c["id"], []))
         for c in repository.list_characters(connection, story_id)
@@ -151,6 +166,7 @@ def build_response(connection, story, request_id: str | None = None) -> StoryIma
         cover=cover,
         characters_missing_images=[c.character_id for c in characters if not c.images],
         request_id=request_id,
+        working_copy_saved_at=copy["images_saved_at"] if draft is not None else None,
     )
 
 
@@ -190,9 +206,21 @@ def save_story_images(
     owner_id: int,
     request_id: str,
     body: StoryImagesSaveRequest,
+    storage: ImageStorage | None = None,
 ) -> StoryImagesResponse:
-    """AC01·03·06·07·08: 스토리·캐릭터 이미지 목록과 순서를 한 트랜잭션에 저장한다."""
-    payload = {"operation": "story-images-v1", "story_id": story_id, **body.model_dump()}
+    """AC01·03·06·07·08: 스토리·캐릭터 이미지 목록과 순서를 한 트랜잭션에 저장한다.
+
+    - 비공개·공개 스토리의 임시 저장: 임시 저장본에만 둔다. 이용자 화면은 그대로다.
+    - 저장(또는 미등록 스토리): 바로 반영하고, 연결이 끊긴 예전 사진은 커밋 뒤 바로 지운다.
+    """
+    response, released = _save_story_images(connection, story_id, owner_id, request_id, body)
+    if storage is not None and released:
+        release_images(connection, storage, released)
+    return response
+
+
+def _save_story_images(connection, story_id, owner_id, request_id, body):
+    payload = {"operation": "story-images-v2", "story_id": story_id, **body.model_dump()}
     request_hash = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
@@ -203,7 +231,7 @@ def save_story_images(
         if previous:
             if previous["request_hash"] != request_hash:
                 raise app_error(409, "IDEMPOTENCY_KEY_REUSED", "같은 요청키의 내용이 다릅니다.")
-            return StoryImagesResponse.model_validate(previous["response"])
+            return StoryImagesResponse.model_validate(previous["response"]), set()
         story_character_ids = {c["id"] for c in repository.list_characters(connection, story_id)}
         unknown = [
             c.character_id for c in body.characters if c.character_id not in story_character_ids
@@ -243,21 +271,30 @@ def save_story_images(
                 issues=gif_on_character,
             )
 
-        touched_characters = [c.character_id for c in body.characters]
-        before = repository.linked_image_ids(connection, story_id, touched_characters)
-        repository.replace_story_images(connection, story_id, body.story_image_ids)
-        for character in body.characters:
-            repository.replace_character_images(
-                connection, character.character_id, character.image_ids
+        released: set[int] = set()
+        if body.kind == "temporary" and story["save_state"] != "draft":
+            # 비공개·공개 스토리의 임시 저장: 필수 이미지 검사 없이 임시 저장본에만 둔다.
+            document = body.model_dump(mode="json", exclude={"kind"})
+            previous_copy = working_copy.write_images(connection, story_id, document, requested)
+            repository.refresh_orphaned(connection, previous_copy | requested)
+        else:
+            before = _replace_lists(
+                connection,
+                story_id,
+                body.story_image_ids,
+                {c.character_id: c.image_ids for c in body.characters},
             )
-        # AC08: 공개·비공개 스토리는 바꾼 뒤에도 캐릭터마다 이미지가 있어야 한다.
-        # 조건을 깨면 예외로 트랜잭션 전체를 되돌린다(임시 저장 스토리는 그대로 저장).
-        if story["save_state"] != "draft":
-            issues = collect_image_issues(connection, story_id)
-            if issues:
-                raise app_error(422, issues[0]["code"], issues[0]["message"], issues=issues)
-        repository.refresh_orphaned(connection, before | requested)
-        story["saved_at"] = repository.touch_saved_at(connection, story_id)
+            # AC08: 공개·비공개 스토리는 저장 뒤에도 캐릭터마다 이미지가 있어야 한다.
+            # 조건을 깨면 예외로 트랜잭션 전체를 되돌린다(미등록 스토리는 그대로 저장).
+            if story["save_state"] != "draft":
+                issues = collect_image_issues(connection, story_id)
+                if issues:
+                    raise app_error(422, issues[0]["code"], issues[0]["message"], issues=issues)
+            # 저장(반영)하면 이미지 임시 저장본은 더 필요 없다.
+            previous_copy = working_copy.clear_images(connection, story_id)
+            repository.refresh_orphaned(connection, before | requested | previous_copy)
+            story["saved_at"] = repository.touch_saved_at(connection, story_id)
+            released = (before | previous_copy) - requested
 
         response = build_response(connection, story, request_id)
         speech_style.remember_write_request(
@@ -268,7 +305,58 @@ def save_story_images(
             request_hash,
             response.model_dump(mode="json"),
         )
-        return response
+        return response, released
+
+
+def _replace_lists(
+    connection, story_id: int, story_image_ids: list[int], characters: dict[int, list[int]]
+) -> set[int]:
+    """스토리 이미지 목록과 담긴 캐릭터의 이미지 목록을 바꾼다.
+
+    바꾸기 전에 연결돼 있던 이미지 ID를 돌려준다.
+    """
+    before = repository.linked_image_ids(connection, story_id, list(characters))
+    repository.replace_story_images(connection, story_id, story_image_ids)
+    for character_id, image_ids in characters.items():
+        repository.replace_character_images(connection, character_id, image_ids)
+    return before
+
+
+def apply_working_copy(connection: psycopg.Connection, story_id: int) -> set[int]:
+    """공통 「저장」에서 이미지 임시 저장본도 함께 반영한다(안 B: 저장하면 사진까지 한 번에).
+
+    호출 측 트랜잭션 안에서 부르고, 반영한 뒤 호출 측이 완성 검사(캐릭터마다 이미지 1장 이상)를
+    한다. 검사가 실패하면 트랜잭션 전체가 되돌아가 사진도 반영되지 않고 임시 저장본도 남는다.
+    임시 저장 뒤 지워진 캐릭터의 목록은 건너뛴다.
+    커밋 뒤 지울 후보(연결이 끊긴 이미지 ID)를 돌려준다.
+    """
+    copy = working_copy.read(connection, story_id)
+    draft = copy["images"] if copy else None
+    if draft is None:
+        return set()
+    existing = {c["id"] for c in repository.list_characters(connection, story_id)}
+    characters = {
+        c["character_id"]: c["image_ids"]
+        for c in draft["characters"]
+        if c["character_id"] in existing
+    }
+    requested = set(draft["story_image_ids"])
+    for image_ids in characters.values():
+        requested.update(image_ids)
+    before = _replace_lists(connection, story_id, draft["story_image_ids"], characters)
+    previous_copy = working_copy.clear_images(connection, story_id)
+    repository.refresh_orphaned(connection, before | requested | previous_copy)
+    repository.touch_saved_at(connection, story_id)
+    return (before | previous_copy) - requested
+
+
+def images_working_copy_saved_at(connection: psycopg.Connection, story_id: int):
+    """이미지 임시 저장본 시각. 없으면 None.
+
+    공통 저장 화면이 「저장」할 사진이 있는지 알 때 쓴다.
+    """
+    copy = working_copy.read(connection, story_id)
+    return copy["images_saved_at"] if copy and copy["images"] is not None else None
 
 
 logger = logging.getLogger(__name__)
@@ -304,20 +392,39 @@ def cleanup_unused_images(
         result.marked = repository.mark_unused_images(connection)
         result.unmarked = repository.unmark_used_images(connection)
     for image_id in repository.expired_image_ids(connection, seconds):
-        try:
-            with connection.transaction():
-                row = repository.lock_expired_image(connection, image_id, seconds)
-                if row is None:
-                    result.kept.append(image_id)
-                    continue
-                if repository.is_image_used(connection, image_id):
-                    repository.clear_orphaned(connection, image_id)
-                    result.kept.append(image_id)
-                    continue
-                storage.delete(row["storage_key"])
-                repository.delete_image_row(connection, image_id)
-                result.deleted.append(image_id)
-        except Exception:
-            logger.exception("이미지 정리 실패(다음 실행에서 다시 시도): image_id=%s", image_id)
-            result.failed.append(image_id)
+        _delete_if_unused(connection, storage, image_id, seconds, result)
     return result
+
+
+def release_images(
+    connection: psycopg.Connection, storage: ImageStorage, image_ids: set[int]
+) -> CleanupResult:
+    """저장(반영)으로 연결이 끊긴 예전 사진을 바로 지운다(2026-11-20 결정: 보관하지 않음).
+
+    정리 작업과 같은 방식(행 잠금 → 사용 재확인 → 파일 삭제 → 행 삭제)이라, 다른 대상·임시
+    저장본이 함께 쓰는 사진은 남는다. 실패하면 행이 남아 정리 작업이 다시 시도한다.
+    저장 트랜잭션이 끝난 뒤에 부른다.
+    """
+    result = CleanupResult()
+    for image_id in sorted(image_ids):
+        _delete_if_unused(connection, storage, image_id, 0, result)
+    return result
+
+
+def _delete_if_unused(connection, storage, image_id: int, seconds: float, result: CleanupResult):
+    try:
+        with connection.transaction():
+            row = repository.lock_expired_image(connection, image_id, seconds)
+            if row is None:
+                result.kept.append(image_id)
+                return
+            if repository.is_image_used(connection, image_id):
+                repository.clear_orphaned(connection, image_id)
+                result.kept.append(image_id)
+                return
+            storage.delete(row["storage_key"])
+            repository.delete_image_row(connection, image_id)
+            result.deleted.append(image_id)
+    except Exception:
+        logger.exception("이미지 정리 실패(다음 실행에서 다시 시도): image_id=%s", image_id)
+        result.failed.append(image_id)

@@ -147,3 +147,32 @@ def test_malformed_user_header_is_rejected_on_file_fetch(api, value):
         api.headers = saved
     assert response.status_code == 401
     assert response.json()["code"] == "UNAUTHENTICATED"
+
+
+def test_image_only_in_working_copy_of_public_story_is_owner_only_CREATE_US_06(api, db):
+    """공개 스토리를 고치다 임시 저장한 사진은 저장 전까지 소유자만 본다.
+
+    이미 반영된 사진은 계속 누구나 볼 수 있다.
+    """
+    story_id, (harin, doyun) = create_story(db)
+    published, published_url = uploaded(api, "character")
+    other_face, _ = uploaded(api, "character")
+    body = {
+        "story_image_ids": [],
+        "characters": [
+            {"character_id": harin, "image_ids": [published]},
+            {"character_id": doyun, "image_ids": [other_face]},
+        ],
+        "kind": "save",
+    }
+    url = f"/api/v1/creation/stories/{story_id}/images"
+    assert api.put(url, json=body, headers={"Idempotency-Key": "seed"}).status_code == 200
+    db.execute("UPDATE stories SET save_state='public' WHERE id=%s", (story_id,))
+
+    draft_only, draft_url = uploaded(api, "character")
+    body["characters"][0]["image_ids"] = [draft_only]
+    body["kind"] = "temporary"
+    assert api.put(url, json=body, headers={"Idempotency-Key": "temp"}).status_code == 200
+
+    assert_owner_only_without_public_cache(api, draft_url)
+    assert_visible_to_all_with_public_cache(api, published_url)

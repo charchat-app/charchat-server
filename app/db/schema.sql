@@ -583,6 +583,28 @@ CREATE TABLE character_images (
 -- 스토리 표지 부재: characters.position 첫 인물의 character_images.position 첫 이미지 조회.
 -- 이 대체 이미지를 story_images에 복제 연결하거나 3:4로 다시 자르지 않는다.
 
+-- 임시 저장본(2026-11-20 강사님 결정). 공개 상태(미등록=draft/비공개/공개)와 저장 상태
+-- (임시 저장/저장)를 나눈다. 비공개·공개 스토리를 고치다 임시 저장하면 여기에만 두고,
+-- 이용자가 보는 본 테이블은 "저장"을 눌러야 바뀐다. 미등록 스토리는 아무도 보지 않으므로
+-- 임시 저장도 본 테이블에 바로 쓴다(이 표를 쓰지 않는다). 스토리마다 1개만 둔다.
+-- creation: 2~4번 공통 저장 요청 본문(JSON), images: 6번 이미지 목록 요청 본문(JSON).
+-- 각 칸은 그 영역을 임시 저장했을 때만 채우고, 그 영역을 "저장"하면 비운다.
+CREATE TABLE story_working_copies (
+    story_id bigint PRIMARY KEY REFERENCES stories(id),
+    creation jsonb,
+    creation_saved_at timestamptz,
+    images jsonb,
+    images_saved_at timestamptz,
+    CHECK ((creation IS NULL) = (creation_saved_at IS NULL)),
+    CHECK ((images IS NULL) = (images_saved_at IS NULL))
+);
+-- 임시 저장본이 쓰는 이미지. 파일 정리가 임시 저장본의 사진을 지우지 않게 하는 사용 연결이다.
+CREATE TABLE story_working_copy_images (
+    story_id bigint NOT NULL REFERENCES story_working_copies(story_id) ON DELETE CASCADE,
+    image_id bigint NOT NULL REFERENCES images(id),
+    PRIMARY KEY (story_id, image_id)
+);
+
 -- 세션에서 실제 사용한 파일의 보존 연결을 위한 최소 구현 제안(표시용 갤러리 아님).
 CREATE TABLE conversation_image_references (
     session_id bigint NOT NULL REFERENCES conversation_sessions(id) ON DELETE CASCADE,

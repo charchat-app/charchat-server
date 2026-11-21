@@ -11,6 +11,7 @@ _REFERENCE_SQL = """
     OR EXISTS (SELECT 1 FROM user_profiles r WHERE r.image_id = i.id)
     OR EXISTS (SELECT 1 FROM conversation_user_profiles r WHERE r.image_id = i.id)
     OR EXISTS (SELECT 1 FROM conversation_image_references r WHERE r.image_id = i.id)
+    OR EXISTS (SELECT 1 FROM story_working_copy_images r WHERE r.image_id = i.id)
 """
 
 
@@ -24,6 +25,15 @@ def insert_image(
            RETURNING id, storage_key, mime_type, byte_size""",
         (owner_id, storage_key, mime_type, size),
     ).fetchone()
+
+
+def read_images(connection: psycopg.Connection, image_ids: list[int]):
+    if not image_ids:
+        return []
+    return connection.execute(
+        "SELECT id, storage_key, mime_type, byte_size FROM images WHERE id = ANY(%s)",
+        (image_ids,),
+    ).fetchall()
 
 
 def find_owned_images(connection: psycopg.Connection, owner_id: int, image_ids: list[int]):

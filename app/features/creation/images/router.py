@@ -85,5 +85,6 @@ def save_story_images(
     request_id: RequestId,
     user_id: User,
     connection: Connection,
+    storage: Storage,
 ):
-    return service.save_story_images(connection, story_id, user_id, request_id, body)
+    return service.save_story_images(connection, story_id, user_id, request_id, body, storage)

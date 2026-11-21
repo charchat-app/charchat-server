@@ -1,5 +1,6 @@
 """7번 공통 저장 중 2·3·4번 소유 영역과 저장 상태 계약."""
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -33,7 +34,12 @@ class CreationSaveRequest(FewshotsSaveRequest):
     relations: RelationList
     # CREATE-US-04-AC09 방향별 초기 호감도. 관계와 독립이며 빈 배열은 모든 조합 0이다.
     affinities: AffinityList
+    # 공개 상태. draft는 미등록이다(2026-11-20 결정: 공개 상태와 저장 상태를 나눈다).
     save_state: Literal["draft", "private", "public"]
+    # 저장 상태. temporary(임시 저장)는 이용자 화면을 바꾸지 않고, save(저장)는 반영한다.
+    # 비공개·공개 스토리의 임시 저장은 임시 저장본에만 두고, 미등록 스토리는 본 테이블에 바로 쓴다.
+    kind: Literal["temporary", "save"] = "save"
+    # auto(자동 저장)는 언제나 임시 저장이다.
     mode: Literal["manual", "auto"] = "manual"
 
 
@@ -42,6 +48,10 @@ class CreationSaveResponse(FewshotsResponse):
     intros: list[Intro]
     relations: list[InitialRelation]
     affinities: list[InitialAffinity]
+    # 값이 있으면 위 내용은 아직 저장(반영)하지 않은 임시 저장본이다. 이용자는 이전 저장본을 본다.
+    working_copy_saved_at: datetime | None = None
+    # 값이 있으면 6번 사진에 아직 반영하지 않은 임시 저장본이 있다. 「저장」하면 함께 반영한다.
+    images_working_copy_saved_at: datetime | None = None
 
 
 class FieldIssue(BaseModel):
