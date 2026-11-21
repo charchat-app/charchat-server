@@ -620,3 +620,15 @@ CREATE TABLE conversation_image_references (
 -- 파일 정리: 유예 → 최종 무참조 검사 → 동시 연결 방지 → 실제 파일 삭제 → 성공 기록.
 -- 저장 중 업로드 보호/저장소 삭제 실패 재시도/잠금 또는 작업 상태 설계는 미구현이다.
 
+-- CHAT-US-01 로컬 개발·테스트 전용. 운영 마이그레이션이 아니다.
+-- 선택 인트로의 표시 순서와 치환 결과를 원본 편집·삭제와 무관하게 보존한다.
+ALTER TABLE conversation_sessions
+    ADD COLUMN intro_messages_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(intro_messages_snapshot) = 'array');
+
+-- 시작 요청의 지문은 생성 시에만 저장한다. 지문 없는 기존 세션은 소급 대상이 아니다.
+ALTER TABLE conversation_sessions
+    ADD COLUMN initial_request_fingerprint bytea,
+    ADD CONSTRAINT conversation_sessions_initial_request_key
+        UNIQUE (owner_id, story_id, initial_request_fingerprint);
+
