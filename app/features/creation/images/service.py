@@ -396,6 +396,15 @@ def cleanup_unused_images(
     return result
 
 
+def refresh_orphaned_images(connection: psycopg.Connection, image_ids: set[int]) -> None:
+    """다른 기능이 이미지 연결을 바꾼 뒤, 그 이미지들의 미사용 시작 시각을 다시 계산한다(AC11).
+
+    연결이 하나라도 남으면 NULL, 없으면 미사용 시각을 기록한다. 호출자의 트랜잭션 안에서,
+    연결 쓰기를 마친 뒤 부른다. 커밋·롤백하지 않는다.
+    """
+    repository.refresh_orphaned(connection, image_ids)
+
+
 def release_images(
     connection: psycopg.Connection, storage: ImageStorage, image_ids: set[int]
 ) -> CleanupResult:
