@@ -2,10 +2,10 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response, status
 
 from app.features.creation.images.storage import ImageStorage, get_image_storage
-from app.features.creation.save_visibility import service
+from app.features.creation.save_visibility import service, soft_delete
 from app.features.creation.save_visibility.schemas import CreationSaveRequest, CreationSaveResponse
 from app.features.creation.speech_style.router import Connection, RequestId, StoryId, User
 
@@ -28,3 +28,14 @@ def save_creation(
 ):
     # 「저장」으로 사진 임시 저장본을 반영하면 연결이 끊긴 예전 파일을 지우므로 저장소가 필요하다.
     return service.save_creation(connection, story_id, user_id, request_id, body, storage)
+
+
+@router.delete(
+    "/stories/{story_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def delete_story(story_id: StoryId, user_id: User, connection: Connection) -> Response:
+    """CREATE-US-07-AC10 본인 스토리 소프트 삭제. 없음·타인·이미 삭제는 모두 404."""
+    soft_delete.soft_delete_story(connection, user_id, story_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

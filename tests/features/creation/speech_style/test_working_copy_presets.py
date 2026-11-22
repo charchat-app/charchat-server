@@ -404,7 +404,14 @@ def test_old_request_without_presets_replays_recorded_response_CREATE_US_05_AC08
                 "operation": "creation-save-v4",
                 "story_id": str(story["id"]),
                 **CreationSaveRequest.model_validate(payload).model_dump(
-                    mode="json", exclude={"basic", "presets", "images", "preserve_scene"}
+                    mode="json",
+                    exclude={
+                        "basic",
+                        "presets",
+                        "images",
+                        "preserve_scene",
+                        "finalize_auto_request_id",
+                    },
                 ),
             },
             sort_keys=True,
@@ -418,7 +425,11 @@ def test_old_request_without_presets_replays_recorded_response_CREATE_US_05_AC08
             (OWNER_ID, "old-key"),
         ).fetchone()
         assert row[0] == old_hash
-        old_response = {k: v for k, v in row[1].items() if k not in ("presets", "presets_pending")}
+        old_response = {
+            k: v
+            for k, v in row[1].items()
+            if k not in ("presets", "presets_pending", "finalize_auto_request_id")
+        }
         connection.execute(
             "UPDATE creation_write_requests SET response=%s WHERE owner_id=%s AND request_id=%s",
             (Jsonb(old_response), OWNER_ID, "old-key"),

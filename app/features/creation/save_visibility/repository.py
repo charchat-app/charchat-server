@@ -16,7 +16,7 @@ def read_basic(connection, story_id):
 def read_characters(connection, story_id):
     # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 1번 characters
     return connection.execute(
-        "SELECT name,description FROM characters WHERE story_id=%s ORDER BY position,id",
+        "SELECT id,name,description FROM characters WHERE story_id=%s ORDER BY position,id",
         (story_id,),
     ).fetchall()
 

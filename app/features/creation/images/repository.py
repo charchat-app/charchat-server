@@ -52,7 +52,8 @@ def read_owned_images(connection: psycopg.Connection, owner_id: int, image_ids: 
     if not image_ids:
         return []
     return connection.execute(
-        "SELECT id, storage_key FROM images WHERE owner_id = %s AND id = ANY(%s)",
+        """SELECT id, storage_key, mime_type, byte_size FROM images
+           WHERE owner_id = %s AND id = ANY(%s)""",
         (owner_id, image_ids),
     ).fetchall()
 
@@ -100,6 +101,14 @@ def linked_image_ids(connection: psycopg.Connection, story_id: int, character_id
         """SELECT image_id FROM story_images WHERE story_id = %s
            UNION SELECT image_id FROM character_images WHERE character_id = ANY(%s)""",
         (story_id, character_ids),
+    ).fetchall()
+    return {row["image_id"] for row in rows}
+
+
+def character_image_ids(connection: psycopg.Connection, character_ids: list[int]) -> set[int]:
+    rows = connection.execute(
+        "SELECT image_id FROM character_images WHERE character_id = ANY(%s)",
+        (character_ids,),
     ).fetchall()
     return {row["image_id"] for row in rows}
 
