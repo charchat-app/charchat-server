@@ -275,28 +275,33 @@ def retry_generation(
 
 
 def get_generation(
-    conn: Connection, owner_id: int, generation_id: int, offset: int, wait: float
+    owner_id: int, generation_id: int, offset: int, wait: float
 ) -> GenerationResponse:
-    """진행 중이고 offset 뒤 새 원문이 없으면 wait초까지 짧게 다시 확인한다(롱 폴링)."""
-    row = repository.get_generation(conn, generation_id, owner_id)
-    if row is None:
-        raise GenerationNotFoundError()
-    if row["status"] in repository.ACTIVE_STATUSES:
-        repository.expire_stale_generations(
-            conn, row["session_id"], settings.chat_generation_stale_seconds
-        )
+    """진행 중이고 offset 뒤 새 원문이 없으면 wait초까지 짧게 다시 확인한다(롱 폴링).
+
+    요청 커넥션을 받지 않는다. 확인할 때마다 풀에서 커넥션을 빌렸다가 바로 돌려주고, 기다리는
+    동안에는 커넥션을 붙잡지 않는다. 동시에 기다리는 폴링이 많아도 다른 요청이 풀을 쓸 수 있다.
+    """
+    with worker.connect() as conn:
+        row = repository.get_generation(conn, generation_id, owner_id)
+        if row is None:
+            raise GenerationNotFoundError()
+        if row["status"] in repository.ACTIVE_STATUSES:
+            repository.expire_stale_generations(
+                conn, row["session_id"], settings.chat_generation_stale_seconds
+            )
     deadline = monotonic() + wait
     while True:
-        row = repository.get_generation_with_text(conn, generation_id, offset)
-        if (
-            row["status"] not in repository.ACTIVE_STATUSES
-            or row["text_length"] > offset
-            or monotonic() >= deadline
-        ):
-            break
+        with worker.connect() as conn:
+            row = repository.get_generation_with_text(conn, generation_id, offset)
+            if (
+                row["status"] not in repository.ACTIVE_STATUSES
+                or row["text_length"] > offset
+                or monotonic() >= deadline
+            ):
+                with conn.transaction():
+                    return _generation_response(conn, row)
         sleep(POLL_INTERVAL_SECONDS)
-    with conn.transaction():
-        return _generation_response(conn, row)
 
 
 def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse:

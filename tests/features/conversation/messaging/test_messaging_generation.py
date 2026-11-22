@@ -1,12 +1,16 @@
 """CHAT-US-02 응답 생성 진행·실패·재시도·롱 폴링."""
 
+from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
 
 import pytest
 from messaging_helpers import GENERATIONS, PLAYER, SESSIONS, RecordingProvider, send, user_part
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from app.core.config import settings
-from app.features.conversation.messaging import providers, repository, service
+from app.db import session as db_session
+from app.features.conversation.messaging import providers, repository, service, worker
 from app.features.conversation.messaging.providers import (
     FakeProvider,
     ProviderError,
@@ -280,3 +284,37 @@ def test_chat_us_02_openai_provider_requires_base_url(monkeypatch):
         providers.get_provider()
     monkeypatch.setattr(settings, "chat_llm_base_url", "http://127.0.0.1:9/v1")
     assert isinstance(providers.get_provider(), providers.OpenAICompatibleProvider)
+
+
+def test_chat_us_02_long_poll_does_not_hold_db_connection_while_waiting(
+    client, db, db_url, session, monkeypatch
+):
+    """롱 폴링은 기다리는 동안 커넥션을 돌려준다: 풀이 1개여도 다른 요청이 바로 끝난다."""
+    monkeypatch.setattr(worker, "submit", lambda job, *args: None)
+    generation = send(client, session, [user_part("대기")]).json()["id"]
+    small_pool = ConnectionPool(
+        db_url,
+        kwargs={"row_factory": dict_row, "autocommit": True},
+        min_size=1,
+        max_size=1,
+        timeout=10,
+        open=True,
+    )
+    monkeypatch.setattr(db_session, "_pool", small_pool)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            waiting = pool.submit(client.get, f"{GENERATIONS}/{generation}?wait=3", headers=PLAYER)
+            sleep(0.5)
+            assert not waiting.done()
+            started = monotonic()
+            turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER)
+            elapsed = monotonic() - started
+            assert turns.status_code == 200
+            # 롱 폴링이 커넥션을 붙잡았다면 대기가 끝날 때까지(약 2.5초) 막힌다.
+            assert elapsed < 1.0
+            assert not waiting.done()
+            poll = waiting.result(timeout=10)
+        assert poll.status_code == 200
+        assert poll.json()["status"] == "pending"
+    finally:
+        small_pool.close()

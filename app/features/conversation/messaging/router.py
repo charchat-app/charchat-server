@@ -32,11 +32,11 @@ def send_message(
 def get_generation(
     generation_id: int,
     owner_id: CurrentUserId,
-    conn: DbConn,
     offset: Annotated[int, Query(ge=0)] = 0,
     wait: Annotated[float, Query(ge=0, le=25)] = 0,
 ) -> GenerationResponse:
-    return service.get_generation(conn, owner_id, generation_id, offset, wait)
+    # 롱 폴링은 요청 커넥션(DbConn)을 받지 않는다. 서비스가 확인할 때마다만 커넥션을 빌린다.
+    return service.get_generation(owner_id, generation_id, offset, wait)
 
 
 @router.post("/generations/{generation_id}/retry", status_code=202)
