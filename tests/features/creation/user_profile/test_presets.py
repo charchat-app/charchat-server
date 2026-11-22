@@ -77,9 +77,9 @@ class FakeStore:
         rows.sort(key=lambda r: (r["position"], r["id"]))
         return [{k: v for k, v in r.items() if k != "story_id"} for r in rows]
 
-    def find_image_owners(self, conn, image_ids):
+    def find_image_owners(self, conn, image_ids, owner_id, *, include_gif=False):
         self.image_lookups.append(list(image_ids))
-        return {i: self.images[i] for i in image_ids if i in self.images}
+        return {i for i in image_ids if self.images.get(i) == owner_id}
 
     def delete_presets_except(self, conn, story_id, keep_ids):
         self.writes.append("delete")

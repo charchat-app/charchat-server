@@ -177,11 +177,13 @@ def _check_attached_images(
     story: AuthorizedStory,
     existing: dict[int, PresetRecord],
     drafts: Sequence[PresetDraft],
-) -> None:
+) -> set[int]:
     """새로 연결하는 이미지만 확인한다: 존재하고, 스토리 제작자의 것이며, GIF가 아니어야 한다.
 
     GIF는 스토리 이미지에만 쓸 수 있다(CREATE-US-06 AC05). 확인한 이미지 행은 잠가 두어,
     첫 쓰기 전에 정리 작업이 지우지 못하게 한다(repository.find_image_owners).
+    잠근 소유 이미지 id(예전·새 연결)를 돌려준다. 예전 데이터의 남의 이미지는 잠그지 않으며
+    연결을 끊을 수는 있지만 미사용 표시는 주기 정리 작업이 맞춘다.
     이미 그 프리셋에 연결돼 있던 이미지는 다시 확인하지 않는다. 업로드 성공·용량은
     업로드 서비스(CREATE-US-06) 책임이라 여기서 판단하지 않는다.
     존재하지 않는 이미지와 남의 이미지는 같은 오류로 알려 존재 여부를 드러내지 않는다.
@@ -194,12 +196,38 @@ def _check_attached_images(
     touched = {r.image_id for r in existing.values() if r.image_id is not None}
     touched.update(attached)
     if not touched:
-        return
-    # 연결을 끊는 이미지도 먼저 잠가, 다른 트랜잭션의 마지막 연결 변경과 순서를 맞춘다.
-    owners = repo.find_image_owners(conn, sorted(touched))
-    bad = sorted({i for i in attached if owners.get(i) != story.owner_id})
+        return set()
+    # 연결을 끊는 소유 이미지도 먼저 잠가, 다른 트랜잭션의 마지막 연결 변경과 순서를 맞춘다.
+    owned = repo.find_image_owners(conn, sorted(touched), story.owner_id)
+    bad = sorted({i for i in attached if i not in owned})
     if bad:
         raise InvalidPresetImageError("사용할 수 없는 이미지가 있습니다.", image_ids=bad)
+    return owned
+
+
+def lock_preset_images(conn: Connection, story: AuthorizedStory, image_ids) -> set[int]:
+    """공통 저장이 이미지 연결을 바꾸기 전에 프리셋 이미지 묶음을 id 순으로 한 번에 잠근다.
+
+    `replace_presets`와 같은 잠금(repository.find_image_owners, id 순 `FOR UPDATE`)을 쓰므로,
+    이어서 부르는 `replace_presets`는 이미 잠근 행을 다시 잠가도 기다리지 않는다.
+    임시 저장본에서는 최종 검사에 실패할 GIF도 원문과 함께 보호한다. 소유자 이미지만
+    잠그고 반환하며, 남의 이미지 행은 잠그지도 기다리지도 않는다.
+    """
+    _require_caller_transaction(conn)
+    ids = sorted({i for i in image_ids if i is not None})
+    if not ids:
+        return set()
+    return repo.find_image_owners(conn, ids, story.owner_id, include_gif=True)
+
+
+def invalid_image_fields(conn: Connection, story: AuthorizedStory, presets: Sequence[PresetRecord]):
+    ids = sorted({preset.image_id for preset in presets if preset.image_id is not None})
+    owned = repo.find_image_owners(conn, ids, story.owner_id) if ids else set()
+    return [
+        index
+        for index, preset in enumerate(presets)
+        if preset.image_id is not None and preset.image_id not in owned
+    ]
 
 
 def _to_records(rows: Sequence[dict]) -> list[PresetRecord]:
@@ -237,7 +265,7 @@ def replace_presets(
 
     existing = {r.id: r for r in read_presets(conn, story)}
     _check_preset_ids(set(existing), drafts)
-    _check_attached_images(conn, story, existing, drafts)
+    locked_owned = _check_attached_images(conn, story, existing, drafts)
     issues = collect_preset_issues(drafts, character_names)
 
     repo.delete_presets_except(conn, story.story_id, [d.id for d in drafts if d.id is not None])
@@ -249,9 +277,10 @@ def replace_presets(
         ):
             raise InvalidPresetReferenceError("프리셋을 수정하지 못했습니다.", preset_ids=[d.id])
 
-    # 끊긴 예전 이미지와 새로 연결된 이미지의 미사용 표시를 같은 트랜잭션 안에서 다시 계산한다.
+    # 끊긴 예전 이미지와 새로 연결된 이미지 중 잠근 소유 이미지만 미사용 표시를 다시 계산한다.
+    # 예전 데이터의 남의 이미지는 갱신하지 않고 주기 정리 작업(mark/unmark)에 맡긴다.
     touched = {r.image_id for r in existing.values()} | {d.image_id for d in drafts}
-    touched.discard(None)
+    touched &= locked_owned
     if touched:
         images_service.refresh_orphaned_images(conn, touched)
     return PresetSaveResult(presets=read_presets(conn, story), issues=issues)

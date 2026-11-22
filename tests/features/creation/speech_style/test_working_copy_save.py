@@ -67,6 +67,53 @@ def test_completed_story_temporary_save_keeps_public_content(context):
     assert working_copy_rows(dsn, story) == 0
 
 
+def test_profile_temporary_save_keeps_latest_scene_and_visibility_choice(context):
+    client, _, story, _, dsn = context
+    saved = publish(client, story, dsn)
+    staged = current_payload(saved, "public")
+    staged["expression"]["custom_style"] = "최신 임시 문체"
+    assert put(client, story, {**staged, "kind": "temporary"}, "scene").status_code == 200
+    stale = current_payload(saved)
+    result = put(
+        client,
+        story,
+        {
+            **stale,
+            "kind": "temporary",
+            "preserve_scene": True,
+            "presets": [{"name": "", "description": "  미완성\n"}],
+        },
+        "profile",
+    )
+    assert result.status_code == 200, result.text
+    data = client.get(url(story)).json()
+    assert data["expression"]["custom_style"] == "최신 임시 문체"
+    assert data["presets_pending"] is True
+    assert data["presets"][0]["description"] == "  미완성\n"
+    assert data["save_state"] == "private"
+    assert stored_custom_style(dsn, story) == "공개된 문체"
+
+
+def test_draft_profile_temporary_save_does_not_rewrite_scene(context):
+    client, _, story, _, dsn = context
+    assert put(client, story, body(text="현재 문체"), "draft-scene").status_code == 200
+    staged = put(
+        client,
+        story,
+        {
+            **body(text="오래된 문체"),
+            "kind": "temporary",
+            "preserve_scene": True,
+            "presets": [{"name": "{{user}}", "description": "  미완성\n"}],
+        },
+        "draft-profile",
+    )
+    assert staged.status_code == 200, staged.text
+    assert staged.json()["request_id"] == "draft-profile"
+    assert stored_custom_style(dsn, story) == "현재 문체"
+    assert client.get(url(story)).json()["presets"][0]["description"] == "  미완성\n"
+
+
 def test_temporary_save_keeps_incomplete_input_without_checks(context):
     client, _, story, _, dsn = context
     saved = publish(client, story, dsn)

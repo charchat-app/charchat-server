@@ -1,5 +1,6 @@
 """2번→7번 공통 원자 저장·완성 검증. 격리 PostgreSQL만 사용한다."""
 
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
@@ -252,11 +253,19 @@ def test_completed_rejection_lists_field_issues_with_over_count(context):
 
 
 def add_presets(dsn, story, names):
+    """저장본 프리셋을 직접 넣는다. 완성 조건(이미지 필수)과 무관하게 이름만 검사하도록
+    프리셋마다 스토리 제작자의 이미지 1장을 연결한다."""
     with psycopg.connect(dsn) as connection:
         for position, name in enumerate(names):
+            image_id = connection.execute(
+                """INSERT INTO images(owner_id, storage_key, mime_type, byte_size)
+                   SELECT owner_id, %s, 'image/png', 1 FROM stories WHERE id=%s RETURNING id""",
+                (f"{secrets.token_hex(16)}.png", story["id"]),
+            ).fetchone()[0]
             connection.execute(
-                "INSERT INTO story_user_presets(story_id,name,position) VALUES (%s,%s,%s)",
-                (story["id"], name, position),
+                "INSERT INTO story_user_presets(story_id,name,image_id,position) "
+                "VALUES (%s,%s,%s,%s)",
+                (story["id"], name, image_id, position),
             )
 
 
@@ -272,33 +281,36 @@ def test_multiple_exact_user_placeholder_presets_are_allowed(context):
 
 @pytest.mark.parametrize("blank", [None, "", "  "])
 def test_blank_user_preset_name_is_field_issue(context, blank):
-    # schema.sql: 완성 저장에서는 제공한 각 프리셋의 이름이 필수다.
+    # CREATE-US-05: 완성 저장에서는 제공한 각 프리셋의 이름이 필수다(프리셋 모듈 규칙).
+    # 요청에서 프리셋을 뺐어도 저장본 프리셋 전체를 검사한다.
     client, _, story, _, dsn = context
     complete(dsn, story)
     add_presets(dsn, story, ["{{user}}", blank])
     before = client.get(url(story)).json()
     result = put(client, story, body("private"))
     assert result.status_code == 422
-    assert result.json()["code"] == "USER_PRESET_NAME_REQUIRED"
+    assert result.json()["code"] == "REQUIRED"
     assert [(i["field"], i["code"]) for i in result.json()["issues"]] == [
-        ("user_presets[1].name", "USER_PRESET_NAME_REQUIRED")
+        ("presets[1].name", "REQUIRED")
     ]
     assert client.get(url(story)).json() == before
 
 
 def test_preset_name_duplicates_character_and_other_preset(context):
     # 직접 입력 이름은 캐릭터·다른 직접 이름과 대소문자·띄어쓰기를 무시하고 비교한다.
+    # 정확한 `{{user}}`만 비교에서 빠지고 `{{USER}}`는 직접 이름이다.
     client, _, story, _, dsn = context
     complete(dsn, story)
     add_presets(dsn, story, ["하 린", "{{user}}", "Alex", "a lex", "{{USER}}"])
     result = put(client, story, body("private"))
     assert result.status_code == 422
-    names = [i["field"] for i in result.json()["issues"] if i["code"] == "INVALID_CHARACTER_NAME"]
-    assert sorted(names) == [
-        "characters[0].name",
-        "user_presets[0].name",
-        "user_presets[2].name",
-        "user_presets[3].name",
+    issues = sorted(
+        (i["field"], i["code"]) for i in result.json()["issues"] if i["field"].startswith("presets")
+    )
+    assert issues == [
+        ("presets[0].name", "NAME_DUPLICATE_CHARACTER"),
+        ("presets[2].name", "NAME_DUPLICATE_PRESET"),
+        ("presets[3].name", "NAME_DUPLICATE_PRESET"),
     ]
     assert client.get(url(story)).json()["save_state"] == "draft"
 

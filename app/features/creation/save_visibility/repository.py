@@ -1,7 +1,8 @@
 """7번 공통 저장의 완성 조건 조회와 저장 상태 변경 SQL."""
 
 # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5)
-# 아래 1번(stories·characters·tags)·5번(story_user_presets) 조회는 다른 기능의 테이블을 직접 읽는다.
+# 아래 1번(stories·characters·tags) 조회는 다른 기능의 테이블을 직접 읽는다.
+# 5번 프리셋은 user_profile 서비스(CREATE-US-05)를 통해 읽고 쓴다.
 # common/에 조회 함수가 생기면 그 함수를 호출하고 이 파일의 해당 함수는 지운다.
 
 
@@ -26,15 +27,6 @@ def read_tag_names(connection, story_id):
     rows = connection.execute(
         """SELECT t.name FROM tags t JOIN story_tags s ON s.tag_id=t.id
            WHERE s.story_id=%s ORDER BY t.id""",
-        (story_id,),
-    ).fetchall()
-    return [row["name"] for row in rows]
-
-
-def read_preset_names(connection, story_id):
-    # TODO(KAN-13): common/ 조회 함수로 교체 (리뷰 server#5) — 5번 story_user_presets
-    rows = connection.execute(
-        "SELECT name FROM story_user_presets WHERE story_id=%s ORDER BY position,id",
         (story_id,),
     ).fetchall()
     return [row["name"] for row in rows]

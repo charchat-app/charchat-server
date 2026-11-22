@@ -32,23 +32,26 @@ def list_presets(conn: Connection, story_id: int) -> list[Row]:
     ).fetchall()
 
 
-def find_image_owners(conn: Connection, image_ids: list[int]) -> dict[int, int]:
-    """프리셋에 연결할 수 있는 이미지 id → 소유자 id. images는 쓰지 않는다.
+def find_image_owners(
+    conn: Connection, image_ids: list[int], owner_id: int, *, include_gif: bool = False
+) -> set[int]:
+    """`owner_id`가 소유한 이미지 중 프리셋에 연결할 수 있는 id 집합. images는 쓰지 않는다.
 
-    - 존재하지 않는 id와 GIF(스토리 이미지 전용, CREATE-US-06 AC05)는 결과에 없다.
-    - 찾은 행은 id 순으로 `FOR UPDATE` 잠금을 잡는다. 연결 변경과 미사용 표시 갱신을
-      직렬화해 정리 작업 또는 다른 프리셋 저장과 충돌하지 않게 한다.
+    - 존재하지 않는 id, 남의 이미지, GIF(스토리 이미지 전용, CREATE-US-06 AC05)는 결과에 없다.
+    - 소유자 조건은 SQL에서 먼저 걸러, `FOR UPDATE`는 소유 행에만 id 순으로 잡는다.
+      남의 이미지 행이 다른 트랜잭션에 잠겨 있어도 기다리지 않는다.
+      잠근 행은 연결 변경과 미사용 표시 갱신을 정리 작업·다른 프리셋 저장과 직렬화한다.
     """
     rows = conn.execute(
         """
-        SELECT id, owner_id, mime_type FROM images
-        WHERE id = ANY(%s::bigint[])
+        SELECT id, mime_type FROM images
+        WHERE id = ANY(%s::bigint[]) AND owner_id = %s
         ORDER BY id
         FOR UPDATE
         """,
-        (image_ids,),
+        (image_ids, owner_id),
     ).fetchall()
-    return {r["id"]: r["owner_id"] for r in rows if r["mime_type"] != "image/gif"}
+    return {r["id"] for r in rows if include_gif or r["mime_type"] != "image/gif"}
 
 
 def delete_presets_except(conn: Connection, story_id: int, keep_ids: list[int]) -> None:
