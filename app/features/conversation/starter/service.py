@@ -190,9 +190,11 @@ def get_session(conn: Connection, owner_id: int, session_id: int) -> SessionResp
         return SessionResponse(
             id=session_id,
             story_title=session["story_title"] or "",
-            # 실제 모델 설정/호출은 KAN-17에서 연결한다.
-            model=None,
+            # 첫 응답 생성 때 적용한 모델(CHAT-US-02). 아직 생성 전이면 None.
+            model=session["model"],
             read_only=session["read_only"],
+            # 대화 입력창의 기본 발화자 이름(CHAT-US-02-AC01).
+            play_name=session["play_name"],
             messages=session["intro_messages_snapshot"],
             characters=[
                 CharacterResponse(id=row["id"], name=row["name"] or "")

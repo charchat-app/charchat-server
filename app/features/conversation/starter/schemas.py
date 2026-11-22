@@ -72,5 +72,6 @@ class SessionResponse(BaseModel):
     story_title: str
     model: str | None
     read_only: bool
+    play_name: str
     messages: list[MessageResponse]
     characters: list[CharacterResponse]

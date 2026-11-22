@@ -632,3 +632,46 @@ ALTER TABLE conversation_sessions
     ADD CONSTRAINT conversation_sessions_initial_request_key
         UNIQUE (owner_id, story_id, initial_request_fingerprint);
 
+
+-- CHAT-US-02 (KAN-17) 로컬 개발·테스트 전용. 운영 마이그레이션이 아니다.
+-- 세션에 적용한 모델. 첫 응답 생성 요청 때 서버 기본 모델(CHAT_DEFAULT_MODEL)로 채운다.
+ALTER TABLE conversation_sessions ADD COLUMN model text;
+
+-- 대화 이력. 이용자 메시지와 정상 완료·저장된 AI 응답만 담는다(인트로는 세션 스냅샷에 있다).
+-- parts: [{"speaker_kind", "character_id"(세션 캐릭터 ID 또는 null), "body"}] 작성 순서 그대로.
+CREATE TABLE conversation_messages (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id bigint NOT NULL REFERENCES conversation_sessions(id) ON DELETE CASCADE,
+    seq integer NOT NULL CHECK (seq > 0),
+    role text NOT NULL CHECK (role IN ('user', 'assistant')),
+    parts jsonb NOT NULL CHECK (jsonb_typeof(parts) = 'array'),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT conversation_messages_session_seq_unique UNIQUE (session_id, seq)
+);
+
+-- 응답 생성 요청. 화면 이탈과 무관하게 서버에서 끝까지 진행하고 상태와 누적 원문을 남긴다.
+-- failed: 표시된 내용 없이 실패(청구 안 함, 재시도 가능). failed_partial: 일부 표시 후 오류.
+-- save_failed: 전체 응답 생성 후 저장 실패. 미완료 응답의 이력·청구 정책은 미결(안건-20261120-7EFE61,
+-- 안건-20261120-17577A)이라 billable은 정상 완료(completed)에만 true로 기록한다.
+CREATE TABLE conversation_generations (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id bigint NOT NULL REFERENCES conversation_sessions(id) ON DELETE CASCADE,
+    owner_id bigint NOT NULL,
+    request_id text NOT NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN (
+        'pending', 'streaming', 'completed', 'failed', 'failed_partial', 'save_failed'
+    )),
+    user_message_id bigint NOT NULL REFERENCES conversation_messages(id) ON DELETE CASCADE,
+    assistant_message_id bigint REFERENCES conversation_messages(id) ON DELETE SET NULL,
+    text text NOT NULL DEFAULT '',
+    model text,
+    error_code text,
+    billable boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT conversation_generations_request_unique UNIQUE (owner_id, session_id, request_id)
+);
+-- 세션마다 진행 중(pending·streaming) 생성은 하나만 허용한다.
+CREATE UNIQUE INDEX conversation_generations_one_active_idx
+    ON conversation_generations(session_id) WHERE status IN ('pending', 'streaming');
+CREATE INDEX conversation_generations_session_idx ON conversation_generations(session_id, id);

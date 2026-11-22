@@ -218,9 +218,10 @@ def copy_relationships(conn: Connection, session_id: int):
 
 def get_session(conn: Connection, session_id: int, owner_id: int):
     return conn.execute(
-        """SELECT cs.id, s.title AS story_title, cs.intro_messages_snapshot,
-                  s.deleted_at IS NOT NULL AS read_only
+        """SELECT cs.id, s.title AS story_title, cs.intro_messages_snapshot, cs.model,
+                  s.deleted_at IS NOT NULL AS read_only, up.name AS play_name
            FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
+           JOIN conversation_user_profiles up ON up.session_id = cs.id
            WHERE cs.id = %s AND cs.owner_id = %s
              AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
                   OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))""",

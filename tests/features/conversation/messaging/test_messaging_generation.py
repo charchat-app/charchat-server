@@ -1,0 +1,282 @@
+"""CHAT-US-02 응답 생성 진행·실패·재시도·롱 폴링."""
+
+from time import monotonic, sleep
+
+import pytest
+from messaging_helpers import GENERATIONS, PLAYER, SESSIONS, RecordingProvider, send, user_part
+
+from app.core.config import settings
+from app.features.conversation.messaging import providers, repository, service
+from app.features.conversation.messaging.providers import (
+    FakeProvider,
+    ProviderError,
+    ProviderRequest,
+    iter_sse_content,
+)
+
+
+def generation_row(db, generation_id):
+    return db.execute(
+        """SELECT status, text, billable, error_code, assistant_message_id
+           FROM conversation_generations WHERE id = %s""",
+        (generation_id,),
+    ).fetchone()
+
+
+def retry(client, generation_id, request_id="retry-0001"):
+    return client.post(
+        f"{GENERATIONS}/{generation_id}/retry", headers=PLAYER, json={"request_id": request_id}
+    )
+
+
+def test_chat_us_02_ac15_failure_without_content_is_not_billed_and_retryable(
+    client, db, session, monkeypatch
+):
+    monkeypatch.setattr(settings, "chat_fake_fail_mode", "before")
+    parts = [user_part("*숨을 고른다.*"), user_part("다시 말해 줘")]
+    generation = send(client, session, parts).json()["id"]
+    row = generation_row(db, generation)
+    assert row == {
+        "status": "failed",
+        "text": "",
+        "billable": False,
+        "error_code": "PROVIDER_ERROR",
+        "assistant_message_id": None,
+    }
+    turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    failed = turns["last_failed_generation"]
+    assert failed["id"] == generation
+    assert failed["status"] == "failed"
+    assert failed["retryable"] is True
+    # AC16: 실패한 입력은 그대로 남아 다시 작성하지 않고 재시도할 수 있다.
+    assert [p["body"] for p in turns["messages"][0]["parts"]] == [p["body"] for p in parts]
+    assert [m["role"] for m in turns["messages"]] == ["user"]
+
+
+def test_chat_us_02_ac15_ac16_retry_reuses_input_and_completes(client, db, session, monkeypatch):
+    monkeypatch.setattr(settings, "chat_fake_fail_mode", "before")
+    failed = send(client, session, [user_part("재시도할 입력")]).json()
+    # 자동 재호출 없음: 실패 후 생성 행은 하나뿐이다.
+    assert db.execute("SELECT count(*) AS n FROM conversation_generations").fetchone()["n"] == 1
+    monkeypatch.setattr(settings, "chat_fake_fail_mode", "none")
+    retried = retry(client, failed["id"])
+    assert retried.status_code == 202
+    body = retried.json()
+    assert body["id"] != failed["id"]
+    assert body["status"] == "pending"
+    assert body["user_message_id"] == failed["user_message_id"]
+    assert generation_row(db, body["id"])["status"] == "completed"
+    # 같은 재시도 요청 ID는 같은 생성을 돌려준다.
+    assert retry(client, failed["id"]).json()["id"] == body["id"]
+    # 이제 최신이 아니므로 원래 실패 건은 다시 시도할 수 없다.
+    again = retry(client, failed["id"], request_id="retry-0002")
+    assert again.status_code == 409
+    assert again.json()["code"] == "GENERATION_NOT_RETRYABLE"
+    turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert [m["role"] for m in turns["messages"]] == ["user", "assistant"]
+    assert turns["last_failed_generation"] is None
+
+
+def test_chat_us_02_ac17_partial_failure_keeps_text_out_of_history(
+    client, db, session, monkeypatch
+):
+    monkeypatch.setattr(settings, "chat_fake_fail_mode", "after")
+    generation = send(client, session, [user_part("중간에 끊김")]).json()["id"]
+    row = generation_row(db, generation)
+    assert row["status"] == "failed_partial"
+    assert row["error_code"] == "STREAM_INTERRUPTED"
+    assert row["text"] != ""
+    assert row["billable"] is False
+    turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert [m["role"] for m in turns["messages"]] == ["user"]
+    assert turns["last_failed_generation"]["status"] == "failed_partial"
+    assert turns["last_failed_generation"]["text"] == row["text"]
+    assert turns["last_failed_generation"]["retryable"] is False
+    response = retry(client, generation)
+    assert response.status_code == 409
+    assert response.json()["code"] == "GENERATION_NOT_RETRYABLE"
+
+
+def test_chat_us_02_ac17_save_failure_is_distinguished(client, db, session, monkeypatch):
+    original = repository.insert_message
+
+    def failing_insert(conn, session_id, role, parts):
+        if role == "assistant":
+            raise RuntimeError("저장 실패 흉내")
+        return original(conn, session_id, role, parts)
+
+    monkeypatch.setattr(repository, "insert_message", failing_insert)
+    generation = send(client, session, [user_part("저장 실패")]).json()["id"]
+    row = generation_row(db, generation)
+    assert row["status"] == "save_failed"
+    assert row["error_code"] == "SAVE_FAILED"
+    assert row["text"].startswith("@도경:")
+    assert row["billable"] is False
+    assert db.execute(
+        "SELECT count(*) AS n FROM conversation_messages WHERE role = 'assistant'"
+    ).fetchone() == {"n": 0}
+    assert retry(client, generation).status_code == 409
+
+
+def test_chat_us_02_ac15_new_message_after_failure_hides_old_failure(
+    client, db, session, monkeypatch
+):
+    monkeypatch.setattr(settings, "chat_fake_fail_mode", "before")
+    failed = send(client, session, [user_part("실패")]).json()
+    monkeypatch.setattr(settings, "chat_fake_fail_mode", "none")
+    assert send(client, session, [user_part("새 입력")], request_id="next-0001").status_code == 202
+    turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert turns["last_failed_generation"] is None
+    assert retry(client, failed["id"]).status_code == 409
+
+
+def test_chat_us_02_empty_provider_output_is_failed_not_billed(client, db, session, monkeypatch):
+    provider = RecordingProvider(chunks=["  ", "\n"])
+    monkeypatch.setattr(providers, "get_provider", lambda: provider)
+    generation = send(client, session, [user_part("빈 응답")]).json()["id"]
+    row = generation_row(db, generation)
+    assert row["status"] == "failed"
+    assert row["error_code"] == "EMPTY_RESPONSE"
+    assert row["billable"] is False
+
+
+def test_chat_us_02_long_poll_offsets_are_code_points(client, db, session, monkeypatch):
+    provider = RecordingProvider(chunks=["@도경: 😀가", "나다"])
+    monkeypatch.setattr(providers, "get_provider", lambda: provider)
+    generation = send(client, session, [user_part("x")]).json()["id"]
+    full = client.get(f"{GENERATIONS}/{generation}", headers=PLAYER).json()
+    assert full["text"] == "@도경: 😀가나다"
+    assert full["next_offset"] == 9
+    tail = client.get(f"{GENERATIONS}/{generation}?offset=5", headers=PLAYER).json()
+    assert tail["text"] == "😀가나다"
+    assert tail["next_offset"] == 9
+    beyond = client.get(f"{GENERATIONS}/{generation}?offset=50", headers=PLAYER).json()
+    assert beyond["text"] == ""
+    assert beyond["next_offset"] == 9
+    assert client.get(f"{GENERATIONS}/{generation}?wait=26", headers=PLAYER).status_code == 422
+    assert client.get(f"{GENERATIONS}/{generation}?offset=-1", headers=PLAYER).status_code == 422
+
+
+def test_chat_us_02_ac13_ac14_thread_worker_streams_and_long_poll_collects_all(
+    client, db, session, thread_worker
+):
+    """실제 스레드 경로: 전송 응답은 바로 pending이고, 롱 폴링으로 끝까지 이어 받는다."""
+    sent = send(client, session, [user_part("스레드로 생성")])
+    assert sent.status_code == 202
+    assert sent.json()["status"] == "pending"
+    generation = sent.json()["id"]
+    collected = ""
+    offset = 0
+    statuses = []
+    deadline = monotonic() + 20
+    while True:
+        poll = client.get(
+            f"{GENERATIONS}/{generation}?offset={offset}&wait=5", headers=PLAYER
+        ).json()
+        statuses.append(poll["status"])
+        collected += poll["text"]
+        offset = poll["next_offset"]
+        if poll["status"] not in ("pending", "streaming"):
+            break
+        assert monotonic() < deadline
+    assert poll["status"] == "completed"
+    assert "streaming" in statuses
+    assert len(statuses) > 1  # 조각마다 여러 번 나눠 받았다.
+    assert collected == generation_row(db, generation)["text"]
+    assert poll["assistant_message"]["parts"][0]["speaker_name"] == "도경"
+
+
+def test_chat_us_02_ac13_generation_continues_without_any_client_poll(
+    client, db, session, thread_worker
+):
+    """화면 이탈(조회 없음)에도 서버가 끝까지 생성·저장한다."""
+    generation = send(client, session, [user_part("나가도 계속")]).json()["id"]
+    deadline = monotonic() + 20
+    while generation_row(db, generation)["status"] in ("pending", "streaming"):
+        assert monotonic() < deadline
+        sleep(0.05)
+    row = generation_row(db, generation)
+    assert row["status"] == "completed"
+    assert row["billable"] is True
+
+
+def test_chat_us_02_long_poll_waits_then_returns_on_timeout(client, db, session, monkeypatch):
+    from app.features.conversation.messaging import worker
+
+    monkeypatch.setattr(worker, "submit", lambda job, *args: None)
+    generation = send(client, session, [user_part("대기")]).json()["id"]
+    started = monotonic()
+    poll = client.get(f"{GENERATIONS}/{generation}?wait=0.5", headers=PLAYER).json()
+    assert monotonic() - started >= 0.45
+    assert poll["status"] == "pending"
+    assert poll["text"] == ""
+
+
+def test_chat_us_02_stale_active_generation_is_expired(client, db, session, monkeypatch):
+    from app.features.conversation.messaging import worker
+
+    monkeypatch.setattr(worker, "submit", lambda job, *args: None)
+    generation = send(client, session, [user_part("서버 중단")]).json()["id"]
+    db.execute(
+        """UPDATE conversation_generations SET updated_at = now() - interval '1 hour'
+           WHERE id = %s""",
+        (generation,),
+    )
+    poll = client.get(f"{GENERATIONS}/{generation}", headers=PLAYER).json()
+    assert poll["status"] == "failed"
+    assert poll["error_code"] == "GENERATION_STALE"
+    assert poll["retryable"] is True
+    # 정리된 뒤에는 새 메시지를 보낼 수 있다.
+    monkeypatch.undo()
+    monkeypatch.setattr(settings, "chat_generation_worker", "inline")
+    monkeypatch.setattr(settings, "chat_fake_chunk_delay_ms", 0)
+    assert send(client, session, [user_part("다시")], request_id="after-stale").status_code == 202
+
+
+def test_chat_us_02_worker_does_not_run_twice(client, db, session):
+    generation = send(client, session, [user_part("한 번")]).json()["id"]
+    before = generation_row(db, generation)
+    service.run_generation(generation)
+    assert generation_row(db, generation) == before
+    assert db.execute("SELECT count(*) AS n FROM conversation_messages").fetchone()["n"] == 2
+
+
+def test_chat_us_02_fake_provider_markers_and_modes():
+    request = ProviderRequest(model="m", messages=[], character_names=["도경"], last_user_text="")
+    text = "".join(FakeProvider().stream(request))
+    assert text.startswith("@도경: (가짜 응답)")
+    with pytest.raises(ProviderError):
+        list(FakeProvider(fail_mode="before").stream(request))
+    request.last_user_text = "#fail-after"
+    received = []
+    with pytest.raises(ProviderError) as exc:
+        for chunk in FakeProvider().stream(request):
+            received.append(chunk)
+    assert exc.value.code == "STREAM_INTERRUPTED"
+    assert received
+
+
+def test_chat_us_02_openai_sse_parsing_without_network():
+    lines = [
+        b": keep-alive\n",
+        b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n',
+        b'data: {"choices":[{"delta":{"content":"@\\ub3c4\\uacbd: "}}]}\n',
+        b"\n",
+        'data: {"choices":[{"delta":{"content":"안녕"}}]}\n'.encode(),
+        b"data: [DONE]\n",
+        b'data: {"choices":[{"delta":{"content":"after"}}]}\n',
+    ]
+    assert "".join(iter_sse_content(lines)) == "@도경: 안녕"
+    with pytest.raises(ProviderError):
+        list(iter_sse_content([b'data: {"error": {"message": "x"}}']))
+    with pytest.raises(ProviderError):
+        list(iter_sse_content([b"data: {broken"]))
+
+
+def test_chat_us_02_openai_provider_requires_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "chat_llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "chat_llm_base_url", None)
+    with pytest.raises(ProviderError):
+        providers.get_provider()
+    monkeypatch.setattr(settings, "chat_llm_base_url", "http://127.0.0.1:9/v1")
+    assert isinstance(providers.get_provider(), providers.OpenAICompatibleProvider)

@@ -106,6 +106,7 @@ def test_create_copies_selected_state_and_renders_snapshot(client, db, saved_sto
         "story_title": "Saved",
         "read_only": False,
         "model": None,
+        "play_name": "Player",
         "messages": [
             {"speaker_kind": "character", "speaker_name": "Aria Moon", "body": "Welcome Player"},
             {
