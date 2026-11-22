@@ -42,7 +42,17 @@ def find_owned_images(connection: psycopg.Connection, owner_id: int, image_ids: 
     return connection.execute(
         """SELECT id, storage_key, mime_type, byte_size FROM images
            WHERE owner_id = %s AND id = ANY(%s)
-           FOR SHARE""",
+           ORDER BY id FOR UPDATE""",
+        (owner_id, image_ids),
+    ).fetchall()
+
+
+def read_owned_images(connection: psycopg.Connection, owner_id: int, image_ids: list[int]):
+    """소유자 이미지만 잠그지 않고 읽는다(읽기 전용 조회용 미리보기 URL)."""
+    if not image_ids:
+        return []
+    return connection.execute(
+        "SELECT id, storage_key FROM images WHERE owner_id = %s AND id = ANY(%s)",
         (owner_id, image_ids),
     ).fetchall()
 
@@ -136,18 +146,35 @@ def mark_unused_images(connection: psycopg.Connection) -> int:
     """연결이 없는데 미사용 시각이 비어 있는 이미지에 시각을 기록한다.
 
     캐릭터 삭제(CASCADE)나 다른 기능의 연결 해제처럼 이 기능을 거치지 않은 변경도 여기서 잡힌다.
+    후보를 id 순 `FOR UPDATE OF i SKIP LOCKED`로 골라 고른 행만 바꾼다. 편집 트랜잭션이
+    잠근 행은 기다리지 않고 건너뛰며 다음 정리 주기에 다시 판단한다.
     """
     return connection.execute(
-        f"""UPDATE images i SET orphaned_at = clock_timestamp()
-            WHERE i.orphaned_at IS NULL AND NOT ({_REFERENCE_SQL})"""
+        f"""WITH candidates AS (
+                SELECT i.id FROM images i
+                WHERE i.orphaned_at IS NULL AND NOT ({_REFERENCE_SQL})
+                ORDER BY i.id
+                FOR UPDATE OF i SKIP LOCKED
+            )
+            UPDATE images SET orphaned_at = clock_timestamp()
+            FROM candidates c WHERE images.id = c.id"""
     ).rowcount
 
 
 def unmark_used_images(connection: psycopg.Connection) -> int:
-    """미사용으로 표시됐지만 다시 연결된 이미지의 표시를 지운다."""
+    """미사용으로 표시됐지만 다시 연결된 이미지의 표시를 지운다.
+
+    `mark_unused_images`와 같이 잠긴 행은 건너뛰고 다음 정리 주기에 다시 판단한다.
+    """
     return connection.execute(
-        f"""UPDATE images i SET orphaned_at = NULL
-            WHERE i.orphaned_at IS NOT NULL AND ({_REFERENCE_SQL})"""
+        f"""WITH candidates AS (
+                SELECT i.id FROM images i
+                WHERE i.orphaned_at IS NOT NULL AND ({_REFERENCE_SQL})
+                ORDER BY i.id
+                FOR UPDATE OF i SKIP LOCKED
+            )
+            UPDATE images SET orphaned_at = NULL
+            FROM candidates c WHERE images.id = c.id"""
     ).rowcount
 
 

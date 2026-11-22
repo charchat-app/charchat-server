@@ -47,6 +47,16 @@ def file_url(storage_key: str) -> str:
     return f"{settings.api_prefix}/creation/image-files/{storage_key}"
 
 
+def owned_image_urls(connection: psycopg.Connection, owner_id: int, image_ids) -> dict[int, str]:
+    """이미지 id → 파일 URL. 소유자 이미지만 담고, 남의·없는 이미지는 빠진다(존재를 드러내지 않음).
+
+    CREATE-US-05 프리셋 미리보기 복원용. 행을 잠그지 않아 읽기 전용 트랜잭션에서도 쓸 수 있다.
+    """
+    ids = sorted({i for i in image_ids if i is not None})
+    rows = repository.read_owned_images(connection, owner_id, ids)
+    return {row["id"]: file_url(row["storage_key"]) for row in rows}
+
+
 def to_item(row) -> ImageItem:
     return ImageItem(
         image_id=row["id"],
@@ -248,9 +258,16 @@ def _save_story_images(connection, story_id, owner_id, request_id, body):
         for character in body.characters:
             requested.update(character.image_ids)
         # 다른 사람의 이미지 ID를 넣은 요청은 존재하지 않는 이미지와 같게 거절한다.
+        copy = working_copy.read(connection, story_id)
+        old = working_copy.images_document_ids(copy["images"] if copy else None)
+        linked = repository.linked_image_ids(
+            connection, story_id, [character.character_id for character in body.characters]
+        )
         images = {
             row["id"]: row
-            for row in repository.find_owned_images(connection, owner_id, sorted(requested))
+            for row in repository.find_owned_images(
+                connection, owner_id, sorted(requested | old | linked)
+            )
         }
         missing = sorted(requested - images.keys())
         if missing:
@@ -322,6 +339,16 @@ def _replace_lists(
     return before
 
 
+def working_copy_image_cohort(connection: psycopg.Connection, story_id: int, copy) -> set[int]:
+    """사진 임시본 반영에서 연결하거나 분리할 이미지 ID."""
+    document = copy["images"] if copy else None
+    if document is None:
+        return set()
+    ids = working_copy.images_document_ids(document)
+    characters = [row["character_id"] for row in document["characters"]]
+    return ids | repository.linked_image_ids(connection, story_id, characters)
+
+
 def apply_working_copy(connection: psycopg.Connection, story_id: int) -> set[int]:
     """공통 「저장」에서 이미지 임시 저장본도 함께 반영한다(안 B: 저장하면 사진까지 한 번에).
 
@@ -381,6 +408,7 @@ def cleanup_unused_images(
     """AC11: 유예 기간이 지난 미사용 이미지만 파일과 행을 지운다.
 
     1. 연결 상태와 미사용 표시를 맞춘다(새로 끊긴 것은 지금부터 유예 시작, 다시 연결된 것은 해제).
+       다른 저장이 잠근 행은 기다리지 않고 건너뛰어 다음 실행에서 다시 맞춘다.
     2. 유예가 지난 이미지마다 별도 트랜잭션에서 행을 잠그고 연결을 다시 확인한다.
        다른 저장이 연결하는 중이면(외래 키 잠금) 기다리지 않고 건너뛰어 그 저장을 깨뜨리지 않는다.
     3. 파일을 먼저 지우고 성공했을 때만 행을 지운다. 파일 삭제가 실패하면 행을 남겨 다시 시도한다.
@@ -394,6 +422,15 @@ def cleanup_unused_images(
     for image_id in repository.expired_image_ids(connection, seconds):
         _delete_if_unused(connection, storage, image_id, seconds, result)
     return result
+
+
+def refresh_orphaned_images(connection: psycopg.Connection, image_ids: set[int]) -> None:
+    """다른 기능이 이미지 연결을 바꾼 뒤, 그 이미지들의 미사용 시작 시각을 다시 계산한다(AC11).
+
+    연결이 하나라도 남으면 NULL, 없으면 미사용 시각을 기록한다. 호출자의 트랜잭션 안에서,
+    연결 쓰기를 마친 뒤 부른다. 커밋·롤백하지 않는다.
+    """
+    repository.refresh_orphaned(connection, image_ids)
 
 
 def release_images(
