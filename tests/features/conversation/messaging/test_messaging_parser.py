@@ -60,3 +60,15 @@ def test_chat_us_02_ac09_text_before_first_tag_and_user_tag_become_narrator():
 def test_chat_us_02_ac09_blank_parts_dropped_and_blank_lines_trimmed():
     assert parse_assistant_text("\n@도경:\n@나레이터: 비\n\n", NAMES) == [narrator("비")]
     assert parse_assistant_text("   ", NAMES) == []
+
+
+def test_chat_us_02_ac09_crlf_and_lone_cr_line_breaks_match_app_parser():
+    # 앱 assistantParser의 CRLF·CR 사례와 같은 결과여야 생성 중·저장 후 말풍선이 같다.
+    assert parse_assistant_text("@도경: 하나\r\n둘\r\n@나레이터: 셋", NAMES) == [
+        character("도경", "하나\n둘"),
+        narrator("셋"),
+    ]
+    assert parse_assistant_text("@도경: 하나\r@Bea: 둘", NAMES) == [
+        character("도경", "하나"),
+        character("Bea", "둘"),
+    ]

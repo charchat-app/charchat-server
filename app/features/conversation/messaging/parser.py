@@ -27,7 +27,8 @@ class ParsedPart:
 def parse_assistant_text(text: str, character_names: list[str]) -> list[ParsedPart]:
     names = set(character_names)
     blocks: list[list] = []  # [kind, name, lines]
-    for line in text.split("\n"):
+    # \r\n·\r 등 모든 줄 경계를 같은 줄바꿈으로 본다(앱 splitPythonLines와 같은 규칙).
+    for line in text.splitlines():
         match = _TAG.match(line)
         if match and (match.group(1) in names or match.group(1) == NARRATOR_TAG):
             name = match.group(1)
