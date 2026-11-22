@@ -634,6 +634,8 @@ ALTER TABLE conversation_sessions
 
 
 -- CHAT-US-02 (KAN-17) 로컬 개발·테스트 전용. 운영 마이그레이션이 아니다.
+-- 기존 DB는 app/db/migrations/kan17_conversation_messaging.sql을 서버 배포 전에 적용한다
+-- (docs/kan17-conversation-messaging-rollout.md). 정의를 바꾸면 두 파일을 함께 고친다.
 -- 세션에 적용한 모델. 첫 응답 생성 요청 때 서버 기본 모델(CHAT_DEFAULT_MODEL)로 채운다.
 ALTER TABLE conversation_sessions ADD COLUMN model text;
 
