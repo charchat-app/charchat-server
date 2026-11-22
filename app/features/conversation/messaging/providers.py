@@ -1,8 +1,10 @@
-"""CHAT-US-02 응답 생성 공급자. 실제 모델·공급자는 팀 결정 전이라 설정으로 고른다.
+"""CHAT-US-02 응답 생성 공급자. 세션 모델(models 행)의 provider·provider_model_id로 호출한다.
 
 - fake: 네트워크 없이 정해진 가짜 응답을 작은 조각으로 보낸다(기본, 로컬·테스트용).
-- openai_compatible: `{base}/chat/completions`를 `stream: true`로 부르고 SSE `data:` 줄을 읽는다.
-  새 런타임 의존성 없이 표준 라이브러리 urllib만 쓴다.
+  모델의 provider_model_id는 응답 문구의 이름표로만 쓴다.
+- openai_compatible: provider가 'openai'인 모델을 `{CHAT_LLM_BASE_URL}/chat/completions`
+  (기본 https://api.openai.com/v1)로 `stream: true` 호출하고 SSE `data:` 줄을 읽는다.
+  키는 CHAT_LLM_API_KEY에서만 읽는다. 새 런타임 의존성 없이 표준 라이브러리 urllib만 쓴다.
 """
 
 import json
@@ -17,6 +19,8 @@ from app.core.config import settings
 
 FAIL_BEFORE_MARKER = "#fail-before"
 FAIL_AFTER_MARKER = "#fail-after"
+# 실제 호출을 지원하는 models.provider 값.
+SUPPORTED_PROVIDERS = ("openai",)
 
 
 class ProviderError(Exception):
@@ -29,8 +33,10 @@ class ProviderError(Exception):
 
 @dataclass
 class ProviderRequest:
+    # 공급자 쪽 모델 ID(models.provider_model_id)와 공급자(models.provider).
     model: str
     messages: list[dict]
+    provider: str = "openai"
     # fake 공급자가 응답을 만들 때 쓰는 보조 정보. 실제 공급자는 messages만 보낸다.
     character_names: list[str] = field(default_factory=list)
     last_user_text: str = ""
@@ -116,6 +122,10 @@ class OpenAICompatibleProvider:
         self.timeout = timeout
 
     def stream(self, request: ProviderRequest) -> Iterator[str]:
+        if request.provider not in SUPPORTED_PROVIDERS:
+            raise ProviderError(
+                "PROVIDER_NOT_CONFIGURED", f"지원하지 않는 공급자입니다: {request.provider}"
+            )
         body = json.dumps(
             {"model": request.model, "messages": request.messages, "stream": True}
         ).encode("utf-8")
@@ -141,9 +151,11 @@ def get_provider() -> Provider:
     if settings.chat_llm_provider == "openai_compatible":
         if not settings.chat_llm_base_url:
             raise ProviderError("PROVIDER_NOT_CONFIGURED", "CHAT_LLM_BASE_URL을 설정하세요.")
+        if not settings.chat_llm_api_key:
+            raise ProviderError("PROVIDER_NOT_CONFIGURED", "CHAT_LLM_API_KEY를 설정하세요.")
         return OpenAICompatibleProvider(
             settings.chat_llm_base_url,
-            settings.chat_llm_api_key or None,
+            settings.chat_llm_api_key,
             settings.chat_llm_timeout_seconds,
         )
     return FakeProvider(settings.chat_fake_chunk_delay_ms, settings.chat_fake_fail_mode)

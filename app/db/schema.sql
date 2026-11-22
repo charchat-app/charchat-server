@@ -633,47 +633,91 @@ ALTER TABLE conversation_sessions
         UNIQUE (owner_id, story_id, initial_request_fingerprint);
 
 
--- CHAT-US-02 (KAN-17) 로컬 개발·테스트 전용. 운영 마이그레이션이 아니다.
--- 기존 DB는 app/db/migrations/kan17_conversation_messaging.sql을 서버 배포 전에 적용한다
--- (docs/kan17-conversation-messaging-rollout.md). 정의를 바꾸면 두 파일을 함께 고친다.
--- 세션에 적용한 모델. 첫 응답 생성 요청 때 서버 기본 모델(CHAT_DEFAULT_MODEL)로 채운다.
-ALTER TABLE conversation_sessions ADD COLUMN model text;
-
--- 대화 이력. 이용자 메시지와 정상 완료·저장된 AI 응답만 담는다(인트로는 세션 스냅샷에 있다).
--- parts: [{"speaker_kind", "character_id"(세션 캐릭터 ID 또는 null), "body"}] 작성 순서 그대로.
-CREATE TABLE conversation_messages (
+-- CHAT-US-02 (KAN-17) 팀 승인 DDL(2026-11-20 공용 DB 적용, Confluence 3047447) 그대로.
+-- 공용 DB에는 이미 있으므로 다시 실행하지 않는다. 기존 DB는
+-- app/db/migrations/kan17_conversation_messaging.sql로 맞춘다(docs/kan17-conversation-messaging-rollout.md).
+-- 이 블록의 이름·정의를 바꾸면 마이그레이션의 정의 검사도 함께 고친다.
+CREATE TABLE public.models (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    session_id bigint NOT NULL REFERENCES conversation_sessions(id) ON DELETE CASCADE,
-    seq integer NOT NULL CHECK (seq > 0),
-    role text NOT NULL CHECK (role IN ('user', 'assistant')),
-    parts jsonb NOT NULL CHECK (jsonb_typeof(parts) = 'array'),
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    CONSTRAINT conversation_messages_session_seq_unique UNIQUE (session_id, seq)
+    name text NOT NULL,
+    provider text NOT NULL,
+    provider_model_id text NOT NULL
 );
+ALTER TABLE public.conversation_sessions
+    ADD COLUMN selected_model_id bigint NOT NULL,
+    ADD CONSTRAINT conversation_sessions_selected_model_fk
+        FOREIGN KEY (selected_model_id) REFERENCES public.models(id);
+CREATE TABLE public.conversation_messages (
+    session_id bigint NOT NULL REFERENCES public.conversation_sessions(id),
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    position bigint NOT NULL CHECK (position >= 0),
+    role text NOT NULL CHECK (role IN ('user', 'assistant')),
+    status text NOT NULL CHECK (status IN ('pending', 'streaming', 'completed', 'failed', 'interrupted')),
+    PRIMARY KEY (session_id, id),
+    CONSTRAINT conversation_messages_position_unique UNIQUE (session_id, position)
+);
+CREATE TABLE public.conversation_message_parts (
+    session_id bigint NOT NULL,
+    message_id bigint NOT NULL,
+    position integer NOT NULL CHECK (position >= 0),
+    speaker_kind text NOT NULL CHECK (speaker_kind IN ('user', 'character', 'narrator')),
+    session_character_id bigint,
+    body text NOT NULL,
+    PRIMARY KEY (session_id, message_id, position),
+    CONSTRAINT conversation_message_parts_message_fk
+        FOREIGN KEY (session_id, message_id)
+        REFERENCES public.conversation_messages(session_id, id),
+    CONSTRAINT conversation_message_parts_character_fk
+        FOREIGN KEY (session_id, session_character_id)
+        REFERENCES public.conversation_character_states(session_id, id),
+    CONSTRAINT conversation_message_parts_speaker_check CHECK (
+        (speaker_kind = 'character' AND session_character_id IS NOT NULL)
+        OR (speaker_kind IN ('user', 'narrator') AND session_character_id IS NULL)
+    )
+);
+-- role(user/assistant)은 메시지 출처, speaker_kind는 부분별 실제 발화자다. 본문에 언급된 캐릭터는
+-- 발화자가 아니다. 인트로는 메시지로 복사하지 않는다(세션 intro_messages_snapshot).
 
--- 응답 생성 요청. 화면 이탈과 무관하게 서버에서 끝까지 진행하고 상태와 누적 원문을 남긴다.
--- failed: 표시된 내용 없이 실패(청구 안 함, 재시도 가능). failed_partial: 일부 표시 후 오류.
--- save_failed: 전체 응답 생성 후 저장 실패. 미완료 응답의 이력·청구 정책은 미결(안건-20261120-7EFE61,
--- 안건-20261120-17577A)이라 billable은 정상 완료(completed)에만 true로 기록한다.
-CREATE TABLE conversation_generations (
+-- 모델 목록 기준 데이터. 세션 시작 때 CHAT_DEFAULT_MODEL_NAME(기본 '루나')의 행을
+-- selected_model_id로 고정한다. 같은 name은 한 행만 둔다(마이그레이션도 name으로 멱등 처리).
+INSERT INTO public.models (name, provider, provider_model_id) VALUES
+    ('루나', 'openai', 'gpt-6-luna'),
+    ('테라', 'openai', 'gpt-6.1-terra');
+
+-- CHAT-US-02 추가 표(팀 표에 없는 생성 작업 정보). 팀 표에는 컬럼을 더하지 않는다.
+-- 이용자 메시지 하나와 그 응답(assistant 메시지 한 행)을 만드는 요청 하나가 한 행이다.
+-- request_id: 세션 안에서 같은 전송·재시도 요청을 한 번만 처리(AC10).
+-- status ↔ assistant 메시지 status: pending·streaming·completed는 같은 값, failed(표시 내용 없이
+-- 실패)·save_failed(전체 생성 후 저장 실패) → failed, failed_partial(일부 표시 후 중단) → interrupted.
+-- text: 스트리밍 누적 원문(롱 폴링 offset 기준). 완료 시 파싱 결과는 conversation_message_parts에 둔다.
+-- 미완료 응답의 이력·청구 정책은 미결(안건-20261120-7EFE61, 안건-20261120-17577A)이라
+-- billable은 정상 완료(completed)에만 true. updated_at은 작업의 갱신 시각(멈춘 작업 정리 기준)이다.
+CREATE TABLE public.conversation_generations (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    session_id bigint NOT NULL REFERENCES conversation_sessions(id) ON DELETE CASCADE,
-    owner_id bigint NOT NULL,
+    session_id bigint NOT NULL REFERENCES public.conversation_sessions(id),
     request_id text NOT NULL,
+    model_id bigint NOT NULL REFERENCES public.models(id),
+    user_message_id bigint NOT NULL,
+    assistant_message_id bigint NOT NULL,
     status text NOT NULL DEFAULT 'pending' CHECK (status IN (
         'pending', 'streaming', 'completed', 'failed', 'failed_partial', 'save_failed'
     )),
-    user_message_id bigint NOT NULL REFERENCES conversation_messages(id) ON DELETE CASCADE,
-    assistant_message_id bigint REFERENCES conversation_messages(id) ON DELETE SET NULL,
     text text NOT NULL DEFAULT '',
-    model text,
     error_code text,
     billable boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    CONSTRAINT conversation_generations_request_unique UNIQUE (owner_id, session_id, request_id)
+    CONSTRAINT conversation_generations_request_unique UNIQUE (session_id, request_id),
+    CONSTRAINT conversation_generations_assistant_message_unique UNIQUE (assistant_message_id),
+    CONSTRAINT conversation_generations_user_message_fk
+        FOREIGN KEY (session_id, user_message_id)
+        REFERENCES public.conversation_messages(session_id, id),
+    CONSTRAINT conversation_generations_assistant_message_fk
+        FOREIGN KEY (session_id, assistant_message_id)
+        REFERENCES public.conversation_messages(session_id, id)
 );
 -- 세션마다 진행 중(pending·streaming) 생성은 하나만 허용한다.
 CREATE UNIQUE INDEX conversation_generations_one_active_idx
-    ON conversation_generations(session_id) WHERE status IN ('pending', 'streaming');
-CREATE INDEX conversation_generations_session_idx ON conversation_generations(session_id, id);
+    ON public.conversation_generations(session_id) WHERE status IN ('pending', 'streaming');
+CREATE INDEX conversation_generations_session_idx
+    ON public.conversation_generations(session_id, id);

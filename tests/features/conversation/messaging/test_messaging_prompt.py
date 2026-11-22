@@ -84,7 +84,8 @@ def test_kan16_ac27_ac28_first_request_uses_saved_settings_in_order(client, db, 
     ]
     assert send(client, session, parts).status_code == 202
     (request,) = recorder.requests
-    assert request.model == "fake-echo"
+    # 세션에 고정된 기본 모델(루나)의 공급자 쪽 ID로 호출한다.
+    assert (request.provider, request.model) == ("openai", "gpt-6-luna")
     messages = request.messages
     assert [m["role"] for m in messages] == ["system", "user"]
     system = messages[0]["content"]

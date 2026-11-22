@@ -1,15 +1,35 @@
 """CHAT-US-02 대화 이력·응답 생성 행과 모델 요청에 쓰는 최신 저장 설정 조회."""
 
 from psycopg import Connection
-from psycopg.types.json import Jsonb
 
 ACTIVE_STATUSES = ("pending", "streaming")
 FAILED_STATUSES = ("failed", "failed_partial", "save_failed")
 ACTIVE_INDEX = "conversation_generations_one_active_idx"
+# 생성 상태 → 팀 표 conversation_messages.status(assistant 메시지).
+MESSAGE_STATUS = {
+    "pending": "pending",
+    "streaming": "streaming",
+    "completed": "completed",
+    "failed": "failed",
+    "save_failed": "failed",
+    "failed_partial": "interrupted",
+}
 
-_GENERATION_COLUMNS = """g.id, g.session_id, g.owner_id, g.status, g.user_message_id,
-    g.assistant_message_id, g.error_code, g.model, g.billable, g.request_id,
+_GENERATION_COLUMNS = """g.id, g.session_id, cs.owner_id, g.status, g.user_message_id,
+    g.assistant_message_id, g.error_code, g.model_id, g.billable, g.request_id,
     char_length(g.text) AS text_length"""
+_GENERATION_FROM = """conversation_generations g
+    JOIN conversation_sessions cs ON cs.id = g.session_id"""
+# 팀 메시지 표에는 시각 컬럼이 없어 생성 작업의 시각을 쓴다. 이용자 메시지는 처음 만든 생성 요청의
+# 시각, AI 메시지는 그 생성의 마지막 갱신(완료) 시각이다.
+_MESSAGE_CREATED_AT = """COALESCE(
+    CASE WHEN m.role = 'user' THEN
+        (SELECT min(g.created_at) FROM conversation_generations g
+         WHERE g.session_id = m.session_id AND g.user_message_id = m.id)
+    ELSE
+        (SELECT g.updated_at FROM conversation_generations g
+         WHERE g.session_id = m.session_id AND g.assistant_message_id = m.id)
+    END, now()) AS created_at"""
 
 
 def set_consistent_read(conn: Connection) -> None:
@@ -19,9 +39,10 @@ def set_consistent_read(conn: Connection) -> None:
 def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool = False):
     # 시작 API(get_session)와 같은 접근 규칙: 삭제 스토리 세션은 읽기 전용으로 남는다.
     query = """
-        SELECT cs.id, cs.story_id, cs.model, cs.intro_messages_snapshot,
-               s.deleted_at IS NOT NULL AS read_only
+        SELECT cs.id, cs.story_id, cs.selected_model_id, md.name AS model_name,
+               cs.intro_messages_snapshot, s.deleted_at IS NOT NULL AS read_only
         FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
+        JOIN models md ON md.id = cs.selected_model_id
         WHERE cs.id = %s AND cs.owner_id = %s
           AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
                OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))
@@ -33,16 +54,14 @@ def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool 
 
 def lock_session_by_id(conn: Connection, session_id: int):
     return conn.execute(
-        "SELECT id, model FROM conversation_sessions WHERE id = %s FOR UPDATE", (session_id,)
+        "SELECT id FROM conversation_sessions WHERE id = %s FOR UPDATE", (session_id,)
     ).fetchone()
 
 
-def set_session_model_if_missing(conn: Connection, session_id: int, model: str) -> str:
+def get_model(conn: Connection, model_id: int):
     return conn.execute(
-        """UPDATE conversation_sessions SET model = COALESCE(model, %s)
-           WHERE id = %s RETURNING model""",
-        (model, session_id),
-    ).fetchone()["model"]
+        "SELECT id, name, provider, provider_model_id FROM models WHERE id = %s", (model_id,)
+    ).fetchone()
 
 
 def get_play_name(conn: Connection, session_id: int) -> str:
@@ -64,18 +83,18 @@ def list_session_characters(conn: Connection, session_id: int):
     ).fetchall()
 
 
-def get_generation_by_request(conn: Connection, owner_id: int, session_id: int, request_id: str):
+def get_generation_by_request(conn: Connection, session_id: int, request_id: str):
     return conn.execute(
-        f"""SELECT {_GENERATION_COLUMNS} FROM conversation_generations g
-            WHERE g.owner_id = %s AND g.session_id = %s AND g.request_id = %s""",
-        (owner_id, session_id, request_id),
+        f"""SELECT {_GENERATION_COLUMNS} FROM {_GENERATION_FROM}
+            WHERE g.session_id = %s AND g.request_id = %s""",
+        (session_id, request_id),
     ).fetchone()
 
 
 def get_generation(conn: Connection, generation_id: int, owner_id: int | None = None):
     return conn.execute(
-        f"""SELECT {_GENERATION_COLUMNS} FROM conversation_generations g
-            WHERE g.id = %s AND (%s::bigint IS NULL OR g.owner_id = %s)""",
+        f"""SELECT {_GENERATION_COLUMNS} FROM {_GENERATION_FROM}
+            WHERE g.id = %s AND (%s::bigint IS NULL OR cs.owner_id = %s)""",
         (generation_id, owner_id, owner_id),
     ).fetchone()
 
@@ -87,7 +106,7 @@ def get_generation_with_text(conn: Connection, generation_id: int, offset: int):
     """
     return conn.execute(
         f"""SELECT {_GENERATION_COLUMNS}, substr(g.text, %s) AS text
-            FROM conversation_generations g WHERE g.id = %s""",
+            FROM {_GENERATION_FROM} WHERE g.id = %s""",
         (offset + 1, generation_id),
     ).fetchone()
 
@@ -100,7 +119,7 @@ def get_full_text(conn: Connection, generation_id: int) -> str:
 
 def get_latest_generation(conn: Connection, session_id: int):
     return conn.execute(
-        f"""SELECT {_GENERATION_COLUMNS} FROM conversation_generations g
+        f"""SELECT {_GENERATION_COLUMNS} FROM {_GENERATION_FROM}
             WHERE g.session_id = %s ORDER BY g.id DESC LIMIT 1""",
         (session_id,),
     ).fetchone()
@@ -108,7 +127,7 @@ def get_latest_generation(conn: Connection, session_id: int):
 
 def get_active_generation(conn: Connection, session_id: int):
     return conn.execute(
-        f"""SELECT {_GENERATION_COLUMNS} FROM conversation_generations g
+        f"""SELECT {_GENERATION_COLUMNS} FROM {_GENERATION_FROM}
             WHERE g.session_id = %s AND g.status IN ('pending', 'streaming')""",
         (session_id,),
     ).fetchone()
@@ -118,8 +137,9 @@ def has_user_message_after(conn: Connection, session_id: int, message_id: int) -
     return (
         conn.execute(
             """SELECT 1 FROM conversation_messages later
-               JOIN conversation_messages m ON m.id = %s
-               WHERE later.session_id = %s AND later.role = 'user' AND later.seq > m.seq
+               JOIN conversation_messages m ON m.session_id = later.session_id AND m.id = %s
+               WHERE later.session_id = %s AND later.role = 'user'
+                 AND later.position > m.position
                LIMIT 1""",
             (message_id, session_id),
         ).fetchone()
@@ -127,56 +147,105 @@ def has_user_message_after(conn: Connection, session_id: int, message_id: int) -
     )
 
 
-def insert_message(conn: Connection, session_id: int, role: str, parts: list[dict]) -> int:
-    # 호출자가 세션 행을 잠근 상태에서 다음 순번을 정한다.
+def insert_message(conn: Connection, session_id: int, role: str, status: str) -> int:
+    """세션의 다음 순서(0부터)로 메시지 행을 만든다. 호출자가 세션 행을 잠근 상태여야 한다."""
     return conn.execute(
-        """INSERT INTO conversation_messages (session_id, seq, role, parts)
-           SELECT %s, COALESCE(MAX(seq), 0) + 1, %s, %s
+        """INSERT INTO conversation_messages (session_id, position, role, status)
+           SELECT %s, COALESCE(MAX(position), -1) + 1, %s, %s
            FROM conversation_messages WHERE session_id = %s
            RETURNING id""",
-        (session_id, role, Jsonb(parts), session_id),
+        (session_id, role, status, session_id),
     ).fetchone()["id"]
+
+
+def insert_parts(conn: Connection, session_id: int, message_id: int, parts: list[dict]) -> None:
+    """부분을 작성 순서(0부터) 그대로 저장한다. character_id는 세션 캐릭터 ID다."""
+    with conn.cursor() as cur:
+        cur.executemany(
+            """INSERT INTO conversation_message_parts
+                   (session_id, message_id, position, speaker_kind, session_character_id, body)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            [
+                (
+                    session_id,
+                    message_id,
+                    position,
+                    part["speaker_kind"],
+                    part.get("character_id"),
+                    part["body"],
+                )
+                for position, part in enumerate(parts)
+            ],
+        )
 
 
 def insert_generation(
     conn: Connection,
     session_id: int,
-    owner_id: int,
     request_id: str,
     user_message_id: int,
-    model: str,
+    assistant_message_id: int,
+    model_id: int,
 ) -> int:
     return conn.execute(
         """INSERT INTO conversation_generations
-               (session_id, owner_id, request_id, user_message_id, model)
+               (session_id, request_id, user_message_id, assistant_message_id, model_id)
            VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-        (session_id, owner_id, request_id, user_message_id, model),
+        (session_id, request_id, user_message_id, assistant_message_id, model_id),
     ).fetchone()["id"]
 
 
-def get_message(conn: Connection, message_id: int):
+def get_message(conn: Connection, session_id: int, message_id: int):
     return conn.execute(
-        "SELECT id, seq, role, parts, created_at FROM conversation_messages WHERE id = %s",
-        (message_id,),
+        f"""SELECT m.id, m.position, m.role, m.status, {_MESSAGE_CREATED_AT}
+            FROM conversation_messages m WHERE m.session_id = %s AND m.id = %s""",
+        (session_id, message_id),
     ).fetchone()
 
 
-def list_messages(conn: Connection, session_id: int, before_seq: int | None = None):
+def list_messages(conn: Connection, session_id: int, before_position: int | None = None):
+    """대화 이력: 이용자 메시지와 정상 완료된 AI 메시지(completed)만 순서대로."""
     return conn.execute(
-        """SELECT id, seq, role, parts, created_at FROM conversation_messages
-           WHERE session_id = %s AND (%s::int IS NULL OR seq < %s) ORDER BY seq""",
-        (session_id, before_seq, before_seq),
+        f"""SELECT m.id, m.position, m.role, m.status, {_MESSAGE_CREATED_AT}
+            FROM conversation_messages m
+            WHERE m.session_id = %s AND m.status = 'completed'
+              AND (%s::bigint IS NULL OR m.position < %s)
+            ORDER BY m.position""",
+        (session_id, before_position, before_position),
     ).fetchall()
+
+
+def list_parts(conn: Connection, session_id: int, message_ids: list[int]) -> dict[int, list]:
+    """메시지 ID → 부분 목록(작성 순서). 키 character_id는 세션 캐릭터 ID다."""
+    parts: dict[int, list] = {message_id: [] for message_id in message_ids}
+    if not message_ids:
+        return parts
+    for row in conn.execute(
+        """SELECT message_id, speaker_kind, session_character_id AS character_id, body
+           FROM conversation_message_parts
+           WHERE session_id = %s AND message_id = ANY(%s)
+           ORDER BY message_id, position""",
+        (session_id, message_ids),
+    ):
+        parts[row["message_id"]].append(row)
+    return parts
 
 
 def expire_stale_generations(conn: Connection, session_id: int, stale_seconds: float) -> None:
     """서버 중단 등으로 갱신이 멈춘 진행 중 생성을 실패로 정리해 세션이 막히지 않게 한다."""
     conn.execute(
-        """UPDATE conversation_generations
-           SET status = CASE WHEN text = '' THEN 'failed' ELSE 'failed_partial' END,
-               error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
-           WHERE session_id = %s AND status IN ('pending', 'streaming')
-             AND updated_at < clock_timestamp() - make_interval(secs => %s)""",
+        """WITH expired AS (
+               UPDATE conversation_generations
+               SET status = CASE WHEN text = '' THEN 'failed' ELSE 'failed_partial' END,
+                   error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
+               WHERE session_id = %s AND status IN ('pending', 'streaming')
+                 AND updated_at < clock_timestamp() - make_interval(secs => %s)
+               RETURNING session_id, assistant_message_id, status
+           )
+           UPDATE conversation_messages m
+           SET status = CASE e.status WHEN 'failed_partial' THEN 'interrupted' ELSE 'failed' END
+           FROM expired e
+           WHERE m.session_id = e.session_id AND m.id = e.assistant_message_id""",
         (session_id, stale_seconds),
     )
 
@@ -185,11 +254,18 @@ def expire_stale_generations(conn: Connection, session_id: int, stale_seconds: f
 
 
 def mark_streaming(conn: Connection, generation_id: int):
-    """pending인 생성만 streaming으로 바꾼다. 이미 처리 중·종료면 None."""
+    """pending인 생성만 streaming으로 바꾼다(assistant 메시지도 함께). 이미 처리 중·종료면 None."""
     return conn.execute(
-        """UPDATE conversation_generations SET status = 'streaming', updated_at = clock_timestamp()
-           WHERE id = %s AND status = 'pending'
-           RETURNING id, session_id, owner_id, user_message_id, model""",
+        """WITH g AS (
+               UPDATE conversation_generations
+               SET status = 'streaming', updated_at = clock_timestamp()
+               WHERE id = %s AND status = 'pending'
+               RETURNING id, session_id, user_message_id, assistant_message_id, model_id
+           ), message AS (
+               UPDATE conversation_messages m SET status = 'streaming'
+               FROM g WHERE m.session_id = g.session_id AND m.id = g.assistant_message_id
+           )
+           SELECT g.*, cs.owner_id FROM g JOIN conversation_sessions cs ON cs.id = g.session_id""",
         (generation_id,),
     ).fetchone()
 
@@ -211,15 +287,21 @@ def finish_generation(
     status: str,
     *,
     error_code: str | None = None,
-    assistant_message_id: int | None = None,
     billable: bool = False,
 ) -> bool:
+    """streaming인 생성을 끝내고 assistant 메시지 상태를 MESSAGE_STATUS로 맞춘다."""
     row = conn.execute(
-        """UPDATE conversation_generations
-           SET status = %s, error_code = %s, assistant_message_id = %s, billable = %s,
-               updated_at = clock_timestamp()
-           WHERE id = %s AND status = 'streaming' RETURNING id""",
-        (status, error_code, assistant_message_id, billable, generation_id),
+        """WITH g AS (
+               UPDATE conversation_generations
+               SET status = %s, error_code = %s, billable = %s, updated_at = clock_timestamp()
+               WHERE id = %s AND status = 'streaming'
+               RETURNING id, session_id, assistant_message_id
+           ), message AS (
+               UPDATE conversation_messages m SET status = %s
+               FROM g WHERE m.session_id = g.session_id AND m.id = g.assistant_message_id
+           )
+           SELECT id FROM g""",
+        (status, error_code, billable, generation_id, MESSAGE_STATUS[status]),
     ).fetchone()
     return row is not None
 

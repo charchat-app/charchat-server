@@ -1,20 +1,30 @@
-"""CHAT-US-02 배포 SQL: KAN-17 이전 DB에 적용·재실행해도 기존 방이 유지되고 정의가 같다."""
+"""CHAT-US-02 배포 SQL: 팀 DDL이 없는 KAN-16 DB와 팀 DDL이 이미 적용된 공용 DB 모두에서
+schema.sql과 같은 정의가 되고, 다시 실행해도 같으며, 정의가 다르면 전체를 되돌린다."""
 
 from pathlib import Path
 
-from messaging_helpers import PLAYER, SESSIONS, send, user_part
+import psycopg
+import pytest
+from messaging_helpers import PLAYER, SESSIONS, send, session_characters, start_session, user_part
+from psycopg.pq import TransactionStatus
 
-MIGRATION = (
-    Path(__file__).resolve().parents[4] / "app/db/migrations/kan17_conversation_messaging.sql"
+ROOT = Path(__file__).resolve().parents[4]
+MIGRATION = ROOT / "app/db/migrations/kan17_conversation_messaging.sql"
+TEAM_DDL = Path(__file__).with_name("team_ddl_20261120.sql")
+KAN17_TABLES = (
+    "models",
+    "conversation_sessions",
+    "conversation_messages",
+    "conversation_message_parts",
+    "conversation_generations",
 )
-KAN17_TABLES = ("conversation_sessions", "conversation_messages", "conversation_generations")
 
 
 def schema_snapshot(db):
     """KAN-17이 다루는 표의 컬럼·제약·인덱스 정의."""
     columns = db.execute(
         """SELECT table_name, column_name, data_type, is_nullable, column_default,
-                  is_identity
+                  is_identity, identity_generation
            FROM information_schema.columns
            WHERE table_schema = 'public' AND table_name = ANY(%s)
            ORDER BY table_name, column_name""",
@@ -35,36 +45,151 @@ def schema_snapshot(db):
     return columns, constraints, indexes
 
 
+def models(db):
+    return [
+        (row["name"], row["provider"], row["provider_model_id"])
+        for row in db.execute(
+            "SELECT name, provider, provider_model_id FROM models ORDER BY id"
+        ).fetchall()
+    ]
+
+
 def drop_kan17_objects(db):
-    """KAN-16까지만 적용된 기존 DB 상태로 되돌린다."""
+    """KAN-17 객체를 지워 origin/dev(KAN-16) 스키마 상태로 되돌린다."""
     with db.transaction():
-        db.execute("DROP TABLE conversation_generations, conversation_messages")
-        db.execute("ALTER TABLE conversation_sessions DROP COLUMN model")
+        db.execute(
+            """DROP TABLE IF EXISTS conversation_generations, conversation_message_parts,
+                                    conversation_messages"""
+        )
+        db.execute("ALTER TABLE conversation_sessions DROP COLUMN IF EXISTS selected_model_id")
+        db.execute("ALTER TABLE conversation_sessions DROP COLUMN IF EXISTS model")
+        db.execute("DROP TABLE IF EXISTS models")
 
 
-def test_chat_us_02_migration_on_legacy_db_keeps_rooms_and_matches_schema(db, client, session):
+@pytest.fixture
+def migration(db):
+    """마이그레이션 SQL. 테스트가 중간에 실패해도 다음 테스트가 쓸 스키마로 되돌린다."""
+    sql = MIGRATION.read_text(encoding="utf-8")
+    yield sql
+    if db.info.transaction_status != TransactionStatus.IDLE:
+        db.execute("ROLLBACK")
+    if db.execute("SELECT to_regclass('conversation_generations') AS t").fetchone()["t"] is None:
+        drop_kan17_objects(db)
+        db.execute(sql)
+
+
+def test_chat_us_02_migration_on_kan16_db_backfills_rooms_and_matches_schema(
+    db, client, session, migration
+):
+    """(나) 팀 DDL이 없는 기존 DB: 기존 방은 기본 모델 루나로 채워진다."""
     expected = schema_snapshot(db)
-    migration = MIGRATION.read_text(encoding="utf-8")
+    before = db.execute("SELECT * FROM conversation_sessions WHERE id = %s", (session,)).fetchone()
     drop_kan17_objects(db)
-    try:
-        before = db.execute(
-            "SELECT * FROM conversation_sessions WHERE id = %s", (session,)
-        ).fetchone()
-        db.execute(migration)
-        db.execute(migration)  # 재실행해도 같은 결과
-        assert schema_snapshot(db) == expected
-        after = db.execute(
-            "SELECT * FROM conversation_sessions WHERE id = %s", (session,)
-        ).fetchone()
-        assert after == {**before, "model": None}
 
-        room = client.get(f"{SESSIONS}/{session}", headers=PLAYER)
-        assert room.status_code == 200
-        assert room.json()["model"] is None
-        assert send(client, session, [user_part("배포 뒤 첫 메시지")]).status_code == 202
-        turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
-        assert [m["role"] for m in turns["messages"]] == ["user", "assistant"]
-        assert turns["model"] == "fake-echo"
-    finally:
-        # 중간에 실패해도 다음 테스트가 쓸 스키마를 남긴다.
+    db.execute(migration)
+    db.execute(migration)  # 재실행해도 같은 결과
+
+    assert schema_snapshot(db) == expected
+    assert models(db) == [("루나", "openai", "gpt-6-luna"), ("테라", "openai", "gpt-6.1-terra")]
+    after = db.execute("SELECT * FROM conversation_sessions WHERE id = %s", (session,)).fetchone()
+    luna = db.execute("SELECT id FROM models WHERE name = '루나'").fetchone()["id"]
+    assert after == {**before, "selected_model_id": luna}
+
+    room = client.get(f"{SESSIONS}/{session}", headers=PLAYER)
+    assert room.status_code == 200
+    assert room.json()["model"] == "루나"
+    assert send(client, session, [user_part("배포 뒤 첫 메시지")]).status_code == 202
+    turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert [m["role"] for m in turns["messages"]] == ["user", "assistant"]
+    assert turns["model"] == "루나"
+
+
+def test_chat_us_02_migration_on_remote_team_ddl_db_seeds_models_and_matches_schema(
+    db, client, saved_story, migration
+):
+    """(가) 팀 DDL(2026-11-20)이 이미 적용된 공용 DB(models 비어 있음)."""
+    expected = schema_snapshot(db)
+    drop_kan17_objects(db)
+    db.execute(TEAM_DDL.read_text(encoding="utf-8"))
+    assert models(db) == []
+    assert db.execute("SELECT to_regclass('conversation_generations') AS t").fetchone() == {
+        "t": None
+    }
+
+    db.execute(migration)
+    db.execute(migration)
+
+    assert schema_snapshot(db) == expected
+    assert models(db) == [("루나", "openai", "gpt-6-luna"), ("테라", "openai", "gpt-6.1-terra")]
+
+    story, intro, _ = saved_story
+    session = start_session(client, story, intro)
+    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).json()["model"] == "루나"
+    chars = session_characters(client, session)
+    parts = [
+        user_part("유저로"),
+        {"speaker_kind": "character", "character_id": chars["Bea"], "body": "Bea로"},
+        {"speaker_kind": "narrator", "character_id": None, "body": "나레이터로"},
+    ]
+    assert send(client, session, parts).status_code == 202
+    turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert turns["model"] == "루나"
+    user_message, assistant = turns["messages"]
+    assert [(p["speaker_kind"], p["speaker_name"]) for p in user_message["parts"]] == [
+        ("user", "민서"),
+        ("character", "Bea"),
+        ("narrator", None),
+    ]
+    assert [(p["speaker_kind"], p["speaker_name"]) for p in assistant["parts"]] == [
+        ("character", "도경"),
+        ("narrator", None),
+    ]
+
+
+def test_chat_us_02_migration_keeps_existing_model_rows_by_name(db, migration):
+    """모델 기준 행은 name으로 멱등: 이미 있는 이름은 다시 넣지 않는다."""
+    drop_kan17_objects(db)
+    db.execute(TEAM_DDL.read_text(encoding="utf-8"))
+    db.execute(
+        "INSERT INTO models (name, provider, provider_model_id) VALUES ('루나', 'openai', 'x')"
+    )
+    db.execute(migration)
+    assert models(db) == [("루나", "openai", "x"), ("테라", "openai", "gpt-6.1-terra")]
+
+
+@pytest.mark.parametrize(
+    ("prepare", "message"),
+    [
+        (
+            # 팀 정의와 다른 같은 이름의 표(예: 이전 초안)는 건너뛰지 않고 거절한다.
+            """CREATE TABLE conversation_messages (
+                   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                   session_id bigint NOT NULL REFERENCES conversation_sessions(id),
+                   seq integer NOT NULL
+               )""",
+            "unexpected public.conversation_messages definition",
+        ),
+        (
+            "ALTER TABLE conversation_sessions ADD COLUMN model text",
+            "conversation_sessions.model found",
+        ),
+    ],
+)
+def test_chat_us_02_migration_aborts_and_rolls_back_on_unexpected_definition(
+    db, migration, prepare, message
+):
+    drop_kan17_objects(db)
+    db.execute(prepare)
+    with pytest.raises(psycopg.errors.RaiseException, match=message):
         db.execute(migration)
+    db.execute("ROLLBACK")
+    # 전체가 되돌아가 모델 표·세션 컬럼·생성 표가 하나도 생기지 않았다.
+    assert db.execute(
+        """SELECT to_regclass('models') AS models, to_regclass('conversation_generations') AS g,
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'conversation_sessions'
+                            AND column_name = 'selected_model_id') AS col"""
+    ).fetchone() == {"models": None, "g": None, "col": False}
+    with db.transaction():
+        db.execute("DROP TABLE IF EXISTS conversation_messages")
+        db.execute("ALTER TABLE conversation_sessions DROP COLUMN IF EXISTS model")

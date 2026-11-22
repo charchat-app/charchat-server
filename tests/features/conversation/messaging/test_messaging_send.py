@@ -12,8 +12,11 @@ from messaging_helpers import (
     SESSIONS,
     send,
     session_characters,
+    start_session,
     user_part,
 )
+
+from app.core.config import settings
 
 
 def count(db, table):
@@ -68,20 +71,102 @@ def test_chat_us_02_ac09_ac12_completed_generation_is_billable_and_linked(client
     assert done["text"].startswith("@도경: (가짜 응답)")
     assert done["next_offset"] == len(done["text"])
     assert done["assistant_message"]["parts"][0]["body"].startswith("(가짜 응답)")
+    assert "가짜 모델(gpt-6-luna)" in done["text"]
     row = db.execute(
-        "SELECT billable, assistant_message_id, model FROM conversation_generations"
+        """SELECT g.billable, g.assistant_message_id, m.name AS model, msg.status
+           FROM conversation_generations g JOIN models m ON m.id = g.model_id
+           JOIN conversation_messages msg
+             ON msg.session_id = g.session_id AND msg.id = g.assistant_message_id"""
     ).fetchone()
-    assert row["billable"] is True
-    assert row["assistant_message_id"] == done["assistant_message"]["id"]
-    assert row["model"] == "fake-echo"
+    assert row == {
+        "billable": True,
+        "assistant_message_id": done["assistant_message"]["id"],
+        "model": "루나",
+        "status": "completed",
+    }
 
 
 def test_kan16_ac20_ac21_default_model_applied_and_shown(client, db, session):
-    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).json()["model"] is None
-    assert client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()["model"] == "fake-echo"
+    # 세션 시작 때 기본 모델(CHAT_DEFAULT_MODEL_NAME=루나)이 selected_model_id로 고정된다.
+    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).json()["model"] == "루나"
+    assert client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()["model"] == "루나"
     send(client, session, [user_part("안녕")])
-    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).json()["model"] == "fake-echo"
-    assert db.execute("SELECT model FROM conversation_sessions").fetchone()["model"] == "fake-echo"
+    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).json()["model"] == "루나"
+    row = db.execute(
+        """SELECT m.name FROM conversation_sessions cs
+           JOIN models m ON m.id = cs.selected_model_id"""
+    ).fetchone()
+    assert row == {"name": "루나"}
+
+
+def test_kan16_ac20_default_model_name_setting_selects_model(client, db, saved_story, monkeypatch):
+    monkeypatch.setattr(settings, "chat_default_model_name", "테라")
+    session = start_session(client, saved_story[0], saved_story[1])
+    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).json()["model"] == "테라"
+    send(client, session, [user_part("안녕")])
+    done = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert done["model"] == "테라"
+    assert "가짜 모델(gpt-6.1-terra)" in done["messages"][1]["parts"][-1]["body"]
+
+
+def test_kan16_ac20_missing_default_model_rejects_session_start(
+    client, db, saved_story, monkeypatch
+):
+    monkeypatch.setattr(settings, "chat_default_model_name", "없는 모델")
+    response = client.post(
+        f"/api/v1/conversation/stories/{saved_story[0]}/sessions",
+        headers=PLAYER,
+        json={
+            "intro_id": saved_story[1],
+            "profile_kind": "preset",
+            "profile_id": 1,
+            "play_name": "",
+        },
+    )
+    assert response.status_code == 503
+    assert response.json()["code"] == "CONVERSATION_MODEL_NOT_CONFIGURED"
+    assert count(db, "conversation_sessions") == 0
+
+
+def test_chat_us_02_parts_stored_in_team_tables_with_speakers(client, db, session):
+    """이용자 부분은 고른 발화자 그대로, AI 응답은 파싱한 발화자별 부분으로 저장된다."""
+    chars = session_characters(client, session)
+    parts = [
+        user_part("나는 유저"),
+        {"speaker_kind": "character", "character_id": chars["Bea"], "body": "나는 Bea"},
+        {"speaker_kind": "narrator", "character_id": None, "body": "나레이션"},
+    ]
+    generation = send(client, session, parts).json()
+    rows = db.execute(
+        """SELECT m.position AS message_position, m.role, m.status, p.position,
+                  p.speaker_kind, p.session_character_id, p.body
+           FROM conversation_messages m
+           JOIN conversation_message_parts p ON p.session_id = m.session_id AND p.message_id = m.id
+           WHERE m.session_id = %s ORDER BY m.position, p.position""",
+        (session,),
+    ).fetchall()
+    assert [
+        (
+            r["message_position"],
+            r["role"],
+            r["status"],
+            r["position"],
+            r["speaker_kind"],
+            r["session_character_id"],
+        )
+        for r in rows
+    ] == [
+        (0, "user", "completed", 0, "user", None),
+        (0, "user", "completed", 1, "character", chars["Bea"]),
+        (0, "user", "completed", 2, "narrator", None),
+        (1, "assistant", "completed", 0, "character", chars["도경"]),
+        (1, "assistant", "completed", 1, "narrator", None),
+    ]
+    assert [r["body"] for r in rows[:3]] == ["나는 유저", "나는 Bea", "나레이션"]
+    assert (
+        generation["user_message_id"]
+        == db.execute("SELECT id FROM conversation_messages WHERE position = 0").fetchone()["id"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -247,7 +332,7 @@ def test_chat_us_02_ac06_ac10_second_message_while_active_is_rejected(
     assert second.status_code == 409
     assert second.json()["code"] == "GENERATION_IN_PROGRESS"
     assert second.json()["active_generation_id"] == first.json()["id"]
-    assert count(db, "conversation_messages") == 1
+    assert count(db, "conversation_messages") == 2  # 첫 요청의 user + pending assistant
 
     turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
     assert turns["active_generation"]["id"] == first.json()["id"]
@@ -273,7 +358,7 @@ def test_chat_us_02_ac10_concurrent_different_requests_allow_one_active(
     )
     assert sorted(r.status_code for r in results) == [202, 409]
     assert count(db, "conversation_generations") == 1
-    assert count(db, "conversation_messages") == 1
+    assert count(db, "conversation_messages") == 2  # 첫 요청의 user + pending assistant
 
 
 def test_chat_us_02_active_index_blocks_second_active_row_in_db(client, db, session, monkeypatch):
@@ -281,14 +366,23 @@ def test_chat_us_02_active_index_blocks_second_active_row_in_db(client, db, sess
 
     monkeypatch.setattr(worker, "submit", lambda job, *args: None)
     send(client, session, [user_part("A")], request_id="request-a1")
-    message = db.execute("SELECT id FROM conversation_messages").fetchone()["id"]
-    with pytest.raises(psycopg.errors.UniqueViolation):
+    message = db.execute("SELECT id FROM conversation_messages WHERE role = 'user'").fetchone()[
+        "id"
+    ]
+    extra = db.execute(
+        """INSERT INTO conversation_messages (session_id, position, role, status)
+           VALUES (%s, 99, 'assistant', 'pending') RETURNING id""",
+        (session,),
+    ).fetchone()["id"]
+    with pytest.raises(psycopg.errors.UniqueViolation) as exc:
         db.execute(
             """INSERT INTO conversation_generations
-                   (session_id, owner_id, request_id, user_message_id, status)
-               VALUES (%s, 2, 'manual-1', %s, 'streaming')""",
-            (session, message),
+                   (session_id, request_id, user_message_id, assistant_message_id, model_id,
+                    status)
+               VALUES (%s, 'manual-1', %s, %s, (SELECT min(id) FROM models), 'streaming')""",
+            (session, message, extra),
         )
+    assert exc.value.diag.constraint_name == "conversation_generations_one_active_idx"
 
 
 def test_chat_us_02_ac11_turns_keep_history_order_across_turns(client, db, session):
@@ -297,5 +391,8 @@ def test_chat_us_02_ac11_turns_keep_history_order_across_turns(client, db, sessi
     messages = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()["messages"]
     assert [m["role"] for m in messages] == ["user", "assistant"] * 3
     assert [m["parts"][0]["body"] for m in messages[::2]] == ["입력 0", "입력 1", "입력 2"]
-    seqs = db.execute("SELECT seq FROM conversation_messages ORDER BY id").fetchall()
-    assert [row["seq"] for row in seqs] == [1, 2, 3, 4, 5, 6]
+    rows = db.execute("SELECT position, role FROM conversation_messages ORDER BY id").fetchall()
+    # 세션마다 0부터 늘어나는 순서. 인트로는 메시지로 복사하지 않는다.
+    assert [(row["position"], row["role"]) for row in rows] == [
+        (index, role) for index, role in enumerate(["user", "assistant"] * 3)
+    ]

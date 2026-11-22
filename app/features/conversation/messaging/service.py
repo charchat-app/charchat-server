@@ -102,7 +102,7 @@ class _Names:
         return None
 
 
-def _chat_message(row, names: _Names) -> ChatMessageResponse:
+def _chat_message(row, parts: list, names: _Names) -> ChatMessageResponse:
     return ChatMessageResponse(
         id=row["id"],
         role=row["role"],
@@ -113,10 +113,16 @@ def _chat_message(row, names: _Names) -> ChatMessageResponse:
                 speaker_name=names.of(part),
                 body=part["body"],
             )
-            for part in row["parts"]
+            for part in parts
         ],
         created_at=row["created_at"],
     )
+
+
+def _load_message(conn: Connection, session_id: int, message_id: int, names: _Names):
+    row = repository.get_message(conn, session_id, message_id)
+    parts = repository.list_parts(conn, session_id, [message_id])[message_id]
+    return _chat_message(row, parts, names)
 
 
 def _generation_response(
@@ -125,8 +131,9 @@ def _generation_response(
     """row는 get_generation_with_text 결과(offset 이후 원문 포함)."""
     names = names or _Names(conn, row["session_id"])
     assistant = None
-    if row["assistant_message_id"] is not None:
-        assistant = _chat_message(repository.get_message(conn, row["assistant_message_id"]), names)
+    # 저장까지 끝난(completed) 응답만 메시지로 보여 준다. 진행·실패 중에는 text로만 전달한다.
+    if row["status"] == "completed":
+        assistant = _load_message(conn, row["session_id"], row["assistant_message_id"], names)
     retryable = False
     if row["status"] == "failed":
         if latest_id is None:
@@ -180,23 +187,33 @@ def _validate_parts(conn: Connection, session_id: int, parts: list[MessagePartRe
 
 def _insert_generation(
     conn: Connection,
-    session_id: int,
-    owner_id: int,
+    session,
     request_id: str,
     user_parts: list[dict] | None = None,
     user_message_id: int | None = None,
 ) -> int:
-    """세션 행을 잠근 트랜잭션 안에서 호출한다. 진행 중 생성이 있으면 부분 유일 인덱스가 막는다."""
+    """세션 행을 잠근 트랜잭션 안에서 호출한다. 진행 중 생성이 있으면 부분 유일 인덱스가 막는다.
+
+    이용자 메시지(completed)와 응답을 받을 assistant 메시지(pending)를 세션의 다음 순서로 만들고
+    생성 행에 연결한다. 재시도는 기존 이용자 메시지를 다시 쓰고 assistant 메시지만 새로 만든다.
+    """
+    session_id = session["id"]
     repository.expire_stale_generations(conn, session_id, settings.chat_generation_stale_seconds)
-    model = repository.set_session_model_if_missing(conn, session_id, settings.chat_default_model)
     try:
         with conn.transaction():
             if user_message_id is None:
-                user_message_id = repository.insert_message(
-                    conn, session_id, "user", user_parts or []
-                )
+                user_message_id = repository.insert_message(conn, session_id, "user", "completed")
+                repository.insert_parts(conn, session_id, user_message_id, user_parts or [])
+            assistant_message_id = repository.insert_message(
+                conn, session_id, "assistant", "pending"
+            )
             return repository.insert_generation(
-                conn, session_id, owner_id, request_id, user_message_id, model
+                conn,
+                session_id,
+                request_id,
+                user_message_id,
+                assistant_message_id,
+                session["selected_model_id"],
             )
     except UniqueViolation as exc:
         if exc.diag.constraint_name == repository.ACTIVE_INDEX:
@@ -216,17 +233,13 @@ def send_message(
         session = repository.get_session(conn, session_id, owner_id, lock=True)
         if session is None:
             raise SessionNotFoundError()
-        existing = repository.get_generation_by_request(
-            conn, owner_id, session_id, request.request_id
-        )
+        existing = repository.get_generation_by_request(conn, session_id, request.request_id)
         if existing is not None:
             return _load_generation(conn, existing["id"])
         if session["read_only"]:
             raise ConversationReadOnlyError()
         parts = _validate_parts(conn, session_id, request.parts)
-        created_id = _insert_generation(
-            conn, session_id, owner_id, request.request_id, user_parts=parts
-        )
+        created_id = _insert_generation(conn, session, request.request_id, user_parts=parts)
         response = _load_generation(conn, created_id)
     # 커밋 뒤에 시작한다. 응답은 시작 전 상태(pending)로 돌려준다.
     worker.submit(run_generation, created_id)
@@ -244,9 +257,7 @@ def retry_generation(
         session = repository.get_session(conn, session_id, owner_id, lock=True)
         if session is None:
             raise GenerationNotFoundError()
-        existing = repository.get_generation_by_request(
-            conn, owner_id, session_id, request.request_id
-        )
+        existing = repository.get_generation_by_request(conn, session_id, request.request_id)
         if existing is not None:
             return _load_generation(conn, existing["id"])
         if session["read_only"]:
@@ -260,11 +271,7 @@ def retry_generation(
         if target["status"] != "failed" or latest["id"] != target["id"]:
             raise GenerationNotRetryableError()
         created_id = _insert_generation(
-            conn,
-            session_id,
-            owner_id,
-            request.request_id,
-            user_message_id=target["user_message_id"],
+            conn, session, request.request_id, user_message_id=target["user_message_id"]
         )
         response = _load_generation(conn, created_id)
     worker.submit(run_generation, created_id)
@@ -312,7 +319,9 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
     with conn.transaction():
         repository.set_consistent_read(conn)
         names = _Names(conn, session_id)
-        messages = [_chat_message(row, names) for row in repository.list_messages(conn, session_id)]
+        rows = repository.list_messages(conn, session_id)
+        parts = repository.list_parts(conn, session_id, [row["id"] for row in rows])
+        messages = [_chat_message(row, parts[row["id"]], names) for row in rows]
         latest = repository.get_latest_generation(conn, session_id)
         latest_id = latest["id"] if latest else None
         active = None
@@ -333,7 +342,8 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
             messages=messages,
             active_generation=active,
             last_failed_generation=failed,
-            model=session["model"] or settings.chat_default_model,
+            # 세션에 고정된 모델의 표시 이름(models.name).
+            model=session["model_name"],
         )
 
 
@@ -364,12 +374,16 @@ def load_prompt_context(conn: Connection, generation) -> PromptContext:
             PromptPart(row["speaker_kind"], row["speaker_name"], row["body"] or "")
         )
     session_characters = repository.list_session_characters(conn, session_id)
-    user_message = repository.get_message(conn, generation["user_message_id"])
+    user_message = repository.get_message(conn, session_id, generation["user_message_id"])
+    rows = repository.list_messages(conn, session_id, before_position=user_message["position"])
+    parts = repository.list_parts(
+        conn, session_id, [row["id"] for row in rows] + [user_message["id"]]
+    )
     history = [
         PromptHistoryMessage(
-            role=row["role"], parts=[_prompt_part(part, names) for part in row["parts"]]
+            role=row["role"], parts=[_prompt_part(part, names) for part in parts[row["id"]]]
         )
-        for row in repository.list_messages(conn, session_id, before_seq=user_message["seq"])
+        for row in rows
     ]
     expression = repository.get_expression(conn, story_id)
     return PromptContext(
@@ -416,7 +430,7 @@ def load_prompt_context(conn: Connection, generation) -> PromptContext:
         ],
         session_character_names=[row["name"] or "" for row in session_characters],
         history=history,
-        current=[_prompt_part(part, names) for part in user_message["parts"]],
+        current=[_prompt_part(part, names) for part in parts[user_message["id"]]],
     )
 
 
@@ -439,7 +453,9 @@ def _fail(generation_id: int, streamed: int, code: str) -> None:
         repository.finish_generation(conn, generation_id, status, error_code=code)
 
 
-def _save_completed(generation_id: int, session_id: int) -> None:
+def _save_completed(generation_id: int, claimed) -> None:
+    """파싱한 발화자별 부분을 assistant 메시지에 저장하고 생성·메시지를 completed로 바꾼다."""
+    session_id = claimed["session_id"]
     with worker.connect() as conn, conn.transaction():
         repository.lock_session_by_id(conn, session_id)
         text = repository.get_full_text(conn, generation_id)
@@ -452,10 +468,8 @@ def _save_completed(generation_id: int, session_id: int) -> None:
             }
             for part in parse_assistant_text(text, list(ids))
         ]
-        message_id = repository.insert_message(conn, session_id, "assistant", parts)
-        if not repository.finish_generation(
-            conn, generation_id, "completed", assistant_message_id=message_id, billable=True
-        ):
+        repository.insert_parts(conn, session_id, claimed["assistant_message_id"], parts)
+        if not repository.finish_generation(conn, generation_id, "completed", billable=True):
             # 그 사이 중단 정리된 생성이면 응답 저장도 되돌린다.
             raise RuntimeError("생성이 더 이상 진행 중이 아닙니다.")
 
@@ -464,8 +478,10 @@ def _stream(generation_id: int, claimed) -> None:
     with worker.connect() as conn, conn.transaction():
         repository.set_consistent_read(conn)
         context = load_prompt_context(conn, claimed)
+        model = repository.get_model(conn, claimed["model_id"])
     request = providers.ProviderRequest(
-        model=claimed["model"] or settings.chat_default_model,
+        model=model["provider_model_id"],
+        provider=model["provider"],
         messages=build_messages(context),
         character_names=context.session_character_names,
         last_user_text="\n".join(part.body for part in context.current),
@@ -511,7 +527,7 @@ def _stream(generation_id: int, claimed) -> None:
         _fail(generation_id, 0, "EMPTY_RESPONSE")
         return
     try:
-        _save_completed(generation_id, claimed["session_id"])
+        _save_completed(generation_id, claimed)
     except Exception:
         logger.exception("응답 저장 실패: generation=%s", generation_id)
         with worker.connect() as conn:

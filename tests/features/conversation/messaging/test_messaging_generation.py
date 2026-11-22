@@ -22,8 +22,11 @@ from app.features.conversation.messaging.providers import (
 
 def generation_row(db, generation_id):
     return db.execute(
-        """SELECT status, text, billable, error_code, assistant_message_id
-           FROM conversation_generations WHERE id = %s""",
+        """SELECT g.status, g.text, g.billable, g.error_code, m.status AS message_status
+           FROM conversation_generations g
+           JOIN conversation_messages m
+             ON m.session_id = g.session_id AND m.id = g.assistant_message_id
+           WHERE g.id = %s""",
         (generation_id,),
     ).fetchone()
 
@@ -46,7 +49,8 @@ def test_chat_us_02_ac15_failure_without_content_is_not_billed_and_retryable(
         "text": "",
         "billable": False,
         "error_code": "PROVIDER_ERROR",
-        "assistant_message_id": None,
+        # 팀 표의 assistant 메시지는 failed로 남고 이력에는 나오지 않는다.
+        "message_status": "failed",
     }
     turns = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
     failed = turns["last_failed_generation"]
@@ -89,6 +93,7 @@ def test_chat_us_02_ac17_partial_failure_keeps_text_out_of_history(
     generation = send(client, session, [user_part("중간에 끊김")]).json()["id"]
     row = generation_row(db, generation)
     assert row["status"] == "failed_partial"
+    assert row["message_status"] == "interrupted"
     assert row["error_code"] == "STREAM_INTERRUPTED"
     assert row["text"] != ""
     assert row["billable"] is False
@@ -103,22 +108,30 @@ def test_chat_us_02_ac17_partial_failure_keeps_text_out_of_history(
 
 
 def test_chat_us_02_ac17_save_failure_is_distinguished(client, db, session, monkeypatch):
-    original = repository.insert_message
+    original = repository.insert_parts
 
-    def failing_insert(conn, session_id, role, parts):
+    def failing_insert(conn, session_id, message_id, parts):
+        role = conn.execute(
+            "SELECT role FROM conversation_messages WHERE session_id = %s AND id = %s",
+            (session_id, message_id),
+        ).fetchone()["role"]
         if role == "assistant":
             raise RuntimeError("저장 실패 흉내")
-        return original(conn, session_id, role, parts)
+        return original(conn, session_id, message_id, parts)
 
-    monkeypatch.setattr(repository, "insert_message", failing_insert)
+    monkeypatch.setattr(repository, "insert_parts", failing_insert)
     generation = send(client, session, [user_part("저장 실패")]).json()["id"]
     row = generation_row(db, generation)
     assert row["status"] == "save_failed"
     assert row["error_code"] == "SAVE_FAILED"
     assert row["text"].startswith("@도경:")
     assert row["billable"] is False
+    assert row["message_status"] == "failed"
+    # 응답 부분은 하나도 저장되지 않는다(부분 저장과 완료 표시는 한 트랜잭션).
     assert db.execute(
-        "SELECT count(*) AS n FROM conversation_messages WHERE role = 'assistant'"
+        """SELECT count(*) AS n FROM conversation_message_parts p
+           JOIN conversation_messages m ON m.session_id = p.session_id AND m.id = p.message_id
+           WHERE m.role = 'assistant'"""
     ).fetchone() == {"n": 0}
     assert retry(client, generation).status_code == 409
 
@@ -278,13 +291,31 @@ def test_chat_us_02_openai_sse_parsing_without_network():
         list(iter_sse_content([b"data: {broken"]))
 
 
-def test_chat_us_02_openai_provider_requires_base_url(monkeypatch):
+def test_chat_us_02_openai_provider_requires_base_url_and_key(monkeypatch):
     monkeypatch.setattr(settings, "chat_llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "chat_llm_api_key", "test-key")
     monkeypatch.setattr(settings, "chat_llm_base_url", None)
     with pytest.raises(ProviderError):
         providers.get_provider()
     monkeypatch.setattr(settings, "chat_llm_base_url", "http://127.0.0.1:9/v1")
+    monkeypatch.setattr(settings, "chat_llm_api_key", None)
+    with pytest.raises(ProviderError) as exc:
+        providers.get_provider()
+    assert exc.value.code == "PROVIDER_NOT_CONFIGURED"
+    monkeypatch.setattr(settings, "chat_llm_api_key", "test-key")
     assert isinstance(providers.get_provider(), providers.OpenAICompatibleProvider)
+
+
+def test_chat_us_02_openai_default_base_url_is_openai():
+    assert type(settings).model_fields["chat_llm_base_url"].default == "https://api.openai.com/v1"
+
+
+def test_chat_us_02_openai_provider_rejects_unsupported_model_provider():
+    provider = providers.OpenAICompatibleProvider("http://127.0.0.1:9/v1", "test-key", 1)
+    request = ProviderRequest(model="x", messages=[], provider="other")
+    with pytest.raises(ProviderError) as exc:
+        list(provider.stream(request))
+    assert exc.value.code == "PROVIDER_NOT_CONFIGURED"
 
 
 def test_chat_us_02_long_poll_does_not_hold_db_connection_while_waiting(
@@ -352,6 +383,7 @@ class _FakeHttpResponse(io.BytesIO):
 def _use_openai_stream(monkeypatch, body: bytes):
     monkeypatch.setattr(settings, "chat_llm_provider", "openai_compatible")
     monkeypatch.setattr(settings, "chat_llm_base_url", "http://127.0.0.1:9/v1")
+    monkeypatch.setattr(settings, "chat_llm_api_key", "test-key")
     monkeypatch.setattr(settings, "chat_stream_flush_ms", 0)
     monkeypatch.setattr(
         providers.urllib.request, "urlopen", lambda *a, **k: _FakeHttpResponse(body)
@@ -375,7 +407,7 @@ def test_chat_us_02_ac15_ac17_openai_stream_without_completion_is_not_billed(
     assert row["error_code"] == "STREAM_INTERRUPTED"
     assert row["text"] == text
     assert row["billable"] is False
-    assert row["assistant_message_id"] is None
+    assert row["message_status"] == ("interrupted" if status == "failed_partial" else "failed")
 
 
 def test_chat_us_02_openai_stream_with_done_completes_and_is_billable(

@@ -17,7 +17,7 @@ def inline_worker(monkeypatch):
     monkeypatch.setattr(settings, "chat_fake_chunk_delay_ms", 0)
     monkeypatch.setattr(settings, "chat_fake_fail_mode", "none")
     monkeypatch.setattr(settings, "chat_llm_provider", "fake")
-    monkeypatch.setattr(settings, "chat_default_model", "fake-echo")
+    monkeypatch.setattr(settings, "chat_default_model_name", "루나")
 
 
 @pytest.fixture

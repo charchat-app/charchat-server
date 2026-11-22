@@ -6,6 +6,7 @@ from hashlib import sha256
 
 from psycopg import Connection
 
+from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.starter import repository
 from app.features.conversation.starter.schemas import (
@@ -124,6 +125,22 @@ class SessionNotFoundError(AppError):
     title = "접근할 수 있는 대화 세션을 찾을 수 없습니다"
 
 
+class ModelNotConfiguredError(AppError):
+    status = 503
+    code = "CONVERSATION_MODEL_NOT_CONFIGURED"
+    title = "대화에 사용할 기본 모델이 설정되지 않았습니다"
+
+
+def _default_model_id(conn: Connection) -> int:
+    """CHAT_DEFAULT_MODEL_NAME과 이름이 같은 models 행 하나. 없거나 여러 개면 시작하지 않는다."""
+    ids = repository.list_model_ids_by_name(conn, settings.chat_default_model_name)
+    if len(ids) != 1:
+        raise ModelNotConfiguredError(
+            f"기본 모델 '{settings.chat_default_model_name}'의 models 행이 {len(ids)}개입니다."
+        )
+    return ids[0]
+
+
 def _play_name(conn: Connection, owner_id: int, request: SessionCreateRequest, profile, chars):
     name = request.play_name
     if name == "" and _is_placeholder_preset(profile):
@@ -170,8 +187,10 @@ def create_session(
             _render_message(row, name).model_dump()
             for row in repository.list_intro_messages(conn, story_id, request.intro_id)
         ]
+        # 세션 시작 때 기본 모델을 고정한다(KAN-16 AC20). 이후 생성은 이 모델을 쓴다.
+        model_id = _default_model_id(conn)
         session_id = repository.insert_session(
-            conn, story_id, owner_id, request.intro_id, snapshot, fingerprint
+            conn, story_id, owner_id, request.intro_id, snapshot, fingerprint, model_id
         )
         repository.insert_applied_profile(conn, session_id, profile, name)
         repository.copy_scene_state(conn, session_id, request.intro_id)
@@ -190,7 +209,7 @@ def get_session(conn: Connection, owner_id: int, session_id: int) -> SessionResp
         return SessionResponse(
             id=session_id,
             story_title=session["story_title"] or "",
-            # 첫 응답 생성 때 적용한 모델(CHAT-US-02). 아직 생성 전이면 None.
+            # 세션에 고정된 모델의 표시 이름(models.name, 예: 루나).
             model=session["model"],
             read_only=session["read_only"],
             # 대화 입력창의 기본 발화자 이름(CHAT-US-02-AC01).
