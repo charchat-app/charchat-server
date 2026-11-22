@@ -3,6 +3,7 @@
 import hashlib
 import json
 from collections import defaultdict
+from contextlib import ExitStack
 
 from pydantic_core import to_jsonable_python
 
@@ -11,7 +12,7 @@ from app.features.creation.common.names import has_surrounding_space, name_compa
 from app.features.creation.images import service as images_service
 from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import service as intro_service
-from app.features.creation.save_visibility import repository, working_copy
+from app.features.creation.save_visibility import rating_review, repository, working_copy
 from app.features.creation.save_visibility.schemas import (
     CreationSaveRequest,
     CreationSaveResponse,
@@ -502,12 +503,20 @@ def validate_completed(connection, story_ref: AuthorizedStory, body):
         )
 
 
-def save_creation(connection, story_id, owner_id, request_id, body, storage=None):
+def save_creation(
+    connection, story_id, owner_id, request_id, body, storage=None, review_coordinator=None
+):
     """2~4번 공통 저장. 「저장」이면 이미지 임시 저장본도 함께 검사·반영한다(안 B).
 
     반영으로 연결이 끊긴 예전 사진은 커밋 뒤 바로 지운다(다른 곳에서 쓰는 사진은 남는다).
+    CREATE-US-08-AC02: 조정기를 주면 비공개·공개 「저장」이 커밋된 뒤 그 저장본을 조정기에
+    알린다(UNSAFE면 검토를 넘기고, 아니면 앞선 검토를 무효로 한다). `after_commit`은
+    트랜잭션을 감싸므로 그 안의 울타리는 COMMIT이 끝난 뒤에 나온다.
     """
-    result, released = _save_creation(connection, story_id, owner_id, request_id, body)
+    with ExitStack() as after_commit:
+        result, released = _save_creation(
+            connection, story_id, owner_id, request_id, body, review_coordinator, after_commit
+        )
     if storage is not None and released:
         images_service.release_images(connection, storage, released)
     return result
@@ -754,7 +763,9 @@ def with_latest_scene(connection, story, body, copy):
     return CreationSaveRequest.model_validate(payload)
 
 
-def _save_creation(connection, story_id, owner_id, request_id, body):
+def _save_creation(
+    connection, story_id, owner_id, request_id, body, review_coordinator=None, after_commit=None
+):
     story_ref = AuthorizedStory(story_id, owner_id)
     digest = request_digest(story_id, body)
     with connection.transaction():
@@ -1077,4 +1088,9 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
         speech_style.remember_write_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )
+        # CREATE-US-08-AC02·AC14: 비공개·공개 「저장」이면 마지막 단계로 정본을 읽고 검토
+        # 조정기 울타리에 들어간다(스토리 잠금 안). 이 뒤로는 COMMIT 말고 SQL이 없다.
+        # 커밋에 성공하면 울타리를 나오며 알린다. 미등록·임시·자동 저장은 알리지 않는다.
+        if review_coordinator is not None and not temporary and target != "draft":
+            rating_review.fence_final_save(connection, story_id, review_coordinator, after_commit)
         return result, released
