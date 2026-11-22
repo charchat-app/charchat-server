@@ -57,6 +57,39 @@ def owned_image_urls(connection: psycopg.Connection, owner_id: int, image_ids) -
     return {row["id"]: file_url(row["storage_key"]) for row in rows}
 
 
+def owned_image_items(
+    connection: psycopg.Connection, owner_id: int, image_ids
+) -> dict[int, ImageItem]:
+    """이미지 id → 사진 API 항목. 소유자 이미지만 잠그지 않고 읽는다(남의·없는 이미지는 빠짐).
+
+    CREATE-US-07-AC09 임시 저장한 새 캐릭터 사진 응답용. 읽기 전용 트랜잭션에서도 쓸 수 있다.
+    """
+    ids = sorted({i for i in image_ids if i is not None})
+    return {
+        row["id"]: to_item(row) for row in repository.read_owned_images(connection, owner_id, ids)
+    }
+
+
+def check_face_images(
+    connection: psycopg.Connection, owner_id: int, image_ids: set[int], admitted: set[int]
+) -> None:
+    """캐릭터 얼굴로 쓸 이미지가 잠금 묶음 안의 소유자 이미지이고 GIF가 아닌지 확인한다.
+
+    묶음 밖(남의 이미지·없는 ID·잠금 뒤 업로드)은 없는 이미지로 거절한다(잠금 순서 유지).
+    """
+    rows = {
+        row["id"]: row
+        for row in repository.read_owned_images(connection, owner_id, sorted(image_ids & admitted))
+    }
+    missing = sorted(image_ids - rows.keys())
+    if missing:
+        raise app_error(
+            422, "IMAGE_NOT_FOUND", "찾을 수 없는 이미지가 있습니다.", image_ids=missing
+        )
+    if any(row["mime_type"] == "image/gif" for row in rows.values()):
+        raise app_error(422, "IMAGE_GIF_NOT_ALLOWED", "GIF는 스토리 이미지에만 쓸 수 있습니다.")
+
+
 def to_item(row) -> ImageItem:
     return ImageItem(
         image_id=row["id"],
@@ -229,11 +262,80 @@ def save_story_images(
     return response
 
 
-def _save_story_images(connection, story_id, owner_id, request_id, body):
-    payload = {"operation": "story-images-v2", "story_id": story_id, **body.model_dump()}
-    request_hash = hashlib.sha256(
+AUTOSAVE_FINALIZE = "autosave_finalize"
+
+
+def is_images_response(raw) -> bool:
+    """기록한 응답이 사진 API(`StoryImagesResponse`) 모양인지(공통 저장 응답과 구분)."""
+    return isinstance(raw, dict) and "story_images" in raw and "expression" not in raw
+
+
+def photo_autosave_matches(story, copy, raw_response, auto_request_id: str) -> bool:
+    """CREATE-US-07-AC09: 사진만 바꾼 자동 저장 기록이 지금도 그대로 확정 가능한지.
+
+    스토리 잠금 안에서 부른다. 다음을 모두 만족할 때만 True다.
+    - 기록한 응답이 사진 API 모양이고 확정 가능(자기 요청키)하며 같은 스토리·공개 상태다.
+    - 응답의 저장본 시각(saved_at)·사진 임시 저장 시각이 지금과 같다.
+    - 지금 사진 임시 저장본에 그 요청키 표시가 있고, 2~5번 공통 임시 저장본은 없다.
+    """
+    if not is_images_response(raw_response):
+        return False
+    if raw_response.get("finalize_auto_request_id") != auto_request_id or copy is None:
+        return False
+    recorded = StoryImagesResponse.model_validate(raw_response)
+    marker = (copy["images"] or {}).get(AUTOSAVE_FINALIZE) or {}
+    return (
+        copy["creation"] is None
+        and marker.get("request_id") == auto_request_id
+        and recorded.story_id == story["id"]
+        and recorded.save_state == story["save_state"]
+        and recorded.saved_at == story["saved_at"]
+        and recorded.working_copy_saved_at is not None
+        and recorded.working_copy_saved_at == copy["images_saved_at"]
+    )
+
+
+def photo_autosave_unchanged(connection, story, owner_id: int, copy, auto_request_id: str) -> bool:
+    """소유자의 요청 기록을 찾아 `photo_autosave_matches`로 확인한다."""
+    previous = speech_style.find_write_request(connection, owner_id, auto_request_id)
+    return bool(previous) and photo_autosave_matches(
+        story, copy, previous["response"], auto_request_id
+    )
+
+
+def _photo_autosave_finalizable(connection, story, owner_id, copy) -> bool:
+    """이번 사진 자동 저장을 확정 가능으로 표시할 수 있는지(쓰기 전 임시 저장본 기준).
+
+    공통 임시 저장본이 없고, 사진 임시 저장본이 없거나 아직 바뀌지 않은 앞의 사진 자동 저장일
+    때만이다. 그 밖의(관계없는) 사진 임시 저장본 위에는 이어 붙이지 않는다.
+    """
+    if not copy:
+        return True
+    if copy["creation"] is not None:
+        return False
+    if copy["images"] is None:
+        return True
+    marker = copy["images"].get(AUTOSAVE_FINALIZE)
+    if not marker:
+        return False
+    return photo_autosave_unchanged(connection, story, owner_id, copy, marker["request_id"])
+
+
+def request_hash_of(story_id: int, body: StoryImagesSaveRequest) -> str:
+    """요청키 비교용 해시. mode를 생략·null로 보낸 요청은 mode를 빼고 해시해 기존과 같다."""
+    exclude = {"mode"} if body.mode is None else set()
+    payload = {
+        "operation": "story-images-v2",
+        "story_id": story_id,
+        **body.model_dump(exclude=exclude),
+    }
+    return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
+
+
+def _save_story_images(connection, story_id, owner_id, request_id, body):
+    request_hash = request_hash_of(story_id, body)
     with connection.transaction():
         speech_style.lock_write_request(connection, owner_id, request_id)
         story = speech_style.find_owned_story(connection, story_id, owner_id, lock=True)
@@ -289,9 +391,17 @@ def _save_story_images(connection, story_id, owner_id, request_id, body):
             )
 
         released: set[int] = set()
+        finalizable = False
         if body.kind == "temporary" and story["save_state"] != "draft":
             # 비공개·공개 스토리의 임시 저장: 필수 이미지 검사 없이 임시 저장본에만 둔다.
-            document = body.model_dump(mode="json", exclude={"kind"})
+            document = body.model_dump(mode="json", exclude={"kind", "mode"})
+            # CREATE-US-07-AC09: 쓰기 전 임시 저장본 기준으로 확정 가능 여부를 정하고,
+            # 가능하면 내부 표시(응답에는 싣지 않음)를 남긴다.
+            finalizable = body.mode == "auto" and _photo_autosave_finalizable(
+                connection, story, owner_id, copy
+            )
+            if finalizable:
+                document[AUTOSAVE_FINALIZE] = {"request_id": request_id}
             previous_copy = working_copy.write_images(connection, story_id, document, requested)
             repository.refresh_orphaned(connection, previous_copy | requested)
         else:
@@ -314,6 +424,8 @@ def _save_story_images(connection, story_id, owner_id, request_id, body):
             released = (before | previous_copy) - requested
 
         response = build_response(connection, story, request_id)
+        if finalizable:
+            response.finalize_auto_request_id = request_id
         speech_style.remember_write_request(
             connection,
             owner_id,
@@ -339,6 +451,56 @@ def _replace_lists(
     return before
 
 
+def stage_combined_images(connection, story_ref, images, copy, admitted):
+    """공통 임시 저장에서 보낸 사진 목록만 기존 편집본 위에 덮어쓴다."""
+    if images is None:
+        return
+    previous = copy["images"] if copy else None
+    story_id = story_ref.story_id
+    people = {row["id"] for row in repository.list_characters(connection, story_id)}
+    lists = {entry.character_id: entry.image_ids for entry in images.characters}
+    if not lists.keys() <= people:
+        raise app_error(422, "CHARACTER_NOT_FOUND", "이 스토리에 없는 캐릭터의 이미지입니다.")
+    covers = images.story_image_ids
+    if covers is None:
+        covers = (
+            previous["story_image_ids"]
+            if previous
+            else [row["id"] for row in repository.read_story_images(connection, story_id)]
+        )
+    merged = {
+        row["character_id"]: row["image_ids"]
+        for row in (previous["characters"] if previous else [])
+        if row["character_id"] in people
+    }
+    merged.update(lists)
+    document = {
+        "story_image_ids": covers,
+        "characters": [
+            {"character_id": person, "image_ids": ids} for person, ids in merged.items()
+        ],
+    }
+    requested = working_copy.images_document_ids(document)
+    rows = {
+        row["id"]: row
+        for row in repository.read_owned_images(
+            connection, story_ref.owner_id, sorted(requested & admitted)
+        )
+    }
+    if requested - rows.keys():
+        raise app_error(422, "IMAGE_NOT_FOUND", "찾을 수 없는 이미지가 있습니다.")
+    if any(
+        rows[image_id]["mime_type"] == "image/gif" for ids in merged.values() for image_id in ids
+    ):
+        raise app_error(422, "IMAGE_GIF_NOT_ALLOWED", "GIF는 스토리 이미지에만 쓸 수 있습니다.")
+    detached = working_copy.write_images(connection, story_id, document, requested)
+    repository.refresh_orphaned(connection, (detached | requested) & admitted)
+
+
+def explicit_image_cohort(connection, story_id, character_ids):
+    return repository.linked_image_ids(connection, story_id, character_ids)
+
+
 def working_copy_image_cohort(connection: psycopg.Connection, story_id: int, copy) -> set[int]:
     """사진 임시본 반영에서 연결하거나 분리할 이미지 ID."""
     document = copy["images"] if copy else None
@@ -349,7 +511,9 @@ def working_copy_image_cohort(connection: psycopg.Connection, story_id: int, cop
     return ids | repository.linked_image_ids(connection, story_id, characters)
 
 
-def apply_working_copy(connection: psycopg.Connection, story_id: int) -> set[int]:
+def apply_working_copy(
+    connection: psycopg.Connection, story_id: int, admitted: set[int]
+) -> set[int]:
     """공통 「저장」에서 이미지 임시 저장본도 함께 반영한다(안 B: 저장하면 사진까지 한 번에).
 
     호출 측 트랜잭션 안에서 부르고, 반영한 뒤 호출 측이 완성 검사(캐릭터마다 이미지 1장 이상)를
@@ -370,11 +534,80 @@ def apply_working_copy(connection: psycopg.Connection, story_id: int) -> set[int
     requested = set(draft["story_image_ids"])
     for image_ids in characters.values():
         requested.update(image_ids)
+    missing = sorted(requested - admitted)
+    if missing:
+        raise app_error(
+            422, "IMAGE_NOT_FOUND", "찾을 수 없는 이미지가 있습니다.", image_ids=missing
+        )
     before = _replace_lists(connection, story_id, draft["story_image_ids"], characters)
     previous_copy = working_copy.clear_images(connection, story_id)
-    repository.refresh_orphaned(connection, before | requested | previous_copy)
+    repository.refresh_orphaned(connection, (before | requested | previous_copy) & admitted)
     repository.touch_saved_at(connection, story_id)
-    return (before | previous_copy) - requested
+    return ((before | previous_copy) - requested) & admitted
+
+
+def apply_character_images(
+    connection: psycopg.Connection,
+    owner_id: int,
+    lists: dict[int, list[int]],
+    admitted: set[int],
+    story_id: int | None = None,
+    story_image_ids: list[int] | None = None,
+) -> set[int]:
+    """CREATE-US-07-AC07: 공통 「저장」이 보낸 캐릭터별 얼굴·스토리 표지 이미지 목록을 반영한다.
+
+    `lists`는 이 스토리의 캐릭터 id → 이미지 ID 목록(순서가 position)이며, 호출 측이 캐릭터를
+    확인·생성한 뒤 같은 트랜잭션에서 부른다. 사진 임시 저장본 반영 뒤에 부르면 보낸 캐릭터만
+    덮어쓰고, 담지 않은 캐릭터·스토리 이미지는 그대로 둔다.
+    `admitted`는 이 트랜잭션이 처음에 id 순으로 잠근 묶음이다.
+    소유·존재 확인과 연결은 그 안에서만 한다. 묶음 밖의 ID(남의 이미지·없는 ID·
+    잠금 뒤 업로드)는 없는 이미지로 거절해 잠금 순서를 지킨다.
+    거절은 예외라 호출 측 트랜잭션 전체가 되돌아간다.
+    `story_image_ids`(순서가 position)가 있으면 `story_id`의 스토리 이미지 목록 전체를 같은
+    규칙(소유·존재 확인, 묶음 안에서만 연결)으로 바꾼다. 스토리 이미지는 GIF를 허용한다.
+    None이면 스토리 이미지는 그대로 둔다.
+    커밋 뒤 지울 후보(연결이 끊긴 예전 이미지 ID)를 돌려준다.
+    """
+    requested = {image_id for image_ids in lists.values() for image_id in image_ids}
+    if story_image_ids is not None:
+        requested |= set(story_image_ids)
+    images = {
+        row["id"]: row
+        for row in repository.read_owned_images(connection, owner_id, sorted(requested & admitted))
+    }
+    missing = sorted(requested - images.keys())
+    if missing:
+        raise app_error(
+            422, "IMAGE_NOT_FOUND", "찾을 수 없는 이미지가 있습니다.", image_ids=missing
+        )
+    gif_on_character = [
+        {"character_id": character_id, "image_id": image_id}
+        for character_id, image_ids in lists.items()
+        for image_id in image_ids
+        if images[image_id]["mime_type"] == "image/gif"
+    ]
+    if gif_on_character:
+        raise app_error(
+            422,
+            "IMAGE_GIF_NOT_ALLOWED",
+            "GIF는 스토리 이미지에만 쓸 수 있습니다.",
+            issues=gif_on_character,
+        )
+    before = character_image_ids(connection, set(lists))
+    if story_image_ids is not None:
+        before |= repository.linked_image_ids(connection, story_id, [])
+        repository.replace_story_images(connection, story_id, story_image_ids)
+    for character_id, image_ids in lists.items():
+        repository.replace_character_images(connection, character_id, image_ids)
+    repository.refresh_orphaned(connection, (before | requested) & admitted)
+    return (before - requested) & admitted
+
+
+def character_image_ids(connection: psycopg.Connection, character_ids: set[int]) -> set[int]:
+    """캐릭터들에 연결된 이미지 ID. 캐릭터를 지우기(CASCADE) 전에 읽어 정리 후보로 쓴다."""
+    if not character_ids:
+        return set()
+    return repository.character_image_ids(connection, sorted(character_ids))
 
 
 def images_working_copy_saved_at(connection: psycopg.Connection, story_id: int):
