@@ -48,6 +48,9 @@ class StoryImagesResponse(BaseModel):
     request_id: str | None = None
     # 값이 있으면 위 목록은 아직 저장(반영)하지 않은 임시 저장본이다. 이용자는 이전 저장본을 본다.
     working_copy_saved_at: datetime | None = None
+    # CREATE-US-07-AC09: 사진만 바꾼 자동 저장(mode=auto)을 공통 「저장」으로 확정할 수 있으면
+    # 자기 요청키, 아니면 null. 조회(GET)와 그 밖의 저장, 이 필드 전에 기록된 응답은 null이다.
+    finalize_auto_request_id: str | None = None
 
 
 def _no_duplicates(ids: list[int], label: str) -> None:
@@ -83,9 +86,14 @@ class StoryImagesSaveRequest(BaseModel):
     # 저장 상태. temporary(임시 저장)는 비공개·공개 스토리에서 임시 저장본에만 둔다.
     # 미등록 스토리는 아무도 보지 않으므로 임시 저장도 바로 반영한다.
     kind: Literal["temporary", "save"] = "save"
+    # CREATE-US-07-AC09: 앱이 선택해 보내는 자동 저장 표시. auto는 temporary에서만 쓴다.
+    # 생략·null은 기존 요청·해시와 같다.
+    mode: Literal["manual", "auto"] | None = None
 
     @model_validator(mode="after")
     def check_ids(self) -> "StoryImagesSaveRequest":
+        if self.mode == "auto" and self.kind != "temporary":
+            raise ValueError("자동 저장(mode=auto)은 임시 저장(kind=temporary)에서만 쓴다.")
         _no_duplicates(self.story_image_ids, "스토리 이미지")
         if any(i <= 0 for i in self.story_image_ids):
             raise ValueError("이미지 ID는 양의 정수여야 합니다.")

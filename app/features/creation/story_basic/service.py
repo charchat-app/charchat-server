@@ -361,14 +361,21 @@ def update_story(
                 "공개·비공개로 저장한 스토리는 저장 조건을 모두 충족해야 저장할 수 있습니다.",
                 issues=[i.model_dump() for i in issues],
             )
-        row = repo.update_story_basic(
-            conn, story_id, req.title, req.subtitle, req.world_description
-        )
-        if req.tags is not None:
-            repo.replace_story_tags(conn, story_id, tags)
-        if req.characters is not None:
-            _sync_characters(conn, story_id, req.characters)
-        return _to_response(conn, row)
+        return _to_response(conn, apply_basic(conn, story_id, req))
+
+
+def apply_basic(conn: Connection, story_id: int, req: StoryUpdateRequest) -> repo.Row:
+    """기본 정보·캐릭터를 검사 없이 반영하고 스토리 행을 돌려준다. 트랜잭션은 호출 측이 연다.
+
+    해시태그는 표기를 정리(strip_tag_mark)해 저장한다. 완성 조건 검사·거절은 호출 측 책임이다.
+    CREATE-US-07 공통 저장(save_visibility)이 다른 기능의 repository를 직접 쓰지 않도록 연다.
+    """
+    row = repo.update_story_basic(conn, story_id, req.title, req.subtitle, req.world_description)
+    if req.tags is not None:
+        repo.replace_story_tags(conn, story_id, _dedupe(req.tags))
+    if req.characters is not None:
+        _sync_characters(conn, story_id, req.characters)
+    return row
 
 
 def suggest_tags(conn: Connection, query: str) -> list[TagSuggestionResponse]:

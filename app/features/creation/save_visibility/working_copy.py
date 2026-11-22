@@ -6,8 +6,9 @@
 미등록 스토리는 아무도 보지 않으므로 임시 저장도 본 테이블에 바로 쓰고 이 표를 쓰지 않는다.
 
 `story_working_copy_images`는 임시 저장본 행 전체가 쓰는 이미지다(파일 정리 보호용 사용 연결).
-6번 이미지 문서(`images`)의 이미지와 공통 문서(`creation`)의 임시 프리셋 이미지를
-합친다. 한쪽 문서를 쓰거나 비울 때 두 문서 기준으로 다시 맞춰, 다른 쪽 문서의 연결은 유지한다.
+6번 이미지 문서(`images`)의 이미지와 공통 문서(`creation`)의 임시 프리셋 이미지·새 캐릭터
+사진(CREATE-US-07-AC09)을 합친다. 한쪽 문서를 쓰거나 비울 때 두 문서를 기준으로 맞춘다.
+다른 쪽 문서의 연결은 유지한다.
 """
 
 from collections.abc import Collection
@@ -42,6 +43,26 @@ def staged_presets(document: dict | None) -> list[dict] | None:
 def preset_image_ids(document: dict | None) -> set[int]:
     """2~5번 공통 문서의 임시 프리셋이 가리키는 이미지 ID(검사하지 않은 원문)."""
     return {p["image_id"] for p in staged_presets(document) or () if p.get("image_id") is not None}
+
+
+STAGED_CHARACTER_IMAGES = "staged_character_images"
+
+
+def staged_character_images(document: dict | None) -> list[dict]:
+    """CREATE-US-07-AC09: 공통 문서의 임시 `basic`과 짝지은 새 캐릭터 사진.
+
+    [{basic_index, image_ids}] (basic_index 순). 쓸 때 소유·GIF를 확인했다. 없으면 [].
+    """
+    return list((document or {}).get(STAGED_CHARACTER_IMAGES) or ())
+
+
+def staged_character_image_ids(document: dict | None) -> set[int]:
+    return {i for entry in staged_character_images(document) for i in entry["image_ids"]}
+
+
+def creation_image_ids(document: dict | None) -> set[int]:
+    """공통 문서가 가리키는 이미지 ID(임시 프리셋 + 새 캐릭터 사진)."""
+    return preset_image_ids(document) | staged_character_image_ids(document)
 
 
 def write_creation(
@@ -123,6 +144,7 @@ def clear_images(connection: psycopg.Connection, story_id: int) -> set[int]:
 def _sync_image_links(connection, story_id: int, admitted: Collection[int]) -> set[int]:
     """연결을 두 문서 기준으로 맞추고, 새로 생기거나 끊긴 이미지 ID를 돌려준다.
 
+    공통 문서의 이미지(임시 프리셋 원문·새 캐릭터 사진, CREATE-US-07-AC09)는 같은 규칙을 따른다.
     임시 프리셋 이미지는 검사 전 원문이다. 이미 연결된 ID는 문서에 남아 있는 동안 유지하고,
     새 ID는 `admitted`(호출자가 이 트랜잭션에서 id 순으로 잠근, 스토리 제작자의 이미지)
     안의 것만 연결한다. 그래서 남의·없는 이미지가 보호되거나 외래 키 오류가 나지 않고,
@@ -138,7 +160,7 @@ def _sync_image_links(connection, story_id: int, admitted: Collection[int]) -> s
     wanted: set[int] = set()
     if row:
         wanted = images_document_ids(row["images"])
-        wanted |= preset_image_ids(row["creation"]) & (previous | set(admitted))
+        wanted |= creation_image_ids(row["creation"]) & (previous | set(admitted))
     removed, added = previous - wanted, wanted - previous
     if removed:
         connection.execute(

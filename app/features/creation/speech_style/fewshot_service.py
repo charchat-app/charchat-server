@@ -99,9 +99,15 @@ def save_fewshots(connection, story_id, owner_id, request_id, body):
         return response
 
 
-def write_fewshots(connection, story_id, body):
+def write_fewshots(connection, story_id, body, character_ids=None):
+    """퓨샷을 저장한다. `character_ids`를 주면 그 인물만 발화자로 허용한다.
+
+    CREATE-US-07 캐릭터 삭제: 삭제 전에 남길 캐릭터만 넘겨,
+    삭제 대상을 가리키는 말풍선을 거절한다.
+    """
     people = characters(connection, story_id)
-    character_ids = {p["id"] for p in people}
+    if character_ids is None:
+        character_ids = {p["id"] for p in people}
     old_groups = {g["id"] for g in repo.read_groups(connection, story_id)}
     old_messages = {m["id"]: m["fewshot_id"] for m in repo.read_messages(connection, story_id)}
     for group in body.fewshots:
