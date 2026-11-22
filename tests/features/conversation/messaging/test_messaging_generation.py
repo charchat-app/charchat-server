@@ -1,5 +1,6 @@
 """CHAT-US-02 응답 생성 진행·실패·재시도·롱 폴링."""
 
+import io
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
 
@@ -318,3 +319,71 @@ def test_chat_us_02_long_poll_does_not_hold_db_connection_while_waiting(
         assert poll.json()["status"] == "pending"
     finally:
         small_pool.close()
+
+
+def _sse(*events: str) -> list[bytes]:
+    return [f"data: {event}\n".encode() for event in events] + [b"\n"]
+
+
+def _delta(text: str) -> str:
+    return '{"choices":[{"delta":{"content":"%s"},"finish_reason":null}]}' % text
+
+
+def test_chat_us_02_sse_requires_completion_signal():
+    finish = '{"choices":[{"delta":{},"finish_reason":"stop"}]}'
+    # finish_reason만 있고 [DONE]이 없어도 정상 완료다.
+    assert "".join(iter_sse_content(_sse(_delta("가"), _delta("나"), finish))) == "가나"
+    assert "".join(iter_sse_content(_sse(_delta("가"), "[DONE]"))) == "가"
+    received = []
+    with pytest.raises(ProviderError) as exc:
+        for chunk in iter_sse_content(_sse(_delta("가"), _delta("나"))):
+            received.append(chunk)
+    assert exc.value.code == "STREAM_INTERRUPTED"
+    assert received == ["가", "나"]
+    with pytest.raises(ProviderError) as exc:
+        list(iter_sse_content([]))
+    assert exc.value.code == "STREAM_INTERRUPTED"
+
+
+class _FakeHttpResponse(io.BytesIO):
+    """urlopen 응답 대역. 줄 단위 반복과 with 문을 지원한다(네트워크 없음)."""
+
+
+def _use_openai_stream(monkeypatch, body: bytes):
+    monkeypatch.setattr(settings, "chat_llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "chat_llm_base_url", "http://127.0.0.1:9/v1")
+    monkeypatch.setattr(settings, "chat_stream_flush_ms", 0)
+    monkeypatch.setattr(
+        providers.urllib.request, "urlopen", lambda *a, **k: _FakeHttpResponse(body)
+    )
+
+
+@pytest.mark.parametrize(
+    ("events", "status", "text"),
+    [
+        ((_delta("@도경: 안녕"), _delta("하세요")), "failed_partial", "@도경: 안녕하세요"),
+        ((), "failed", ""),
+    ],
+)
+def test_chat_us_02_ac15_ac17_openai_stream_without_completion_is_not_billed(
+    client, db, session, monkeypatch, events, status, text
+):
+    _use_openai_stream(monkeypatch, b"".join(_sse(*events)))
+    generation = send(client, session, [user_part("잘린 응답")]).json()["id"]
+    row = generation_row(db, generation)
+    assert row["status"] == status
+    assert row["error_code"] == "STREAM_INTERRUPTED"
+    assert row["text"] == text
+    assert row["billable"] is False
+    assert row["assistant_message_id"] is None
+
+
+def test_chat_us_02_openai_stream_with_done_completes_and_is_billable(
+    client, db, session, monkeypatch
+):
+    _use_openai_stream(monkeypatch, b"".join(_sse(_delta("@도경: 안녕"), "[DONE]")))
+    generation = send(client, session, [user_part("정상 응답")]).json()["id"]
+    row = generation_row(db, generation)
+    assert row["status"] == "completed"
+    assert row["text"] == "@도경: 안녕"
+    assert row["billable"] is True
