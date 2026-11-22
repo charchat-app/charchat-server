@@ -632,3 +632,20 @@ ALTER TABLE conversation_sessions
     ADD CONSTRAINT conversation_sessions_initial_request_key
         UNIQUE (owner_id, story_id, initial_request_fingerprint);
 
+-- CREATE-US-08 로컬 개발·테스트 전용(문서의 stories 등급 컬럼). 운영 마이그레이션이 아니다.
+-- 기존 DB 적용용 초안: app/db/migrations/create_us08_story_rating.sql
+-- requested_rating: 제작자가 고른 등급(저장본). 임시 저장 중인 선택은 임시 저장본 JSON에 둔다.
+-- effective_rating·rating_review_*: 실제 적용 등급과 검토 상태. 공통 저장은 바꾸지 않는다.
+ALTER TABLE stories
+    ADD COLUMN requested_rating text NOT NULL DEFAULT 'SAFE',
+    ADD COLUMN effective_rating text NOT NULL DEFAULT 'SAFE',
+    ADD COLUMN rating_review_status text NOT NULL DEFAULT 'not_reviewed',
+    ADD COLUMN rating_review_reason text,
+    ADD COLUMN rating_requested_at timestamptz,
+    ADD CONSTRAINT stories_requested_rating_check
+        CHECK (requested_rating IN ('SAFE', 'UNSAFE')),
+    ADD CONSTRAINT stories_effective_rating_check
+        CHECK (effective_rating IN ('SAFE', 'UNSAFE')),
+    ADD CONSTRAINT stories_rating_review_status_check
+        CHECK (rating_review_status IN ('not_reviewed', 'reviewing', 'completed', 'failed'));
+

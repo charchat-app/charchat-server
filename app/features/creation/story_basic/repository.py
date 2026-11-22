@@ -31,7 +31,8 @@ def list_owned_stories(conn: Connection, owner_id: int) -> list[Row]:
     """삭제되지 않은 본인 스토리를 최근 저장 순으로 돌려준다."""
     return conn.execute(
         """
-        SELECT id, save_state, title, saved_at FROM stories
+        SELECT id, save_state, title, saved_at, effective_rating, rating_review_status
+        FROM stories
         WHERE owner_id = %s AND deleted_at IS NULL
         ORDER BY saved_at DESC, id DESC
         """,

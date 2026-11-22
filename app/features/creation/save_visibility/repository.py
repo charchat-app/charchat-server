@@ -32,6 +32,25 @@ def read_tag_names(connection, story_id):
     return [row["name"] for row in rows]
 
 
+def read_rating(connection, story_id):
+    """CREATE-US-08 저장본 등급 선택·적용 등급·검토 상태."""
+    return connection.execute(
+        """SELECT requested_rating, effective_rating, rating_review_status
+           FROM stories WHERE id=%s""",
+        (story_id,),
+    ).fetchone()
+
+
+def update_requested_rating(connection, story_id, requested_rating):
+    """CREATE-US-08-AC01: 제작자의 등급 선택만 바꾼다.
+
+    적용 등급·검토 상태·사유·요청 시각은 이 조각에서 쓰지 않는다(검토 연동은 후속 작업).
+    """
+    connection.execute(
+        "UPDATE stories SET requested_rating=%s WHERE id=%s", (requested_rating, story_id)
+    )
+
+
 def update_save_state(connection, story_id, save_state):
     return connection.execute(
         "UPDATE stories SET save_state=%s WHERE id=%s RETURNING save_state,saved_at",
