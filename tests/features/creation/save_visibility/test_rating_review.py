@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,7 +10,19 @@ from app.features.creation.save_visibility.rating_review import (
     RatingReviewCoordinator,
     build_snapshot,
 )
-from tests.features.creation.save_visibility.review_fakes import FakeEvaluator, MemoryLastPassStore
+from app.features.creation.save_visibility.review_verdict import (
+    Eligibility,
+    EligibilityReason,
+    EligibilityVerdict,
+)
+from tests.features.creation.save_visibility.review_fakes import (
+    ELIGIBLE,
+    INELIGIBLE,
+    UNAVAILABLE,
+    UNDETERMINED,
+    FakeEvaluator,
+    MemoryLastPassStore,
+)
 
 STORY = 7
 
@@ -162,8 +175,25 @@ def test_revert_to_passed_snapshot_supersedes_in_flight_review_CREATE_US_08_AC14
     assert store.history == [(STORY, snap())]
 
 
-@pytest.mark.parametrize("verdict", [False, RuntimeError("공급자 오류"), None])
-def test_failed_review_keeps_older_pass_and_is_not_reused_CREATE_US_08_AC14(parts, verdict):
+NOT_APPROVING = [
+    INELIGIBLE,
+    UNDETERMINED,
+    UNAVAILABLE,
+    RuntimeError("공급자 오류"),
+    # 타입이 맞지 않는 값·검증을 건너뛴 판정은 통과가 아니다(예전 bool 계약 포함).
+    True,
+    False,
+    None,
+    "eligible",
+    Eligibility.ELIGIBLE,
+    EligibilityVerdict.model_construct(
+        outcome=Eligibility.ELIGIBLE, reasons=frozenset({EligibilityReason.UNDERAGE_STATED})
+    ),
+]
+
+
+@pytest.mark.parametrize("verdict", NOT_APPROVING)
+def test_failed_review_keeps_older_pass_and_is_not_reused_CREATE_US_08_AC05_AC14(parts, verdict):
     evaluator, store, coordinator = parts
     coordinator.publish(STORY, snap())
     assert coordinator.wait(5)
@@ -173,11 +203,56 @@ def test_failed_review_keeps_older_pass_and_is_not_reused_CREATE_US_08_AC14(part
     assert coordinator.wait(5)
     assert store.get(STORY) == snap()
     # 실패한 내용은 통과로 남지 않아, 같은 내용을 다시 저장하면 다시 검토한다.
-    evaluator.verdict = True
+    evaluator.verdict = ELIGIBLE
     assert coordinator.publish(STORY, changed) == "submitted"
     assert coordinator.wait(5)
     assert store.get(STORY) == changed
     assert len(evaluator.calls) == 3
+
+
+@pytest.mark.parametrize("verdict", [INELIGIBLE, UNDETERMINED, UNAVAILABLE, True])
+def test_non_approval_logs_no_story_content_CREATE_US_08_AC05(parts, caplog, verdict):
+    evaluator, store, coordinator = parts
+    evaluator.verdict = verdict
+    caplog.set_level("DEBUG", logger="app.features.creation.save_visibility.rating_review")
+    coordinator.publish(STORY, snap(world="내용표식", detail="내용표식"))
+    assert coordinator.wait(5)
+    assert store.get(STORY) is None
+    assert caplog.records
+    assert all("내용표식" not in r.getMessage() for r in caplog.records)
+
+
+LEAK = "원문표식"
+
+
+class Opaque:
+    """`.value`에 원문을 담은 해시 가능한 가짜 값."""
+
+    value = LEAK
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        # 검증을 건너뛴 판정 객체의 필드에 원문이 실린 경우
+        INELIGIBLE.model_copy(update={"reasons": frozenset({Opaque()})}),
+        INELIGIBLE.model_copy(update={"outcome": SimpleNamespace(value=LEAK)}),
+        EligibilityVerdict.model_construct(outcome=SimpleNamespace(value=LEAK), reasons=()),
+        INELIGIBLE.model_copy(update={"rationale": LEAK}),
+        # 판정이 아닌 객체(타입 이름 포함)
+        SimpleNamespace(outcome=SimpleNamespace(value=LEAK), reasons=[LEAK]),
+        type(LEAK, (), {})(),
+    ],
+)
+def test_malformed_verdict_logs_only_fixed_code_CREATE_US_08_AC05(parts, caplog, verdict):
+    evaluator, store, coordinator = parts
+    evaluator.verdict = verdict
+    caplog.set_level("DEBUG", logger="app.features.creation.save_visibility.rating_review")
+    coordinator.publish(STORY, snap())
+    assert coordinator.wait(5)
+    assert store.get(STORY) is None
+    assert caplog.records
+    assert all(LEAK not in r.getMessage() for r in caplog.records)
 
 
 def test_stories_are_independent_CREATE_US_08_AC14(parts):

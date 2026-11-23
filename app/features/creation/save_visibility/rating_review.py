@@ -27,6 +27,11 @@ from typing import Protocol
 
 from app.features.creation.initial_state import service as initial_state
 from app.features.creation.save_visibility import repository
+from app.features.creation.save_visibility.review_verdict import (
+    Eligibility,
+    EligibilityVerdict,
+    revalidated,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +79,11 @@ def capture_snapshot(connection, story_id) -> ReviewSnapshot:
 
 
 class ReviewEvaluator(Protocol):
-    def evaluate(self, story_id: int, snapshot: ReviewSnapshot) -> bool:
-        """True만 통과다. False·예외는 통과가 아니다. 조정기 잠금 밖에서 부른다."""
+    def evaluate(self, story_id: int, snapshot: ReviewSnapshot) -> EligibilityVerdict:
+        """검증된 적격 판정만 통과다(`is_eligible`). 그 밖의 값·예외는 통과가 아니다.
+
+        조정기 잠금 밖에서 부른다.
+        """
 
 
 class LastPassStore(Protocol):
@@ -252,7 +260,19 @@ class RatingReviewCoordinator:
                     released = True
                     return
             try:
-                passed = self._evaluator.evaluate(story_id, snapshot) is True
+                result = self._evaluator.evaluate(story_id, snapshot)
+                checked = revalidated(EligibilityVerdict, result)
+                passed = checked is not None and checked.outcome is Eligibility.ELIGIBLE
+                if not passed:
+                    # 검증된 판정의 종류·사유 코드만 남긴다. 잘못된 값은 필드·타입 이름도 읽지 않고
+                    # 고정 코드만 남긴다(원문·평가기 출력이 섞일 수 있다).
+                    logger.info(
+                        "등급 검토 미통과 story_id=%s generation=%s outcome=%s reasons=%s",
+                        story_id,
+                        generation,
+                        checked.outcome.value if checked is not None else "invalid",
+                        sorted(r.value for r in checked.reasons) if checked is not None else [],
+                    )
             except Exception as exc:
                 logger.warning(
                     "등급 검토 실패 story_id=%s generation=%s error=%s",

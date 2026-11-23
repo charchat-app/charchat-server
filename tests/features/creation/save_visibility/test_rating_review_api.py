@@ -16,7 +16,12 @@ from app.features.creation.save_visibility.rating_review import (
     build_snapshot,
 )
 from app.main import create_app
-from tests.features.creation.save_visibility.review_fakes import FakeEvaluator, MemoryLastPassStore
+from tests.features.creation.save_visibility.review_fakes import (
+    ELIGIBLE,
+    INELIGIBLE,
+    FakeEvaluator,
+    MemoryLastPassStore,
+)
 from tests.features.creation.speech_style.conftest import OWNER_ID, create_story
 from tests.features.creation.speech_style.test_common_save_api import body, current_payload, put
 from tests.features.creation.speech_style.test_common_save_rating import (
@@ -185,7 +190,7 @@ def test_draft_unsafe_save_does_not_hand_off_CREATE_US_08_AC02(ctx):
 
 def test_idempotent_replay_does_not_hand_off_again_CREATE_US_08_AC02(ctx):
     saved = published(ctx)
-    ctx.evaluator.verdict = False  # 통과 기록 없이도 재전송은 넘기지 않는다.
+    ctx.evaluator.verdict = INELIGIBLE  # 통과 기록 없이도 재전송은 넘기지 않는다.
     payload = {**current_payload(saved), "requested_rating": "UNSAFE"}
     first = put(ctx.client, ctx.story, payload, "same")
     assert first.status_code == 200
@@ -307,7 +312,7 @@ def test_failed_review_keeps_older_pass_and_is_retried_on_next_save_CREATE_US_08
     assert failed.status_code == 200, failed.text
     assert len(reviewed(ctx)) == 2
     assert ctx.store.get(ctx.story["id"]) == expected(ctx)
-    ctx.evaluator.verdict = True
+    ctx.evaluator.verdict = ELIGIBLE
     again = save(ctx, first.json(), "third")
     assert again.status_code == 200
     assert reviewed(ctx)[1:] == [expected(ctx, world="새 세계관")] * 2
