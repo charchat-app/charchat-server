@@ -12,6 +12,8 @@ import psycopg
 import pytest
 import uvicorn
 
+from tests.features.creation.images.helpers import give_face_images
+
 
 @pytest.mark.app_integration
 def test_actual_app_adapter_round_trip(adapter_context):
@@ -32,6 +34,12 @@ def test_actual_app_adapter_round_trip(adapter_context):
                VALUES (%s,'가상 캐릭터','가상 상세',0)""",
             (story["id"],),
         )
+        give_face_images(connection, story["id"])
+        image_id = connection.execute(
+            """SELECT ci.image_id FROM character_images ci
+               JOIN characters c ON c.id = ci.character_id WHERE c.story_id = %s""",
+            (story["id"],),
+        ).fetchone()[0]
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.listen()
@@ -45,7 +53,7 @@ def test_actual_app_adapter_round_trip(adapter_context):
             time.sleep(0.02)
         assert server.started
         result = subprocess.run(
-            ["node", str(script), f"http://127.0.0.1:{port}", str(story["id"])],
+            ["node", str(script), f"http://127.0.0.1:{port}", str(story["id"]), str(image_id)],
             capture_output=True,
             text=True,
             timeout=30,

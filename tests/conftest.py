@@ -19,6 +19,8 @@ from app.core.config import settings
 from app.main import create_app
 
 SCHEMA_SQL = Path(__file__).resolve().parents[1] / "app" / "db" / "schema.sql"
+# schema.sql이 넣는 기준 데이터 표. 테스트마다 비우지 않는다.
+SEED_TABLES = ("models",)
 
 
 def _ensure_database(url: str) -> None:
@@ -48,10 +50,14 @@ def db_url() -> str:
 
 @pytest.fixture
 def db(db_url: str) -> Iterator[psycopg.Connection]:
-    """테스트 준비·확인용 직접 연결. 테스트 전에 모든 테이블을 비운다."""
+    """테스트 준비·확인용 직접 연결. 테스트 전에 모든 테이블을 비운다.
+
+    schema.sql이 넣는 기준 데이터 표(models)는 비우지 않는다. 바꾼 테스트가 직접 되돌린다.
+    """
     with psycopg.connect(db_url, autocommit=True, row_factory=dict_row) as conn:
         tables = conn.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> ALL(%s)",
+            (list(SEED_TABLES),),
         ).fetchall()
         names = sql.SQL(", ").join(sql.Identifier(t["tablename"]) for t in tables)
         conn.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY CASCADE").format(names))
