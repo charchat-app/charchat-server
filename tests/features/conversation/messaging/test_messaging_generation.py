@@ -1,6 +1,7 @@
 """CHAT-US-02 응답 생성 진행·실패·재시도·롱 폴링."""
 
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
 
@@ -316,6 +317,31 @@ def test_chat_us_02_openai_provider_rejects_unsupported_model_provider():
     with pytest.raises(ProviderError) as exc:
         list(provider.stream(request))
     assert exc.value.code == "PROVIDER_NOT_CONFIGURED"
+
+
+def test_chat_us_02_openai_provider_sends_model_id_with_configured_prefix(monkeypatch):
+    """OpenRouter 같은 중계 서비스는 'openai/gpt-6-luna'처럼 공급자 이름이 붙은 ID를 받는다."""
+    sent = []
+
+    def fake_urlopen(http_request, timeout):
+        sent.append(json.loads(http_request.data))
+        return _FakeHttpResponse(b"".join(_sse(_delta("ok"), "[DONE]")))
+
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(settings, "chat_llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "chat_llm_base_url", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(settings, "chat_llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "chat_llm_model_prefix", "openai/")
+    provider = providers.get_provider()
+    for model in ("gpt-6-luna", "openai/gpt-6-luna"):
+        assert "".join(provider.stream(ProviderRequest(model=model, messages=[]))) == "ok"
+    assert [body["model"] for body in sent] == ["openai/gpt-6-luna", "openai/gpt-6-luna"]
+
+    # 기본값(접두사 없음)은 DB의 provider_model_id를 그대로 보낸다.
+    assert type(settings).model_fields["chat_llm_model_prefix"].default == ""
+    plain = providers.OpenAICompatibleProvider("http://127.0.0.1:9/v1", "test-key", 1)
+    list(plain.stream(ProviderRequest(model="gpt-6-luna", messages=[])))
+    assert sent[-1]["model"] == "gpt-6-luna"
 
 
 def test_chat_us_02_long_poll_does_not_hold_db_connection_while_waiting(

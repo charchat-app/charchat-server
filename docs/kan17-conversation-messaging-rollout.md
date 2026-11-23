@@ -46,6 +46,8 @@ SQL을 먼저 적용하지 않고 서버를 올리면 **세션 시작과 기존 
    맞아야 세션을 시작할 수 있다(없거나 여러 행이면 `503 CONVERSATION_MODEL_NOT_CONFIGURED`).
    실제 호출은 `CHAT_LLM_PROVIDER=openai_compatible`, `CHAT_LLM_API_KEY`(비밀 저장소),
    `CHAT_LLM_BASE_URL`(기본 `https://api.openai.com/v1`). `fake`는 네트워크 없이 가짜 응답을 보낸다.
+   OpenRouter로 호출하려면 `CHAT_LLM_BASE_URL=https://openrouter.ai/api/v1`,
+   `CHAT_LLM_MODEL_PREFIX=openai/`로 둔다. DB의 `models.provider_model_id`는 바꾸지 않는다.
 7. 서버 배포 후 기존 방 조회(`GET /sessions/{id}`, `GET /sessions/{id}/turns`), 새 세션 시작,
    메시지 전송을 확인한 뒤 앱을 배포한다.
 

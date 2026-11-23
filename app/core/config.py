@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     chat_llm_provider: Literal["fake", "openai_compatible"] = "fake"
     chat_llm_base_url: str | None = "https://api.openai.com/v1"
     chat_llm_api_key: str | None = None
+    # 공급자에 보낼 모델 ID 앞에 붙일 말. models.provider_model_id는 그대로 두고 중계 서비스
+    # 규칙에 맞춘다. 예: OpenRouter는 "openai/" → "openai/gpt-6-luna". 기본은 붙이지 않음.
+    chat_llm_model_prefix: str = ""
     # 새 세션에 고정할 기본 모델의 models.name. 해당 행이 없으면 세션 시작을 503으로 거절한다.
     chat_default_model_name: str = "루나"
     # 공급자 연결·첫 응답 대기 시간(초).
