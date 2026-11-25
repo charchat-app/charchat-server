@@ -59,13 +59,15 @@ def canonical_presets(connection, story_ref: AuthorizedStory) -> list[PresetResp
 def rating_fields(connection, story_id, staged_rating=None) -> dict:
     """CREATE-US-08 응답 등급 필드. 선택은 임시 저장한 값이 있으면 그것, 없으면 저장본이다.
 
-    적용 등급·검토 상태는 언제나 저장본 값이다.
+    적용 등급·검토 상태는 언제나 저장본 값이다. 사유는 허용 목록으로 다시 검증한 코드만
+    내보내고, 맞지 않는 저장값(예전 자유 텍스트 등)은 null로 둔다(CREATE-US-08-AC09~AC11).
     """
     row = repository.read_rating(connection, story_id)
     return {
         "requested_rating": staged_rating or row["requested_rating"],
         "effective_rating": row["effective_rating"],
         "rating_review_status": row["rating_review_status"],
+        "rating_review_reason": rating_review.reason_payload(row["rating_review_reason"]),
     }
 
 
@@ -1071,6 +1073,7 @@ def _save_creation(
         # 저장한 선택을 반영한다. 둘 다 없으면 저장본 선택을 그대로 둔다. 같은 트랜잭션이라
         # 검사·저장이 실패하면 함께 되돌아간다. 적용 등급·검토 상태·사유·요청 시각은 쓰지 않고
         # 검토를 시작하지도 않는다(후속 조각).
+        # (결과 저장 경로의 적용 등급·검토 상태는 아래 `prepare_final_save`가 쓴다.)
         rating = body.requested_rating
         if rating is None and not temporary:
             rating = working_copy.staged_requested_rating(staged_doc)
@@ -1082,15 +1085,21 @@ def _save_creation(
         # 정리 작업 유예를 따른다).
         unlinked = working_copy.clear_creation(connection, story_id, admitted=admitted)
         images_service.refresh_orphaned_images(connection, unlinked & admitted)
+        # CREATE-US-08-AC02·AC14: 비공개·공개 「저장」이면 모든 쓰기 뒤 정본을 읽는다. 결과 저장
+        # 경로면 검토 대기(또는 SAFE)를 같은 트랜잭션에 써 응답에도 담는다. 미등록·임시·자동
+        # 저장은 검토와 무관하다.
+        handoff = None
+        if review_coordinator is not None and not temporary and target != "draft":
+            handoff = rating_review.prepare_final_save(connection, story_id, review_coordinator)
         result = response(
             connection, story, owner_id, groups, people, request_id, intros, relations, affinities
         )
         speech_style.remember_write_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )
-        # CREATE-US-08-AC02·AC14: 비공개·공개 「저장」이면 마지막 단계로 정본을 읽고 검토
-        # 조정기 울타리에 들어간다(스토리 잠금 안). 이 뒤로는 COMMIT 말고 SQL이 없다.
-        # 커밋에 성공하면 울타리를 나오며 알린다. 미등록·임시·자동 저장은 알리지 않는다.
-        if review_coordinator is not None and not temporary and target != "draft":
-            rating_review.fence_final_save(connection, story_id, review_coordinator, after_commit)
+        # 마지막 단계로 검토 조정기 울타리에 들어간다(스토리 잠금 안). 이 뒤로는 COMMIT 말고
+        # SQL이 없다. 커밋에 성공하면 울타리를 나오며 알린다. 요청키 영수증과 이 응답은 커밋
+        # 시점 값으로 고정되고, 커밋 뒤 넘김 실패는 현재 검토 상태에만 쓴다(CREATE-US-08-AC02·AC11).
+        if handoff is not None:
+            rating_review.fence_final_save(story_id, review_coordinator, after_commit, handoff)
         return result, released

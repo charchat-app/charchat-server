@@ -367,3 +367,15 @@ def test_unsafe_without_eligibility_is_not_cleared_CREATE_US_08_AC15(eligibility
 @pytest.mark.parametrize("rating", [None, "safe", "", "OTHER"])
 def test_unknown_rating_is_not_cleared_CREATE_US_08_AC15(rating):
     assert decide_offering(rating, CLEAR, ELIGIBLE) is Offering.NOT_CLEARED
+
+
+def test_reason_response_codes_match_verdict_enums_CREATE_US_08_AC09():
+    from typing import get_args
+
+    from app.features.creation.save_visibility.schemas import RatingReviewReason
+
+    fields = RatingReviewReason.model_fields
+    outcomes = set(get_args(fields["outcome"].annotation))
+    (codes,) = get_args(fields["reasons"].annotation)
+    assert outcomes == {e.value for e in Eligibility} - {Eligibility.ELIGIBLE.value}
+    assert set(get_args(codes)) == {r.value for r in EligibilityReason}

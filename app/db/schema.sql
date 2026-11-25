@@ -38,8 +38,17 @@ CREATE TABLE stories (
 -- deleted_at은 공개 범위와 별개다. 소프트 삭제 시 자식/세션/이미지 연결을 유지한다.
 
 -- CREATE-US-07: 허용 상태 전환과 복구/물리 삭제 금지를 DB에서도 지키는 구현 제안.
+-- CREATE-US-08: 검토 메타데이터(적용 등급·검토 상태·사유·요청 표)만 실제로 바뀐 UPDATE는 저장본
+-- 편집이 아니므로 saved_at을 그대로 둔다(자동 저장 영수증·응답 saved_at 보존). 같은 값 touch,
+-- 제작자 선택(requested_rating)·다른 필드가 바뀐 UPDATE는 saved_at을 새로 쓴다. 컬럼 이름을 jsonb
+-- 키로만 비교하므로 등급 컬럼이 없는 DB에도 적용된다. 기존 DB 적용용 초안:
+-- app/db/migrations/create_us08_review_saved_at.sql (함수 본문은 이 정의와 같아야 한다)
 CREATE FUNCTION enforce_story_lifecycle()
 RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    review_keys CONSTANT text[] := ARRAY[
+        'effective_rating', 'rating_review_status', 'rating_review_reason',
+        'rating_requested_at', 'saved_at'];
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'Stories must be soft deleted and retained indefinitely'
@@ -58,7 +67,12 @@ BEGIN
         RAISE EXCEPTION 'This story save-state transition is not allowed'
             USING ERRCODE = '23514';
     END IF;
-    NEW.saved_at := clock_timestamp();
+    IF to_jsonb(NEW) - review_keys = to_jsonb(OLD) - review_keys
+       AND to_jsonb(NEW) - 'saved_at' IS DISTINCT FROM to_jsonb(OLD) - 'saved_at' THEN
+        NEW.saved_at := OLD.saved_at;
+    ELSE
+        NEW.saved_at := clock_timestamp();
+    END IF;
     RETURN NEW;
 END;
 $$;

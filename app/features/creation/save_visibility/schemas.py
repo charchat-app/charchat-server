@@ -278,9 +278,30 @@ class CreationSaveResponse(FewshotsResponse):
     # 등급 필드 전에 기록된 요청키 응답을 재전송할 때는 컬럼 기본값으로 채운다.
     effective_rating: Rating = "SAFE"
     rating_review_status: RatingReviewStatus = "not_reviewed"
+    # CREATE-US-08-AC09~AC11: 마지막 검토가 적격이 아니었던 이유(허용 목록 코드만). 저장된 사유를
+    # 허용 목록으로 다시 검증해 맞을 때만 채우고, 없거나 알 수 없는 값(예전 자유 텍스트 포함)은
+    # null이다. 평가기 원문은 담지 않는다. 이 필드 전 응답을 재전송할 때도 null로 채운다.
+    rating_review_reason: "RatingReviewReason | None" = None
     # CREATE-US-08-AC13: 2~5번 임시 저장본이 등급 선택만 담았고 사진 임시 저장본이 없으면 true.
     # 이때만 `finalize_rating_working_copy_at`으로 반영할 수 있다. 이 필드 전 응답은 false로 채운다.
     rating_only_working_copy: bool = False
+
+
+class RatingReviewReason(BaseModel):
+    """검증된 미적격 판정의 종류와 사유 코드. 평가기 원문·자유 텍스트를 담지 않는다."""
+
+    outcome: Literal["ineligible", "undetermined", "unavailable"]
+    reasons: list[
+        Literal[
+            "underage_stated",
+            "minor_depicted",
+            "restricted_kinship",
+            "age_undetermined",
+            "kinship_undetermined",
+            "invalid_signals",
+            "evaluator_failure",
+        ]
+    ]
 
 
 class StagedCharacterImagesResponse(BaseModel):
