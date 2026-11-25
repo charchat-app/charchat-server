@@ -1,6 +1,7 @@
 """CHAT-US-02 응답 생성 진행·실패·재시도·롱 폴링."""
 
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
 
@@ -419,3 +420,50 @@ def test_chat_us_02_openai_stream_with_done_completes_and_is_billable(
     assert row["status"] == "completed"
     assert row["text"] == "@도경: 안녕"
     assert row["billable"] is True
+
+
+@pytest.mark.parametrize(
+    ("chunks", "visible"),
+    [
+        (["아직 끝나지 않은 답"], True),
+        ([""], False),
+        (["   "], False),
+        (["\ufeff"], False),  # JS trim은 BOM을 지운다.
+        (["@나레이터: \x1f"], True),  # JS trim은 이 제어 문자를 지우지 않는다.
+        (["@도경:\r\n@나레이터:\x85@Bea:\u2028\ufeff"], False),
+        ([" @도경:"], True),  # 태그는 trim 전 줄 맨 앞에서만 인식한다.
+        (["@새이름:"], True),  # 세션 시작 후 바뀐 원본 이름은 앱의 태그가 아니다.
+        (["@나레", "이터:"], False),
+        (["@도", "경: "], False),
+        (["@도", "경: 안녕", "\n@나레이터:"], True),
+        (["@모르는이:"], True),  # 알 수 없는 태그는 본문으로 표시한다.
+    ],
+)
+def test_chat_us_02_ac17_model_output_limit(
+    client, db, session, saved_story, monkeypatch, chunks, visible
+):
+    _, _, (first, _) = saved_story
+    db.execute("UPDATE characters SET name = '새이름' WHERE id = %s", (first,))
+    *prefix, last = chunks
+    events = [_delta(chunk) for chunk in prefix]
+    events.append(
+        json.dumps({"choices": [{"delta": {"content": last}, "finish_reason": "length"}]})
+    )
+    _use_openai_stream(monkeypatch, b"".join(_sse(*events, "[DONE]")))
+    generation = send(client, session, [user_part("계속 이야기해줘")]).json()["id"]
+    row = generation_row(db, generation)
+    assert row["error_code"] == "MODEL_OUTPUT_LIMIT"
+    assert row["text"] == "".join(chunks)
+    assert row["billable"] is visible
+    assert row["status"] == ("failed_partial" if visible else "failed")
+    assert row["message_status"] == ("interrupted" if visible else "failed")
+    poll = client.get(f"{GENERATIONS}/{generation}", headers=PLAYER).json()
+    assert poll["retryable"] is (not visible)
+    _use_openai_stream(monkeypatch, b"".join(_sse(_delta("다시 생성한 답"), "[DONE]")))
+    response = retry(client, generation)
+    if visible:
+        assert response.status_code == 409
+        assert response.json()["code"] == "GENERATION_NOT_RETRYABLE"
+    else:
+        assert response.status_code == 202
+        assert generation_row(db, response.json()["id"])["status"] == "completed"

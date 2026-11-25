@@ -9,7 +9,7 @@ from psycopg.errors import UniqueViolation
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.messaging import providers, repository, worker
-from app.features.conversation.messaging.parser import parse_assistant_text
+from app.features.conversation.messaging.parser import JS_TRIM_CHARS, parse_assistant_text
 from app.features.conversation.messaging.prompt import (
     PromptContext,
     PromptHistoryMessage,
@@ -453,6 +453,21 @@ def _fail(generation_id: int, streamed: int, code: str) -> None:
         repository.finish_generation(conn, generation_id, status, error_code=code)
 
 
+def _finish_output_limit(generation_id: int, session_character_names: list[str]) -> None:
+    with worker.connect() as conn, conn.transaction():
+        text = repository.get_full_text(conn, generation_id)
+        visible = bool(
+            parse_assistant_text(text, session_character_names, trim_chars=JS_TRIM_CHARS)
+        )
+        repository.finish_generation(
+            conn,
+            generation_id,
+            "failed_partial" if visible else "failed",
+            error_code=providers.MODEL_OUTPUT_LIMIT,
+            billable=visible,
+        )
+
+
 def _save_completed(generation_id: int, claimed) -> None:
     """파싱한 발화자별 부분을 assistant 메시지에 저장하고 생성·메시지를 completed로 바꾼다."""
     session_id = claimed["session_id"]
@@ -513,8 +528,12 @@ def _stream(generation_id: int, claimed) -> None:
         if not flush():
             return
     except providers.ProviderError as exc:
-        flush()
-        _fail(generation_id, streamed, exc.code)
+        if not flush():
+            return
+        if exc.code == providers.MODEL_OUTPUT_LIMIT:
+            _finish_output_limit(generation_id, context.session_character_names)
+        else:
+            _fail(generation_id, streamed, exc.code)
         return
     except Exception:
         logger.exception("응답 생성 공급자 오류: generation=%s", generation_id)

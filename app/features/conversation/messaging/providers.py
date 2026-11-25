@@ -21,6 +21,7 @@ FAIL_BEFORE_MARKER = "#fail-before"
 FAIL_AFTER_MARKER = "#fail-after"
 # 실제 호출을 지원하는 models.provider 값.
 SUPPORTED_PROVIDERS = ("openai",)
+MODEL_OUTPUT_LIMIT = "MODEL_OUTPUT_LIMIT"
 
 
 class ProviderError(Exception):
@@ -109,6 +110,9 @@ def iter_sse_content(lines: Iterable[bytes | str]) -> Iterator[str]:
             content = (choice.get("delta") or {}).get("content")
             if content:
                 yield content
+            if choice.get("finish_reason") == "length":
+                # 모델이 출력 한도에 도달한 경우. 전송 단절이나 정상 완료와 구분한다.
+                raise ProviderError(MODEL_OUTPUT_LIMIT)
             if choice.get("finish_reason"):
                 finished = True
     if not finished:
