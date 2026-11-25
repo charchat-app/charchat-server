@@ -67,13 +67,17 @@ from typing import Protocol
 
 import psycopg
 from psycopg.rows import dict_row
+from pydantic import ValidationError
 
 from app.features.creation.initial_state import service as initial_state
 from app.features.creation.save_visibility import repository
 from app.features.creation.save_visibility.review_verdict import (
+    AttributedVerdict,
     Eligibility,
     EligibilityReason,
     EligibilityVerdict,
+    ReviewTarget,
+    TargetKind,
     revalidated,
     unavailable,
 )
@@ -173,7 +177,9 @@ class ReviewEvaluator(Protocol):
     def evaluate(self, story_id: int, snapshot: ReviewSnapshot) -> EligibilityVerdict:
         """검증된 적격 판정만 통과다(`is_eligible`). 그 밖의 값·예외는 통과가 아니다.
 
-        조정기 잠금 밖에서 부른다.
+        조정기 잠금 밖에서 부른다. CREATE-US-08-AC09: 평가기가 선택적으로
+        `evaluate_attributed(story_id, snapshot) -> AttributedVerdict`도 주면 조정기는 그것을
+        대신 부른다(판정은 같고 사유 대상만 더해진다).
         """
 
 
@@ -211,6 +217,8 @@ class ReviewResult:
     reason: str | None
     # 검증된 적격 판정이었는가. 통과 지문은 이것이 참일 때만 쓴다.
     passed: bool = False
+    # CREATE-US-08-AC09 사유 대상. 판정 사유·검토 비교 내용에 묶인 것만 남는다(판정과 무관).
+    targets: frozenset = frozenset()
 
 
 def next_pass_digest(stored, namespace, story_id, snapshot, result: ReviewResult) -> str | None:
@@ -266,14 +274,211 @@ def reason_payload(text) -> dict | None:
     return {"outcome": verdict.outcome.value, "reasons": sorted(r.value for r in verdict.reasons)}
 
 
-def review_result(verdict) -> ReviewResult:
-    """평가기 반환값을 엄격히 다시 검증해 결과로 바꾼다. 잘못된 값은 실패(`invalid_signals`)다."""
-    checked = revalidated(EligibilityVerdict, verdict)
+_TARGET_CONTAINERS = (frozenset, set, tuple, list)
+
+
+def _checked_targets(fields: dict) -> frozenset:
+    """대상 붙은 판정의 대상을 하나씩 엄격히 다시 검증한다. 잘못된 대상·묶음은 뺀다."""
+    if fields.keys() - AttributedVerdict.model_fields.keys():
+        return frozenset()  # 계약 밖 필드(평가기 원문 등)가 섞인 대상 묶음은 믿지 않는다.
+    targets = fields.get("targets")
+    if type(targets) not in _TARGET_CONTAINERS:
+        return frozenset()
+    kept = set()
+    for item in targets:
+        checked = revalidated(ReviewTarget, item)
+        if checked is not None:
+            kept.add(checked)
+    return frozenset(kept)
+
+
+def split_verdict(value) -> tuple[EligibilityVerdict | None, frozenset]:
+    """평가기 반환값(판정 또는 대상 붙은 판정)을 엄격히 다시 검증해 (판정, 대상)으로 나눈다.
+
+    판정과 대상은 따로 검증한다. 판정이 잘못되면 (None, 빈 대상)이다. 대상 메타데이터가
+    잘못돼도 독립적으로 유효한 판정(강등 등)은 그대로 두고 잘못된 대상만 뺀다(CREATE-US-08-AC09).
+    대상은 판정에 쓰이지 않는다.
+    """
+    if isinstance(value, AttributedVerdict):
+        fields = vars(value)
+        checked = revalidated(EligibilityVerdict, fields.get("verdict"))
+        if checked is None:
+            return None, frozenset()
+        return checked, _checked_targets(fields)
+    return revalidated(EligibilityVerdict, value), frozenset()
+
+
+def tied_targets(verdict: EligibilityVerdict, targets, snapshot) -> frozenset:
+    """판정 사유와 검토 비교 내용(명단 인물)에 묶이는 대상만 남긴다. 묶을 수 없으면 뺀다."""
+    if snapshot is None or verdict.outcome not in (
+        Eligibility.INELIGIBLE,
+        Eligibility.UNDETERMINED,
+    ):
+        return frozenset()
+    roster = {person[0] for person in snapshot.characters}
+    return frozenset(
+        t
+        for t in targets
+        if t.reason in verdict.reasons and (t.character_id is None or t.character_id in roster)
+    )
+
+
+# --- CREATE-US-08-AC09 사유 대상 저장·조회 --------------------------------------------------------
+# 저장(stories.rating_review_targets, jsonb): 대상마다 사유 코드·종류·명단 인물 DB ID(유저 캐릭터는
+# null)만 두고 이름·원문은 두지 않는다. 결과를 쓴 요청 표·사유 코드·정본 내용 해시를 함께 둬, 조회할
+# 때 그 셋이 모두 지금 값과 같을 때만 대상을 낸다(대상을 모르는 이전 버전 작성기가 남긴 오래된
+# 대상은 사유만 남기고 뺀다). 예전 사유 컬럼(rating_review_reason)의 형식은 바꾸지 않는다.
+# 응답: 사유 코드·종류·표시 라벨(제작자가 쓴 인물 이름 또는 고정 역할 문구)만 싣는다.
+TARGETS_REVISION = 1
+MAX_TARGETS_BYTES = 16384  # DB 제약(stories_rating_review_targets_check)과 같다.
+USER_ROLE_LABEL = "유저"  # 유저 캐릭터(유저 슬롯) 고정 역할 문구
+_TARGETS_KEYS = frozenset({"v", "ticket", "reason", "content", "targets"})
+_TARGET_KEYS = frozenset({"reason", "kind", "character_id"})
+
+
+def encode_targets(story_id, snapshot: ReviewSnapshot, ticket: datetime, result) -> str | None:
+    """결과와 함께 쓸 대상 JSON. 대상이 없거나 크기를 넘으면 None(사유만 남는다)."""
+    if not result.targets or result.reason is None:
+        return None
+    items = sorted(
+        result.targets,
+        key=lambda t: (
+            t.reason.value,
+            t.kind.value,
+            -1 if t.character_id is None else t.character_id,
+        ),
+    )
+    document = {
+        "v": TARGETS_REVISION,
+        "ticket": ticket.isoformat(),
+        "reason": result.reason,
+        "content": content_digest(story_id, snapshot),
+        "targets": [
+            {"reason": t.reason.value, "kind": t.kind.value, "character_id": t.character_id}
+            for t in items
+        ],
+    }
+    text = json.dumps(document, separators=(",", ":"))
+    return text if len(text.encode()) <= MAX_TARGETS_BYTES else None
+
+
+def _bound_document(row):
+    """저장된 대상이 지금의 사유·요청 표에 묶이면 그 문서, 아니면 None."""
+    document = row.get("rating_review_targets")
+    ticket = row.get("rating_requested_at")
+    if (
+        type(document) is not dict
+        or document.keys() != _TARGETS_KEYS
+        or type(document["v"]) is not int
+        or document["v"] != TARGETS_REVISION
+        or type(document["reason"]) is not str
+        or document["reason"] != row["rating_review_reason"]
+        or type(document["ticket"]) is not str
+        or type(document["content"]) is not str
+        or type(document["targets"]) is not list
+        or ticket is None
+    ):
+        return None
+    try:
+        if datetime.fromisoformat(document["ticket"]) != ticket:
+            return None
+    except (ValueError, TypeError):
+        return None
+    return document
+
+
+_LINE_BREAKS = re.compile(r"[ \t\n\r]*[\t\n\r][ \t\n\r]*")
+# 앱 readTarget이 거부하는 제어 문자(C0·DEL·C1), 줄·문단 구분자, 양방향 제어.
+_UNSAFE_LABEL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f  ؜‎‏‪-‮⁦-⁩]")
+
+
+def display_name(name) -> str | None:
+    """명단 이름의 한 줄 라벨. 탭·LF·CR은 공백 하나로, 다른 제어 문자가 있으면 None."""
+    if type(name) is not str or "﻿" in name:
+        # FEFF는 앱 JS trim은 지우고 Python strip은 남겨 양쪽 라벨이 갈리므로 정규화 전에 거부한다.
+        return None
+    label = _LINE_BREAKS.sub(" ", name).strip()
+    if not label or _UNSAFE_LABEL_CHARS.search(label):
+        return None
+    return label
+
+
+def target_label(target: ReviewTarget, names: dict) -> str | None:
+    """표시 라벨. 명단에 없거나 유저·다른 인물과 구별되지 않으면 None(뺀다).
+
+    명단 원본 이름(저장값·해시 입력)은 바꾸지 않고 응답 라벨만 정규화한다.
+    """
+    if target.character_id is None:
+        return USER_ROLE_LABEL  # 계약상 인물 종류만 유저 캐릭터일 수 있다.
+    if target.character_id not in names:
+        return None
+    label = display_name(names[target.character_id])
+    if label is None or label == USER_ROLE_LABEL:
+        # 「유저」라는 명단 인물은 유저 캐릭터와 구별되지 않는다(관계 「유저 ↔ 유저」 포함).
+        return None
+    if any(
+        other_id != target.character_id and display_name(other) == label
+        for other_id, other in names.items()
+    ):
+        return None  # 정규화 뒤 같은 라벨인 다른 인물과 구별되지 않는다.
+    if target.kind is TargetKind.RELATIONSHIP:
+        return f"{USER_ROLE_LABEL} ↔ {label}"  # 출발·방향을 정하지 않은 쌍
+    return label
+
+
+def review_targets(connection, story_id, row) -> list[dict] | None:
+    """응답 대상 목록. 사유·요청 표·정본 내용에 묶이지 않으면 None, 묶이지 않는 항목은 뺀다."""
+    verdict = decode_reason(row["rating_review_reason"])
+    if verdict is None or row["rating_review_status"] != "completed":
+        return None
+    document = _bound_document(row)
+    if document is None:
+        return None
+    snapshot = capture_snapshot(connection, story_id)
+    if document["content"] != content_digest(story_id, snapshot):
+        return None
+    names = {person[0]: person[1] for person in snapshot.characters}
+    found = set()
+    for item in document["targets"]:
+        if type(item) is not dict or item.keys() != _TARGET_KEYS:
+            continue
+        try:
+            target = ReviewTarget.model_validate(item)
+        except (ValidationError, ValueError, TypeError):
+            continue
+        if target.reason not in verdict.reasons:
+            continue
+        label = target_label(target, names)
+        if label is not None:
+            found.add((target.reason.value, target.kind.value, label))
+    return [{"reason": r, "kind": k, "label": label} for r, k, label in sorted(found)] or None
+
+
+def reason_view(connection, story_id, row) -> dict | None:
+    """응답 `rating_review_reason`. 묶이는 대상이 있을 때만 `targets`를 더한다."""
+    payload = reason_payload(row["rating_review_reason"])
+    if payload is not None:
+        targets = review_targets(connection, story_id, row)
+        if targets:
+            payload["targets"] = targets
+    return payload
+
+
+def review_result(verdict, snapshot: ReviewSnapshot | None = None) -> ReviewResult:
+    """평가기 반환값을 엄격히 다시 검증해 결과로 바꾼다. 잘못된 값은 실패(`invalid_signals`)다.
+
+    CREATE-US-08-AC09: 대상 붙은 판정이면 `snapshot`에 묶이는 대상만 결과에 싣는다.
+    """
+    checked, targets = split_verdict(verdict)
     if checked is None:
         checked = unavailable(EligibilityReason.INVALID_SIGNALS)
     effective, status = _OUTCOME_TARGETS[checked.outcome]
     return ReviewResult(
-        effective, status, encode_reason(checked), checked.outcome is Eligibility.ELIGIBLE
+        effective,
+        status,
+        encode_reason(checked),
+        checked.outcome is Eligibility.ELIGIBLE,
+        tied_targets(checked, targets, snapshot),
     )
 
 
@@ -334,6 +539,8 @@ class DatabaseReviewResults:
                     next_pass_digest(
                         row["rating_pass_digest"], namespace, story_id, canonical, result
                     ),
+                    # CREATE-US-08-AC09: 같은 잠금·같은 UPDATE에서 정본 내용으로 만든 대상
+                    encode_targets(story_id, canonical, ticket, result),
                 )
 
 
@@ -583,9 +790,14 @@ class RatingReviewCoordinator:
                 return
             outcome = FAILURE
             try:
-                result = self._evaluator.evaluate(story_id, snapshot)
-                outcome = review_result(result)
-                checked = revalidated(EligibilityVerdict, result)
+                # CREATE-US-08-AC09: 대상을 함께 주는 평가기면 그것을 쓴다(판정은 같다).
+                attribute = getattr(self._evaluator, "evaluate_attributed", None)
+                if attribute is not None:
+                    result = attribute(story_id, snapshot)
+                else:
+                    result = self._evaluator.evaluate(story_id, snapshot)
+                outcome = review_result(result, snapshot)
+                checked = split_verdict(result)[0]
                 passed = checked is not None and checked.outcome is Eligibility.ELIGIBLE
                 if not passed:
                     # 검증된 판정의 종류·사유 코드만 남긴다. 잘못된 값은 필드·타입 이름도 읽지 않고

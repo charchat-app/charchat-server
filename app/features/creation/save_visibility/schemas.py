@@ -9,6 +9,7 @@ from pydantic import (
     ConfigDict,
     Field,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -302,6 +303,30 @@ class RatingReviewReason(BaseModel):
             "evaluator_failure",
         ]
     ]
+    # CREATE-US-08-AC09: 사유가 가리키는 인물·관계. 사유·검토 요청·지금 정본 내용에 묶이는 검증된
+    # 대상이 있을 때만 키가 있다(없으면 키 자체를 싣지 않아 예전 응답·영수증 모양과 같다).
+    targets: "list[RatingReviewTarget] | None" = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_targets(self, handler):
+        data = handler(self)
+        if self.targets is None:
+            data.pop("targets", None)
+        return data
+
+
+class RatingReviewTarget(BaseModel):
+    """사유 하나의 대상. 표시 라벨은 제작자가 쓴 인물 이름 또는 고정 역할 문구다(DB ID 없음)."""
+
+    reason: Literal[
+        "underage_stated",
+        "minor_depicted",
+        "restricted_kinship",
+        "age_undetermined",
+        "kinship_undetermined",
+    ]
+    kind: Literal["character", "relationship"]
+    label: str
 
 
 class StagedCharacterImagesResponse(BaseModel):
@@ -311,6 +336,7 @@ class StagedCharacterImagesResponse(BaseModel):
     images: list[ImageItem]
 
 
+RatingReviewReason.model_rebuild()
 CreationSaveResponse.model_rebuild()
 
 

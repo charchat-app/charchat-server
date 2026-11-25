@@ -33,9 +33,13 @@ def read_tag_names(connection, story_id):
 
 
 def read_rating(connection, story_id):
-    """CREATE-US-08 저장본 등급 선택·적용 등급·검토 상태·사유 코드."""
+    """CREATE-US-08 저장본 등급 선택·적용 등급·검토 상태·사유 코드.
+
+    AC09 사유 대상과 그것을 묶을 요청 표도 함께 읽는다(응답에는 검증한 뒤에만 싣는다).
+    """
     return connection.execute(
-        """SELECT requested_rating, effective_rating, rating_review_status, rating_review_reason
+        """SELECT requested_rating, effective_rating, rating_review_status, rating_review_reason,
+                  rating_review_targets, rating_requested_at
            FROM stories WHERE id=%s""",
         (story_id,),
     ).fetchone()
@@ -50,7 +54,7 @@ def mark_review_pending(connection, story_id):
     """검토 대기로 바꾸고 새 요청 표를 돌려준다. 적용 등급은 그대로 둔다(재검토 중 유지)."""
     return connection.execute(
         f"""UPDATE stories SET rating_review_status='reviewing', rating_review_reason=NULL,
-                rating_requested_at={_NEW_TICKET}
+                rating_review_targets=NULL, rating_requested_at={_NEW_TICKET}
             WHERE id=%s RETURNING rating_requested_at""",
         (story_id,),
     ).fetchone()["rating_requested_at"]
@@ -60,7 +64,7 @@ def mark_review_failed(connection, story_id, reason):
     """검토를 넘기지 못했다. 적용 등급은 그대로 두고 새 요청 표로 실패를 기록한다."""
     connection.execute(
         f"""UPDATE stories SET rating_review_status='failed', rating_review_reason=%s,
-                rating_requested_at={_NEW_TICKET}
+                rating_review_targets=NULL, rating_requested_at={_NEW_TICKET}
             WHERE id=%s""",
         (reason, story_id),
     )
@@ -78,10 +82,11 @@ def mark_rating_safe(connection, story_id):
     """
     connection.execute(
         """UPDATE stories SET effective_rating='SAFE', rating_review_status='not_reviewed',
-               rating_review_reason=NULL
+               rating_review_reason=NULL, rating_review_targets=NULL
            WHERE id=%s
-             AND (effective_rating, rating_review_status, rating_review_reason)
-                 IS DISTINCT FROM ('SAFE', 'not_reviewed', NULL)""",
+             AND (effective_rating, rating_review_status, rating_review_reason,
+                  rating_review_targets)
+                 IS DISTINCT FROM ('SAFE', 'not_reviewed', NULL, NULL::jsonb)""",
         (story_id,),
     )
 
@@ -94,7 +99,8 @@ def reuse_review_pass(connection, story_id, digest):
     """
     row = connection.execute(
         f"""UPDATE stories SET effective_rating='UNSAFE', rating_review_status='completed',
-                rating_review_reason=NULL, rating_requested_at={_NEW_TICKET}
+                rating_review_reason=NULL, rating_review_targets=NULL,
+                rating_requested_at={_NEW_TICKET}
             WHERE id=%s AND rating_pass_digest=%s AND requested_rating='UNSAFE'
               AND deleted_at IS NULL
             RETURNING rating_requested_at""",
@@ -114,12 +120,13 @@ def lock_review_target(connection, story_id):
 
 
 def apply_review_result(
-    connection, story_id, ticket, effective_rating, status, reason, pass_digest
+    connection, story_id, ticket, effective_rating, status, reason, pass_digest, targets=None
 ) -> bool:
     """요청 표가 그대로이고 UNSAFE 선택·검토 중·삭제되지 않았을 때만 결과를 쓴다.
 
     `effective_rating`이 None이면 적용 등급을 그대로 둔다. `pass_digest`는 같은 잠금 안에서
-    정한 통과 지문(그대로 두려면 읽은 값을 그대로 준다).
+    정한 통과 지문(그대로 두려면 읽은 값을 그대로 준다). `targets`는 같은 잠금 안에서 만든
+    CREATE-US-08-AC09 사유 대상 JSON 문자열(없으면 None으로 비운다)이며 결과와 같은 UPDATE에서 쓴다.
     결과 쓰기 트랜잭션 안에서 부른다. 같은 트랜잭션에 지문을 아는 작성기 표시를 둬, DB 트리거가
     이 쓰기를 이전 버전 작성기의 거부로 보고 지문을 비우지 않게 한다(CREATE-US-08-AC14).
     """
@@ -127,11 +134,12 @@ def apply_review_result(
     row = connection.execute(
         """UPDATE stories
            SET effective_rating=COALESCE(%s, effective_rating),
-               rating_review_status=%s, rating_review_reason=%s, rating_pass_digest=%s
+               rating_review_status=%s, rating_review_reason=%s, rating_pass_digest=%s,
+               rating_review_targets=%s::jsonb
            WHERE id=%s AND rating_requested_at=%s AND requested_rating='UNSAFE'
              AND rating_review_status='reviewing' AND deleted_at IS NULL
            RETURNING id""",
-        (effective_rating, status, reason, pass_digest, story_id, ticket),
+        (effective_rating, status, reason, pass_digest, targets, story_id, ticket),
     ).fetchone()
     return row is not None
 

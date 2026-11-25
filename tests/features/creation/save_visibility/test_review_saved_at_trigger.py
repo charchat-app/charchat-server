@@ -15,6 +15,7 @@ from tests.features.creation.speech_style.conftest import OWNER_ID, create_story
 MIGRATIONS = Path(__file__).resolve().parents[4] / "app/db/migrations"
 MIGRATION = MIGRATIONS / "create_us08_review_saved_at.sql"
 DIGEST_MIGRATION = MIGRATIONS / "create_us08_review_pass_digest.sql"
+TARGETS_MIGRATION = MIGRATIONS / "create_us08_review_targets.sql"
 
 # 이 수정 전 함수(saved_at을 늘 새로 쓴다). 마이그레이션이 기존 DB에서 고치는지 확인용.
 LEGACY_FUNCTION = """
@@ -50,6 +51,8 @@ REVIEW_ONLY = [
     "rating_review_reason='ineligible:underage_stated', rating_review_status='failed'",
     # CREATE-US-08-AC14 통과 지문도 검토 메타데이터다.
     f"rating_pass_digest='v1:fake-eval.v1:{'a' * 64}', rating_review_status='completed'",
+    # CREATE-US-08-AC09 사유 대상만 바뀐 UPDATE도 검토 메타데이터다.
+    """rating_review_targets='{"v": 1, "targets": []}'::jsonb""",
 ]
 
 ADVANCES = [
@@ -84,7 +87,7 @@ def test_review_metadata_only_change_keeps_saved_at_CREATE_US_08_AC03(db, assign
     update(db, story, assignments)
     assert saved_at(db, story) == before
     # 직접 saved_at을 써도 검토 메타데이터만 바뀌면 서버 저장 시각을 지킨다.
-    update(db, story, "rating_review_status='not_reviewed', saved_at=now() + interval '1 day'")
+    update(db, story, "rating_requested_at=clock_timestamp(), saved_at=now() + interval '1 day'")
     assert saved_at(db, story) == before
 
 
@@ -229,6 +232,64 @@ def test_digest_migration_refuses_unexpected_check_CREATE_US_08_AC14(db):
         db.execute(DIGEST_MIGRATION.read_text(encoding="utf-8"))
         db.execute(expected_function)
     assert digest_check(db) == expected_check
+
+
+# --- CREATE-US-08-AC09 사유 대상 컬럼 마이그레이션(정방향·재실행) ---
+
+TARGETS_CHECK = "stories_rating_review_targets_check"
+
+
+def targets_snapshot(db):
+    """대상 컬럼 정의와 제약 정의(없으면 None)."""
+    column = db.execute(
+        """SELECT data_type, is_nullable, column_default FROM information_schema.columns
+           WHERE table_schema='public' AND table_name='stories'
+             AND column_name='rating_review_targets'"""
+    ).fetchone()
+    check = db.execute(
+        """SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint
+           WHERE conrelid='public.stories'::regclass AND conname=%s""",
+        (TARGETS_CHECK,),
+    ).fetchone()
+    return column, check and check["d"]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        (TARGETS_MIGRATION,),
+        (TARGETS_MIGRATION, TARGETS_MIGRATION),
+        (MIGRATION, TARGETS_MIGRATION, DIGEST_MIGRATION),
+        (TARGETS_MIGRATION, MIGRATION, TARGETS_MIGRATION),
+    ],
+    ids=["forward", "replay", "saved-at-first", "targets-first-replay"],
+)
+def test_targets_migration_forward_and_rerun_match_schema_CREATE_US_08_AC09(db, order):
+    expected_function, expected_targets = function_definition(db), targets_snapshot(db)
+    assert expected_targets[0] is not None and expected_targets[1] is not None
+    try:
+        # 마이그레이션 전 기존 DB: 대상 컬럼이 없고 함수는 수정 전이다.
+        db.execute(f"ALTER TABLE stories DROP CONSTRAINT {TARGETS_CHECK}")
+        db.execute("ALTER TABLE stories DROP COLUMN rating_review_targets")
+        db.execute(LEGACY_FUNCTION)
+        assert targets_snapshot(db) == (None, None)
+        for migration in order:
+            db.execute(migration.read_text(encoding="utf-8"))
+        assert function_definition(db) == expected_function
+        assert targets_snapshot(db) == expected_targets
+        story = create_story(db)
+        before = saved_at(db, story)
+        update(db, story, """rating_review_targets='{"v": 1, "targets": []}'::jsonb""")
+        assert saved_at(db, story) == before  # 대상만 바뀌면 저장 시각을 지킨다.
+        with pytest.raises(psycopg.errors.CheckViolation):
+            update(db, story, "rating_review_targets='[]'::jsonb")
+    finally:
+        if db.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+            db.execute("ROLLBACK")
+        db.execute(TARGETS_MIGRATION.read_text(encoding="utf-8"))
+        db.execute(expected_function)
+    assert function_definition(db) == expected_function
+    assert targets_snapshot(db) == expected_targets
 
 
 # --- CREATE-US-08-AC14 이전 버전 작성기 거부 완료 방어 ---

@@ -25,6 +25,7 @@ from typing import Protocol
 from app.features.creation.save_visibility.review_verdict import (
     CONFIRMED,
     AgeContext,
+    AttributedVerdict,
     CharacterSignals,
     Eligibility,
     EligibilityReason,
@@ -32,7 +33,9 @@ from app.features.creation.save_visibility.review_verdict import (
     EligibilityVerdict,
     Kinship,
     MinorDepiction,
-    decide_eligibility,
+    ReviewTarget,
+    TargetKind,
+    decide_attributed,
     unavailable,
 )
 
@@ -397,27 +400,54 @@ class JevDecisionsEvaluator:
 
     def evaluate(self, story_id, snapshot) -> EligibilityVerdict:
         """스토리 ID는 보내지 않는다. 예외를 내지 않고 실패는 `unavailable`로 돌려준다."""
+        return self.evaluate_attributed(story_id, snapshot).verdict
+
+    def evaluate_attributed(self, story_id, snapshot) -> AttributedVerdict:
+        """`evaluate`와 같은 판정에 CREATE-US-08-AC09 사유 대상을 더한다(요청은 한 번).
+
+        대상은 검증된 인물별 신호와 유저 캐릭터 신호에서만 만든다. 실패는 대상이 없다.
+        """
         plan = build_plan(snapshot)
         if plan is None:
-            return unavailable(R.INVALID_SIGNALS)
+            return _failed(R.INVALID_SIGNALS)
         request = DecisionsRequest(ENDPOINT, plan.body, MAX_RESPONSE_BYTES)
         try:
             reply = self._transport.send(request)
         except Exception:
-            return unavailable(R.EVALUATOR_FAILURE)
+            return _failed(R.EVALUATOR_FAILURE)
         if (
             type(reply) is not DecisionsReply
             or type(reply.status) is not int
             or type(reply.body) is not bytes
         ):
-            return unavailable(R.INVALID_SIGNALS)
+            return _failed(R.INVALID_SIGNALS)
         if reply.status != 200:
-            return unavailable(R.EVALUATOR_FAILURE)
+            return _failed(R.EVALUATOR_FAILURE)
         try:
             picked = parse_answers(reply.body, plan.choices)
         except _ProviderError:
-            return unavailable(R.EVALUATOR_FAILURE)
+            return _failed(R.EVALUATOR_FAILURE)
         except _Malformed:
-            return unavailable(R.INVALID_SIGNALS)
-        verdict = decide_eligibility(snapshot, _signals(plan, picked))
-        return with_user_character(verdict, picked[USER_CHARACTER_QUESTION])
+            return _failed(R.INVALID_SIGNALS)
+        attributed = decide_attributed(snapshot, _signals(plan, picked))
+        return with_user_character_targets(attributed, picked[USER_CHARACTER_QUESTION])
+
+
+def _failed(reason) -> AttributedVerdict:
+    return AttributedVerdict(verdict=unavailable(reason))
+
+
+def with_user_character_targets(attributed: AttributedVerdict, choice: str) -> AttributedVerdict:
+    """`with_user_character`와 같은 판정에 유저 캐릭터(고정 역할) 대상을 더한다."""
+    verdict = with_user_character(attributed.verdict, choice)
+    if verdict.outcome is Eligibility.UNAVAILABLE:
+        return AttributedVerdict(verdict=verdict)
+    extra = (
+        frozenset(
+            ReviewTarget(reason=reason, kind=TargetKind.CHARACTER, character_id=None)
+            for reason in _USER_CHARACTER[choice][0]
+        )
+        if verdict.outcome is not Eligibility.ELIGIBLE
+        else frozenset()
+    )
+    return AttributedVerdict(verdict=verdict, targets=attributed.targets | extra)

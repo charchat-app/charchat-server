@@ -61,13 +61,14 @@ def rating_fields(connection, story_id, staged_rating=None) -> dict:
 
     적용 등급·검토 상태는 언제나 저장본 값이다. 사유는 허용 목록으로 다시 검증한 코드만
     내보내고, 맞지 않는 저장값(예전 자유 텍스트 등)은 null로 둔다(CREATE-US-08-AC09~AC11).
+    AC09 사유 대상은 사유·요청 표·정본 내용에 다시 묶일 때만 `targets`로 더한다.
     """
     row = repository.read_rating(connection, story_id)
     return {
         "requested_rating": staged_rating or row["requested_rating"],
         "effective_rating": row["effective_rating"],
         "rating_review_status": row["rating_review_status"],
-        "rating_review_reason": rating_review.reason_payload(row["rating_review_reason"]),
+        "rating_review_reason": rating_review.reason_view(connection, story_id, row),
     }
 
 

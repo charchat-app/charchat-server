@@ -1,6 +1,7 @@
 """CREATE-US-08-AC04~AC08·AC15 내부 판정 계약.
 
-평가기가 이미 분류한 인물별 신호만 받아 서버 규칙으로 적격 여부를 정한다. 신호 추출(공급자
+평가기가 이미 분류한 인물별 신호만 받아 서버 규칙으로 적격 여부를 정한다(AC09 사유 대상도 같은
+신호에서 만든다). 신호 추출(공급자
 호출·프롬프트)과 저장·API 반영은 이 모듈의 범위가 아니다. 신호와 판정에는 원문을 담지 않는다.
 잘못되거나 검증을 건너뛴 값은 어떤 경우에도 승인으로 보지 않는다.
 """
@@ -184,6 +185,81 @@ def eligibility_from_output(snapshot: "ReviewSnapshot", output) -> EligibilityVe
     except (ValidationError, ValueError, TypeError):
         return unavailable(R.INVALID_SIGNALS)
     return _decide(snapshot, signals)  # 방금 검증했으므로 다시 파싱하지 않는다.
+
+
+# --- CREATE-US-08-AC09 검증된 사유 대상 -----------------------------------------------------------
+# 판정(적격 여부)은 위 규칙 그대로다. 대상은 같은 인물별 신호에서 같은 규칙
+# (`_character_reasons`)으로 만든 부가 정보이며 판정을 바꾸지 않는다. 원문·평가기 출력은
+# 담지 않는다.
+
+AGE_REASONS = frozenset({R.UNDERAGE_STATED, R.MINOR_DEPICTED, R.AGE_UNDETERMINED})
+KINSHIP_REASONS = frozenset({R.RESTRICTED_KINSHIP, R.KINSHIP_UNDETERMINED})
+
+
+class TargetKind(StrEnum):
+    CHARACTER = "character"
+    # 유저 ↔ 명단 인물 한 쌍. 혈연 신호는 계약상 늘 이 쌍이다(출발·방향은 정하지 않는다).
+    RELATIONSHIP = "relationship"
+
+
+class ReviewTarget(BaseModel):
+    """사유 하나가 가리키는 대상.
+
+    `character_id`는 명단 인물 DB ID(내부 전용), None은 유저 캐릭터다.
+    """
+
+    model_config = _STRICT
+
+    reason: EligibilityReason
+    kind: TargetKind
+    character_id: StrictInt | None
+
+    @model_validator(mode="after")
+    def _consistent(self):
+        if self.kind is TargetKind.CHARACTER:
+            valid = self.reason in AGE_REASONS
+        else:
+            valid = self.reason in KINSHIP_REASONS and self.character_id is not None
+        if not valid:
+            raise ValueError("대상 종류와 사유가 맞지 않는다")
+        return self
+
+
+class AttributedVerdict(BaseModel):
+    """판정과 그 사유의 대상. 대상은 판정에 쓰이지 않는다(검증 실패 시 버려도 판정은 같다)."""
+
+    model_config = _STRICT
+
+    verdict: EligibilityVerdict
+    targets: frozenset[ReviewTarget] = frozenset()
+
+
+def _targets(signals: EligibilitySignals) -> frozenset[ReviewTarget]:
+    """검증을 마친 신호만 받는다."""
+    return frozenset(
+        ReviewTarget(
+            reason=reason,
+            kind=TargetKind.RELATIONSHIP if reason in KINSHIP_REASONS else TargetKind.CHARACTER,
+            character_id=c.character_id,
+        )
+        for c in signals.characters
+        for reason in _character_reasons(c)
+    )
+
+
+def _attributed(snapshot: "ReviewSnapshot", signals: EligibilitySignals) -> AttributedVerdict:
+    verdict = _decide(snapshot, signals)
+    if verdict.outcome not in (Eligibility.INELIGIBLE, Eligibility.UNDETERMINED):
+        return AttributedVerdict(verdict=verdict)
+    return AttributedVerdict(verdict=verdict, targets=_targets(signals))
+
+
+def decide_attributed(snapshot: "ReviewSnapshot", signals: EligibilitySignals) -> AttributedVerdict:
+    """`decide_eligibility`와 같은 판정에 인물별 대상을 더한다(판정 규칙은 그대로)."""
+    checked = revalidated(EligibilitySignals, signals)
+    if checked is None:
+        return AttributedVerdict(verdict=unavailable(R.INVALID_SIGNALS))
+    return _attributed(snapshot, checked)
 
 
 def is_eligible(value) -> bool:

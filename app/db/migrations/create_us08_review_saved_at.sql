@@ -3,7 +3,8 @@
 -- create_us08_story_rating.sql과 순서 무관: 컬럼 이름을 jsonb 키로만 비교한다). 재실행해도 같은
 -- 결과다. 함수 본문은 app/db/schema.sql의 enforce_story_lifecycle()과 같아야 한다.
 -- create_us08_review_pass_digest.sql도 같은 본문(통과 지문 키·이전 버전 거부 방어 포함)을 쓰므로 두
--- 파일은 순서·재실행과 무관하게 같은 함수를 남긴다. 한쪽 본문을 바꾸면 다른 쪽과 schema.sql도 함께
+-- 파일은 순서·재실행과 무관하게 같은 함수를 남긴다(create_us08_review_targets.sql도 같은 본문이며
+-- 사유 대상 키를 검토 메타데이터로 본다). 한쪽 본문을 바꾸면 다른 쪽과 schema.sql도 함께
 -- 바꾼다. 지문 컬럼이 없는 DB에서는 지문 키·방어가 아무것도 하지 않는다(jsonb 키 비교).
 -- 삭제·복구·소유자 변경·상태 전환 금지는 그대로 두고 saved_at 갱신 조건과, 지문을 모르는 작성기의
 -- 거부 완료 때 같은 지문 비우기(CREATE-US-08-AC14)만 더한다.
@@ -24,7 +25,7 @@ RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     review_keys CONSTANT text[] := ARRAY[
         'effective_rating', 'rating_review_status', 'rating_review_reason',
-        'rating_requested_at', 'rating_pass_digest', 'saved_at'];
+        'rating_requested_at', 'rating_pass_digest', 'rating_review_targets', 'saved_at'];
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'Stories must be soft deleted and retained indefinitely'

@@ -7,6 +7,7 @@
 --    saved_at 파일은 같은 함수 본문(app/db/schema.sql의 enforce_story_lifecycle()과 같음)을 쓰고,
 --    본문은 컬럼 이름을 jsonb 키로만 보므로 등급·지문 컬럼이 아직 없어도 동작한다. 이 파일은
 --    컬럼·제약과 함수를 한 트랜잭션에서 맞추므로 지문 컬럼이 보이는 순간 함수도 맞춰져 있다.
+--    사유 대상 마이그레이션(create_us08_review_targets.sql)도 같은 본문을 쓰며 순서 무관하다.
 -- 2. 이전 버전 API(지문을 모름)는 적용 뒤에도 계속 돌 수 있다. 그 작성기가 검토 중을 거부(SAFE·완료)로
 --    바꾸며 지문을 그대로 두면 함수가 지문을 비운다(지문을 아는 작성기는 트랜잭션 표시
 --    charchat.rating_pass_digest_writer='v1'을 둔다). 이전 버전이 남긴 거부 뒤에 같은 내용이
@@ -71,7 +72,7 @@ RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     review_keys CONSTANT text[] := ARRAY[
         'effective_rating', 'rating_review_status', 'rating_review_reason',
-        'rating_requested_at', 'rating_pass_digest', 'saved_at'];
+        'rating_requested_at', 'rating_pass_digest', 'rating_review_targets', 'saved_at'];
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'Stories must be soft deleted and retained indefinitely'

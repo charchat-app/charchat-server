@@ -38,18 +38,18 @@ CREATE TABLE stories (
 -- deleted_at은 공개 범위와 별개다. 소프트 삭제 시 자식/세션/이미지 연결을 유지한다.
 
 -- CREATE-US-07: 허용 상태 전환과 복구/물리 삭제 금지를 DB에서도 지키는 구현 제안.
--- CREATE-US-08: 검토 메타데이터(적용 등급·검토 상태·사유·요청 표·통과 지문)만 실제로 바뀐 UPDATE는 저장본
+-- CREATE-US-08: 검토 메타데이터(적용 등급·검토 상태·사유·요청 표·통과 지문·사유 대상)만 실제로 바뀐 UPDATE는 저장본
 -- 편집이 아니므로 saved_at을 그대로 둔다(자동 저장 영수증·응답 saved_at 보존). 같은 값 touch,
 -- 제작자 선택(requested_rating)·다른 필드가 바뀐 UPDATE는 saved_at을 새로 쓴다. 컬럼 이름을 jsonb
 -- 키로만 비교하므로 등급 컬럼이 없는 DB에도 적용된다. 기존 DB 적용용 초안:
--- app/db/migrations/create_us08_review_saved_at.sql, create_us08_review_pass_digest.sql
--- (두 파일의 함수 본문은 모두 이 정의와 같아야 한다)
+-- app/db/migrations/create_us08_review_saved_at.sql, create_us08_review_pass_digest.sql,
+-- create_us08_review_targets.sql (세 파일의 함수 본문은 모두 이 정의와 같아야 한다)
 CREATE FUNCTION enforce_story_lifecycle()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     review_keys CONSTANT text[] := ARRAY[
         'effective_rating', 'rating_review_status', 'rating_review_reason',
-        'rating_requested_at', 'rating_pass_digest', 'saved_at'];
+        'rating_requested_at', 'rating_pass_digest', 'rating_review_targets', 'saved_at'];
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'Stories must be soft deleted and retained indefinitely'
@@ -686,6 +686,16 @@ ALTER TABLE stories
     ADD COLUMN rating_pass_digest text,
     ADD CONSTRAINT stories_rating_pass_digest_check
         CHECK (rating_pass_digest ~ '^v[0-9]{1,9}:[a-z0-9][a-z0-9._-]{0,63}:[0-9a-f]{64}$');
+
+-- CREATE-US-08-AC09 검증된 사유 대상. 원문·이름 없이 사유 코드·종류·명단 인물 ID와, 그 결과를 쓴
+-- 요청 표·사유·정본 내용 해시만 둔다. 결과 쓰기와 같은 UPDATE에서 쓰고 새 검토 요청·실패·SAFE
+-- 확정·통과 재사용에서 비운다. 조회는 요청 표·사유·정본 내용이 지금과 같을 때만 대상을 낸다.
+-- 기존 DB 적용용 초안: app/db/migrations/create_us08_review_targets.sql
+ALTER TABLE stories
+    ADD COLUMN rating_review_targets jsonb,
+    ADD CONSTRAINT stories_rating_review_targets_check
+        CHECK (jsonb_typeof(rating_review_targets) = 'object'
+               AND octet_length(rating_review_targets::text) <= 16384);
 
 
 -- CHAT-US-02 (KAN-17) 팀 승인 DDL(2026-11-20 공용 DB 적용, Confluence 3047447) 그대로.

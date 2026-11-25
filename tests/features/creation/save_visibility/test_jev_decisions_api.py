@@ -74,7 +74,11 @@ def test_underage_reply_downgrades_with_reason_CREATE_US_08_AC04_AC09(jev):
     assert rating_view(ctx) == (
         "SAFE",
         "completed",
-        {"outcome": "ineligible", "reasons": ["underage_stated"]},
+        {
+            "outcome": "ineligible",
+            "reasons": ["underage_stated"],
+            "targets": [{"reason": "underage_stated", "kind": "character", "label": "하린"}],
+        },
     )
 
 
