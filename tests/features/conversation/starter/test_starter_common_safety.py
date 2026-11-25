@@ -367,3 +367,51 @@ def test_start_fails_closed_if_changed_between_preflight_and_save_CREATE_US_08_A
         created = start(client, story)
     assert created.status_code == 404
     assert session_count(db) == 0
+
+
+# --- 세션 유래 표식(session_origin) ---------------------------------------------------------
+
+
+def test_session_surfaces_are_marked_session_origin_CREATE_US_08_AC15(db, db_url, story):
+    """관람 미리보기만 정본 판정이고, 시작 사전 판정(입력 오류 포함)·세션 조회는 세션 유래다."""
+    guard = FakeGuard()
+    with guarded(db_url, guard) as client:
+        assert client.get(f"{STORIES}/{story['id']}", headers=PLAYER).status_code == 200
+        invalid = client.post(
+            f"{STORIES}/{story['id']}/sessions",
+            headers=PLAYER,
+            json={
+                "intro_id": story["intro"] + 999,
+                "profile_kind": "preset",
+                "profile_id": 1,
+                "play_name": "",
+            },
+        )
+        assert invalid.status_code == 422
+        created = start(client, story)
+        assert created.status_code == 201, created.text
+        assert client.get(f"{SESSIONS}/{created.json()['id']}", headers=PLAYER).status_code == 200
+    view, invalid_preflight, preflight, session = guard.surfaces
+    assert view.session_origin is False
+    assert invalid_preflight.session_origin is True
+    assert invalid_preflight.bound_intro == () and invalid_preflight.bound_play_name is None
+    assert preflight.session_origin is True
+    assert session.session_origin is True
+
+
+def test_creator_presets_are_judged_on_every_canonical_surface_CREATE_US_08_AC15(db, db_url, story):
+    """관람·시작·세션 조회 모두 같은 스냅숏의 제작자 프리셋을 정본으로 판정한다."""
+    image = db.execute("SELECT id FROM images LIMIT 1").fetchone()["id"]
+    db.execute(
+        "INSERT INTO user_profiles (owner_id, name, image_id, description) VALUES (2, %s, %s, %s)",
+        (PERSONAL_SENTINEL, image, PERSONAL_SENTINEL),
+    )
+    guard = FakeGuard()
+    with guarded(db_url, guard) as client:
+        client.get(f"{STORIES}/{story['id']}", headers=PLAYER)
+        created = start(client, story)
+        client.get(f"{SESSIONS}/{created.json()['id']}", headers=PLAYER)
+    assert len(guard.surfaces) == 3
+    for surface in guard.surfaces:
+        assert surface.bound_profiles == (SafetyProfile(name="{{user}}", description="Preset"),)
+    assert not any(PERSONAL_SENTINEL in text for text in guard.texts())

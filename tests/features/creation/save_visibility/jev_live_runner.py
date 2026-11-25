@@ -1,7 +1,12 @@
 """CREATE-US-08-AC02·AC04 Jev 실제 호출 개발자 스모크 러너.
 
 pytest 수집 대상이 아니며 CI에서 실행하지 않는다.
-사용: `python -m tests.features.creation.save_visibility.jev_live_runner`
+사용: `python -m tests.features.creation.save_visibility.jev_live_runner [--story-safety]`
+- 인자 없음(기본): CREATE-US-08-AC02·AC04 등급 검토 스모크(기존 동작 그대로).
+- `--story-safety`: CREATE-US-08-AC15 스토리 공통 안전 후보의 관람 미리보기 1회 스모크.
+  같은 고정 자식 모듈·일회용 DB·DSN 격리·정리를 그대로 쓰고, 자식에 모드 하나만 넘긴다.
+  자식은 대상 확인을 마친 연결 객체 하나로 스키마·시드·앱 요청 커넥션을 모두 처리하고,
+  보내기 전에 요청 전체를 고정 기대 요청과 비교한다.
 실행 셸에 `OPENROUTER_API_KEY`를 명시적으로 넣는다(`.env`를 읽지 않는다).
 
 부모(`app`을 import하지 않음)
@@ -87,6 +92,14 @@ ENV_DSN = "CHARCHAT_JEV_SMOKE_DSN"
 ENV_DBNAME = "CHARCHAT_JEV_SMOKE_DBNAME"
 ENV_MARKER = "CHARCHAT_JEV_SMOKE_MARKER"
 ENV_KEY = "OPENROUTER_API_KEY"
+MODE_RATING = "rating"
+MODE_STORY_SAFETY = "story_safety"
+# 모드마다 고정 자식 argv(모듈은 `MODULE` 하나로 고정).
+_CHILD_ARGS = {MODE_RATING: ("--child",), MODE_STORY_SAFETY: ("--child", "--story-safety")}
+_PARENT_ARGV = {(): MODE_RATING, ("--story-safety",): MODE_STORY_SAFETY}
+_CHILD_ARGV = {args: mode for mode, args in _CHILD_ARGS.items()}
+# 스토리 공통 안전 모드의 증거 줄에 싣는 기록 키(원문·응답은 싣지 않는다).
+EVIDENCE_KEYS = ("posts", "status", "elapsed_ms", "transport", "outcome")
 
 
 class Refused(Exception):
@@ -103,6 +116,11 @@ class DockerTimeout(Stage):
 
 def status(**fields):
     return f"{PREFIX} " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+
+def evidence(record):
+    """기록에서 허용 키만 골라 `status` 한 줄로 만든다. 값 형식은 `sanitize`가 다시 거른다."""
+    return status(**{key: record[key] for key in EVIDENCE_KEYS if key in record})
 
 
 # --- 출력 정화 -----------------------------------------------------------------
@@ -380,12 +398,16 @@ def _inspect(cid, fmt, *, docker_, env, stage):
 def parent_main(
     environ=None,
     *,
+    mode=MODE_RATING,
     docker_=docker,
     run_child_=run_child,
     out=print,
     clock=time.monotonic,
     sleep=time.sleep,
 ):
+    if mode not in _CHILD_ARGS:
+        out(status(result="failed", reason="usage"))
+        return 2
     environ = os.environ if environ is None else environ
     key = environ.get(ENV_KEY)
     if not key:
@@ -492,7 +514,7 @@ def parent_main(
         env = child_env(environ, dsn=dsn, dbname=dbname, marker=marker, key=key)
         with tempfile.TemporaryDirectory(prefix="jev-smoke-") as cwd:  # .env 없는 빈 폴더
             returncode, lines = run_child_(
-                [sys.executable, "-m", MODULE, "--child"],
+                [sys.executable, "-m", MODULE, *_CHILD_ARGS[mode]],
                 env=env,
                 cwd=cwd,
                 timeout=CHILD_TIMEOUT_SECONDS,
@@ -548,8 +570,41 @@ def verify_target(connection, dbname, marker):
         raise Refused
 
 
-def child_main(environ=None, *, out=print):
+# 모드별 스모크 적재기: import만 하고 `run(target, transport, out) -> check`를 돌려준다.
+# 기본(등급) 모드의 `target`은 DSN이고, 스토리 공통 안전 모드는 확인을 마친 연결 객체다.
+def _rating_smoke():
+    from tests.features.creation.save_visibility.test_jev_live_smoke import (
+        assert_approved,
+        run_smoke,
+    )
+
+    def run(dsn, transport, out):
+        result = run_smoke(dsn, transport)
+        return lambda: assert_approved(*result)
+
+    return run
+
+
+def _story_safety_smoke():
+    from tests.features.creation.save_visibility.jev_story_safety_live import (
+        assert_viewer_clear,
+        run_viewer_smoke,
+    )
+
+    def run(connection, transport, out):
+        record, view_status = run_viewer_smoke(connection, transport)
+        out(evidence(record))  # 허용 키 값만. 부모가 `sanitize`로 다시 거른다.
+        return lambda: assert_viewer_clear(record, view_status)
+
+    return run
+
+
+_SMOKES = {MODE_RATING: _rating_smoke, MODE_STORY_SAFETY: _story_safety_smoke}
+
+
+def child_main(environ=None, *, mode=MODE_RATING, out=print):
     import logging
+    from contextlib import ExitStack
 
     logging.disable(logging.CRITICAL)
     environ = os.environ if environ is None else environ
@@ -557,32 +612,42 @@ def child_main(environ=None, *, out=print):
     try:
         dsn, dbname, marker = environ[ENV_DSN], environ[ENV_DBNAME], environ[ENV_MARKER]
         key = environ[ENV_KEY]
+        load_smoke = _SMOKES[mode]  # 알 수 없는 모드는 쓰기 전에 멈춘다.
 
         stage = "dsn"
         check_loopback_dsn(dsn)
 
         import psycopg
+        from psycopg.rows import dict_row
 
         stage = "verify"
-        with psycopg.connect(dsn, autocommit=True) as connection:
+        with ExitStack() as stack:
+            connection = stack.enter_context(psycopg.connect(dsn, autocommit=True))
             verify_target(connection, dbname, marker)
             stage = "schema"
             connection.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+            if mode == MODE_RATING:
+                stack.close()  # 기본 모드는 기존대로 연결을 닫고 DSN으로 스모크한다.
+                target = dsn
+            else:
+                # 확인한 같은 연결 객체를 시드·앱 요청 커넥션까지 그대로 쓴다(재연결 없음).
+                connection.row_factory = dict_row
+                target = connection
 
-        stage = "import"
-        from tests.features.creation.save_visibility.jev_http_transport import JevHttpTransport
-        from tests.features.creation.save_visibility.test_jev_live_smoke import (
-            assert_approved,
-            run_smoke,
-        )
+            stage = "import"
+            from tests.features.creation.save_visibility.jev_http_transport import (
+                JevHttpTransport,
+            )
 
-        stage = "transport"
-        transport = JevHttpTransport(key)
-        del key
-        stage = "smoke"
-        result = run_smoke(dsn, transport)
-        stage = "assert"
-        assert_approved(*result)
+            smoke = load_smoke()
+
+            stage = "transport"
+            transport = JevHttpTransport(key)
+            del key
+            stage = "smoke"
+            check = smoke(target, transport, out)
+            stage = "assert"
+            check()
     except BaseException as error:  # 원문·트레이스백 없이 단계만 알린다.
         if isinstance(error, KeyboardInterrupt):
             raise
@@ -593,13 +658,13 @@ def child_main(environ=None, *, out=print):
 
 
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    if argv == ["--child"]:
-        return child_main()
-    if argv:
-        print(status(result="failed", reason="usage"))
-        return 2
-    return parent_main()
+    argv = tuple(sys.argv[1:] if argv is None else argv)
+    if argv in _CHILD_ARGV:
+        return child_main(mode=_CHILD_ARGV[argv])
+    if argv in _PARENT_ARGV:
+        return parent_main(mode=_PARENT_ARGV[argv])
+    print(status(result="failed", reason="usage"))
+    return 2
 
 
 if __name__ == "__main__":

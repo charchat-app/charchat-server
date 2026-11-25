@@ -87,10 +87,13 @@ class SafetySurface:
     bound_intro: tuple[SafetyMessage, ...] = ()
     # 세션 조회 응답에 나가는 세션 캐릭터 이름 스냅숏.
     bound_character_names: tuple[str, ...] = ()
-    # 관람 응답 profiles에 나가는 제작자 프리셋 이름·설명(관람자 개인 프로필은 제외).
+    # 같은 스냅숏의 제작자 프리셋 이름·설명 정본 전체(모든 판정 면에서 읽는다).
+    # 플레이어 개인 프로필은 제작자 정본이 아니므로 넣지 않는다.
     bound_profiles: tuple[SafetyProfile, ...] = ()
     # 세션 시작·조회 응답에 묶이는 실제 플레이 이름(재시도·조회는 저장된 값).
     bound_play_name: str | None = None
+    # 세션 유래 판정(대화 시작 사전 판정·세션 조회)인가. 입력 오류로 바인딩 값이 없어도 True다.
+    session_origin: bool = False
 
 
 CommonSafetyGuard = Callable[[SafetySurface], CommonSafety]
@@ -132,13 +135,15 @@ def read_story_surface(
     *,
     bound_intro: tuple[SafetyMessage, ...] = (),
     bound_character_names: tuple[str, ...] = (),
-    bound_profiles: tuple[SafetyProfile, ...] = (),
     bound_play_name: str | None = None,
+    session_origin: bool = False,
 ) -> SafetySurface | None:
     """저장본 정본 텍스트를 읽는다. 호출자의 트랜잭션(스냅숏·잠금)을 그대로 쓴다.
 
     공개 범위·삭제 여부는 보지 않는다. 접근 판단은 호출 기능이 먼저 한다.
     임시 저장본(working copy)은 관람자에게 나가지 않으므로 읽지 않는다.
+    관계는 null이 아닌 양 끝이 모두 이 스토리의 캐릭터일 때만 읽고, null 끝은 `{{user}}`로 둔다.
+    제작자 프리셋은 응답 노출 여부와 무관하게 전부 읽고, 개인 프로필은 읽지 않는다.
     """
     story = conn.execute(
         "SELECT title, subtitle, world_description FROM stories WHERE id = %s", (story_id,)
@@ -159,9 +164,16 @@ def read_story_surface(
            FROM character_initial_relationships r
            LEFT JOIN characters src ON src.id = r.source_character_id
            LEFT JOIN characters dst ON dst.id = r.target_character_id
-           WHERE src.story_id = %s OR dst.story_id = %s
+           WHERE (r.source_character_id IS NOT NULL OR r.target_character_id IS NOT NULL)
+             AND (r.source_character_id IS NULL OR src.story_id = %s)
+             AND (r.target_character_id IS NULL OR dst.story_id = %s)
            ORDER BY r.id""",
         (USER_SLOT, USER_SLOT, story_id, story_id),
+    ).fetchall()
+    presets = conn.execute(
+        """SELECT name, description FROM story_user_presets
+           WHERE story_id = %s ORDER BY position, id""",
+        (story_id,),
     ).fetchall()
     intros = conn.execute(
         "SELECT id, title FROM intros WHERE story_id = %s ORDER BY position, id", (story_id,)
@@ -195,8 +207,12 @@ def read_story_surface(
         ),
         bound_intro=bound_intro,
         bound_character_names=bound_character_names,
-        bound_profiles=bound_profiles,
+        bound_profiles=tuple(
+            SafetyProfile(name=row["name"] or "", description=row["description"] or "")
+            for row in presets
+        ),
         bound_play_name=bound_play_name,
+        session_origin=session_origin,
     )
 
 
@@ -207,8 +223,8 @@ def story_is_clear(
     *,
     bound_intro: tuple[SafetyMessage, ...] = (),
     bound_character_names: tuple[str, ...] = (),
-    bound_profiles: tuple[SafetyProfile, ...] = (),
     bound_play_name: str | None = None,
+    session_origin: bool = False,
 ) -> bool:
     """정본을 읽어 판정한다. 정본이 없으면 제공하지 않는다."""
     surface = read_story_surface(
@@ -216,7 +232,7 @@ def story_is_clear(
         story_id,
         bound_intro=bound_intro,
         bound_character_names=bound_character_names,
-        bound_profiles=bound_profiles,
         bound_play_name=bound_play_name,
+        session_origin=session_origin,
     )
     return surface is not None and is_clear(guard, surface)

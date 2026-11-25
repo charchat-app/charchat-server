@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 
 import pytest
 
@@ -464,3 +465,239 @@ def test_child_timeout_reports_failure_and_still_cleans_up():
 def test_non_loopback_dsn_is_refused(dsn):
     with pytest.raises(runner.Refused):
         runner.check_loopback_dsn(dsn)
+
+
+# --- 스토리 공통 안전 모드(--story-safety) ---------------------------------------
+
+
+def _recording_child(seen):
+    def child(cmd, *, env, cwd, timeout, secrets_):
+        seen.append({"cmd": list(cmd), "env": dict(env), "timeout": timeout, "secrets": secrets_})
+        return 0, [runner.status(result="passed")]
+
+    return child
+
+
+@pytest.mark.parametrize(
+    ("mode", "child_args"),
+    [
+        (runner.MODE_RATING, ["--child"]),  # 기본 모드는 그대로다.
+        (runner.MODE_STORY_SAFETY, ["--child", "--story-safety"]),
+    ],
+)
+def test_parent_forwards_single_mode_to_fixed_child_module_CREATE_US_08_AC15(mode, child_args):
+    seen = []
+    fake = FakeDocker()
+    lines = []
+    clock = FakeClock()
+    code = runner.parent_main(
+        {"PATH": "x", runner.ENV_KEY: KEY},
+        mode=mode,
+        docker_=fake,
+        run_child_=_recording_child(seen),
+        out=lines.append,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert code == 0, lines
+    [call] = seen
+    assert call["cmd"][1:3] == ["-m", runner.MODULE]
+    assert call["cmd"][3:] == child_args
+    assert call["timeout"] == runner.CHILD_TIMEOUT_SECONDS
+    # DSN·자격 증명은 자식 환경에만, 그리고 정화 대상 비밀 값으로 넘긴다.
+    assert set(call["env"]) <= set(runner._PASS_ENV) | {
+        "PYTHONPATH",
+        "PYTHONIOENCODING",
+        "PYTHONDONTWRITEBYTECODE",
+        runner.ENV_DSN,
+        runner.ENV_DBNAME,
+        runner.ENV_MARKER,
+        runner.ENV_KEY,
+    }
+    assert "DATABASE_URL" not in call["env"] and "TEST_DATABASE_URL" not in call["env"]
+    assert KEY in call["secrets"] and call["env"][runner.ENV_DSN] in call["secrets"]
+    assert all(runner.ENV_KEY not in c["env"] for c in fake.calls)
+    assert fake.rm_calls() == [["--host", ENDPOINT, "rm", "-f", "-v", CID]]
+
+
+def test_parent_rejects_unknown_mode_before_docker_CREATE_US_08_AC15():
+    fake = FakeDocker()
+    lines = []
+    code = runner.parent_main(
+        {"PATH": "x", runner.ENV_KEY: KEY}, mode="other", docker_=fake, out=lines.append
+    )
+    assert code == 2
+    assert lines == [runner.status(result="failed", reason="usage")]
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], ("parent", runner.MODE_RATING)),
+        (["--story-safety"], ("parent", runner.MODE_STORY_SAFETY)),
+        (["--child"], ("child", runner.MODE_RATING)),
+        (["--child", "--story-safety"], ("child", runner.MODE_STORY_SAFETY)),
+    ],
+)
+def test_main_dispatches_single_explicit_mode_CREATE_US_08_AC15(monkeypatch, argv, expected):
+    calls = []
+    monkeypatch.setattr(runner, "parent_main", lambda *, mode: calls.append(("parent", mode)) or 0)
+    monkeypatch.setattr(runner, "child_main", lambda *, mode: calls.append(("child", mode)) or 0)
+    assert runner.main(argv) == 0
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--story-safety", "--child"],
+        ["--story-safety", "--story-safety"],
+        ["--child", "--story-safety", "x"],
+        ["--other"],
+    ],
+)
+def test_main_rejects_other_argv_CREATE_US_08_AC15(monkeypatch, capsys, argv):
+    monkeypatch.setattr(runner, "parent_main", lambda **_: pytest.fail("must not run"))
+    monkeypatch.setattr(runner, "child_main", lambda **_: pytest.fail("must not run"))
+    assert runner.main(argv) == 2
+    assert capsys.readouterr().out.strip() == runner.status(result="failed", reason="usage")
+
+
+def test_story_safety_evidence_is_allowlisted_status_only_CREATE_US_08_AC15():
+    record = {
+        "posts": 1,
+        "status": 200,
+        "elapsed_ms": 812,
+        "transport": "ok",
+        "outcome": "view_200",
+        "body": "raw provider text",  # 허용 목록 밖 값은 싣지 않는다.
+    }
+    line = runner.evidence(record)
+    assert line == runner.status(
+        posts=1, status=200, elapsed_ms=812, transport="ok", outcome="view_200"
+    )
+    assert runner.sanitize(line) == [line]
+    assert "raw" not in line
+
+
+def test_story_safety_evidence_with_missing_values_stays_valid_CREATE_US_08_AC15():
+    line = runner.evidence({"posts": 0, "status": None, "elapsed_ms": None, "transport": None})
+    assert runner.sanitize(line) == [line]
+
+
+def test_story_safety_evidence_with_unsafe_value_is_dropped_by_sanitize_CREATE_US_08_AC15():
+    line = runner.evidence({"posts": 1, "outcome": "view 200 secret"})
+    assert runner.sanitize(line) == []
+
+
+def test_story_safety_child_refuses_non_loopback_dsn_before_connecting_CREATE_US_08_AC15():
+    lines = []
+    environ = {
+        runner.ENV_DSN: "host=10.0.0.5 port=5432 dbname=jev_smoke_0000000000000000_test",
+        runner.ENV_DBNAME: "jev_smoke_0000000000000000_test",
+        runner.ENV_MARKER: "m",
+        runner.ENV_KEY: KEY,
+    }
+    try:
+        assert runner.child_main(environ, mode=runner.MODE_STORY_SAFETY, out=lines.append) == 1
+    finally:
+        logging.disable(logging.NOTSET)  # 자식 진입점이 끈 로깅을 테스트 프로세스에서 되돌린다.
+    assert lines == [runner.status(result="failed", stage="dsn")]
+
+
+# --- 자식: 확인한 같은 연결 객체 재사용 -----------------------------------------
+
+
+_LOOPBACK_DSN = "host=127.0.0.1 port=5432 dbname=jev_smoke_0000000000000000_test"
+
+
+class FakeConnection:
+    """`psycopg.connect(...)` 결과를 흉내 낸다. 실행한 SQL과 열림 상태만 기록한다."""
+
+    def __init__(self):
+        self.row_factory = None
+        self.closed = False
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+    def execute(self, query, params=None):
+        assert not self.closed
+        self.executed.append(query)
+
+
+def _run_child_offline(monkeypatch, mode):
+    """DB·네트워크 없이 자식을 돌리고 (연결 목록, 확인 시점 기록, 스모크 시점 기록)을 돌려준다."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    from tests.features.creation.save_visibility import jev_http_transport
+
+    connections, verified, smoked = [], [], []
+
+    def connect(dsn, **kwargs):
+        assert dsn == _LOOPBACK_DSN and kwargs == {"autocommit": True}
+        connections.append(FakeConnection())
+        return connections[-1]
+
+    def verify(connection, dbname, marker):
+        verified.append((connection, connection.row_factory, list(connection.executed)))
+
+    def loader():
+        def run(target, transport, out):
+            row_factory = getattr(target, "row_factory", None)
+            smoked.append((target, row_factory is dict_row, connections[-1].closed))
+            return lambda: None
+
+        return run
+
+    class Transport:
+        def __init__(self, key):
+            assert key == KEY
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    monkeypatch.setattr(runner, "verify_target", verify)
+    monkeypatch.setitem(runner._SMOKES, mode, loader)
+    monkeypatch.setattr(jev_http_transport, "JevHttpTransport", Transport)
+    environ = {
+        runner.ENV_DSN: _LOOPBACK_DSN,
+        runner.ENV_DBNAME: "jev_smoke_0000000000000000_test",
+        runner.ENV_MARKER: "m",
+        runner.ENV_KEY: KEY,
+    }
+    lines = []
+    try:
+        code = runner.child_main(environ, mode=mode, out=lines.append)
+    finally:
+        logging.disable(logging.NOTSET)
+    assert (code, lines) == (0, [runner.status(result="passed")])
+    return connections, verified, smoked
+
+
+def test_story_child_reuses_verified_connection_for_schema_seed_and_app_CREATE_US_08_AC15(
+    monkeypatch,
+):
+    connections, verified, smoked = _run_child_offline(monkeypatch, runner.MODE_STORY_SAFETY)
+    [connection] = connections  # 연결은 하나뿐이다(DSN으로 다시 연결하지 않는다).
+    [(checked, factory_at_verify, executed_before)] = verified
+    assert checked is connection
+    assert factory_at_verify is None and executed_before == []  # 확인 전에는 쓰지 않는다.
+    assert connection.executed == [runner.SCHEMA_SQL.read_text(encoding="utf-8")]
+    # 스모크(시드·앱 요청 커넥션)는 확인한 그 연결 객체를, 확인 뒤 dict_row로, 열린 채로 받는다.
+    assert smoked == [(connection, True, False)]
+    assert connection.closed
+
+
+def test_rating_child_keeps_dsn_based_smoke_unchanged_CREATE_US_08_AC02(monkeypatch):
+    connections, verified, smoked = _run_child_offline(monkeypatch, runner.MODE_RATING)
+    [connection] = connections
+    assert verified[0][0] is connection
+    assert connection.row_factory is None
+    # 기본 모드는 기존대로 스키마 연결을 닫은 뒤 DSN 문자열로 스모크한다.
+    assert smoked == [(_LOOPBACK_DSN, False, True)]
+    assert connection.closed

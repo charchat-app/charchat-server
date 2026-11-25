@@ -8,7 +8,7 @@ from hashlib import sha256
 from psycopg import Connection
 
 from app.core import common_safety
-from app.core.common_safety import CommonSafetyGuard, SafetyMessage, SafetyProfile
+from app.core.common_safety import CommonSafetyGuard, SafetyMessage
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.starter import repository
@@ -72,16 +72,9 @@ def get_story(
             for row in repository.list_profiles(conn, story_id, owner_id)
             if _eligible_profile(row)
         ]
-        # CREATE-US-08-AC15: 응답과 같은 스냅숏의 정본과 응답에 나가는 제작자 프리셋을
+        # CREATE-US-08-AC15: 응답과 같은 스냅숏의 정본(제작자 프리셋 전체 포함)을
         # 판정한다. 비공개 소유자도 우회하지 않는다.
-        presets = tuple(
-            SafetyProfile(name=row["name"], description=row["description"] or "")
-            for row in profiles
-            if row["kind"] == "preset"
-        )
-        if guard is not None and not common_safety.story_is_clear(
-            conn, guard, story_id, bound_profiles=presets
-        ):
+        if guard is not None and not common_safety.story_is_clear(conn, guard, story_id):
             raise StoryNotFoundError()
         messages = defaultdict(list)
         for row in repository.list_intro_messages(conn, story_id):
@@ -233,8 +226,9 @@ def _start_surface(conn: Connection, story_id: int, start: _Start | None):
     elif start is not None:
         bound = _bound_intro(start.snapshot)
         play_name = start.name
+    # 입력 오류(start=None)로 바인딩 값이 없어도 세션 유래 판정이다.
     return common_safety.read_story_surface(
-        conn, story_id, bound_intro=bound, bound_play_name=play_name
+        conn, story_id, bound_intro=bound, bound_play_name=play_name, session_origin=True
     )
 
 
@@ -312,6 +306,7 @@ def get_session(
             bound_intro=_bound_intro(session["intro_messages_snapshot"]),
             bound_character_names=tuple(row["name"] or "" for row in characters),
             bound_play_name=session["play_name"],
+            session_origin=True,
         ):
             raise SessionNotFoundError()
         return SessionResponse(

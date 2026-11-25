@@ -74,3 +74,30 @@ def test_default_app_tag_search_is_unchanged_CREATE_US_08_AC15(client, db):
     assert [s["id"] for s in client.get(TAGS, params={"tag": "romance"}, headers=OWNER).json()] == [
         story
     ]
+
+
+def test_creator_presets_are_judged_in_tag_search_CREATE_US_08_AC15(db, db_url):
+    """제작자 프리셋도 같은 스냅숏의 정본으로 판정하고, 개인 프로필은 넘기지 않는다."""
+    story = _public_story(db, "Preset")
+    image = db.execute(
+        """INSERT INTO images (owner_id, storage_key, mime_type, byte_size)
+           VALUES (1, 'k', 'image/png', 1) RETURNING id"""
+    ).fetchone()["id"]
+    db.execute(
+        """INSERT INTO story_user_presets (story_id, name, image_id, description, position)
+           VALUES (%s, 'Merchant', %s, %s, 0)""",
+        (story, image, BLOCK_MARKER),
+    )
+    personal = "ZQX-PERSONAL-5521"
+    db.execute(
+        "INSERT INTO user_profiles (owner_id, name, image_id, description) VALUES (1, %s, %s, %s)",
+        (personal, image, personal),
+    )
+    guard = FakeGuard()
+    response = _search(db_url, guard)
+    assert response.status_code == 200
+    assert response.json() == []
+    [surface] = guard.surfaces
+    assert [(p.name, p.description) for p in surface.bound_profiles] == [("Merchant", BLOCK_MARKER)]
+    assert surface.session_origin is False
+    assert personal not in repr(surface)
