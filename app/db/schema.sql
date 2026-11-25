@@ -690,8 +690,8 @@ INSERT INTO public.models (name, provider, provider_model_id) VALUES
 -- status ↔ assistant 메시지 status: pending·streaming·completed는 같은 값, failed(표시 내용 없이
 -- 실패)·save_failed(전체 생성 후 저장 실패) → failed, failed_partial(일부 표시 후 중단) → interrupted.
 -- text: 스트리밍 누적 원문(롱 폴링 offset 기준). 완료 시 파싱 결과는 conversation_message_parts에 둔다.
--- 미완료 응답의 이력·청구 정책은 미결(안건-20261120-7EFE61, 안건-20261120-17577A)이라
--- billable은 정상 완료(completed)에만 true. updated_at은 작업의 갱신 시각(멈춘 작업 정리 기준)이다.
+-- billable은 정상 응답 및 본문을 제공한 모델 출력 한도 종료에 true. 서버·저장 실패는 false.
+-- updated_at은 작업의 갱신 시각(멈춘 작업 정리 기준)이다.
 CREATE TABLE public.conversation_generations (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     session_id bigint NOT NULL REFERENCES public.conversation_sessions(id),
