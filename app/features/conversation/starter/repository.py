@@ -115,6 +115,13 @@ def get_initial_session_id(
     return row["id"] if row else None
 
 
+def list_model_ids_by_name(conn: Connection, name: str) -> list[int]:
+    return [
+        row["id"]
+        for row in conn.execute("SELECT id FROM models WHERE name = %s ORDER BY id", (name,))
+    ]
+
+
 def insert_session(
     conn: Connection,
     story_id: int,
@@ -122,13 +129,14 @@ def insert_session(
     intro_id: int,
     messages: list,
     fingerprint: bytes,
+    selected_model_id: int,
 ) -> int:
     return conn.execute(
         """INSERT INTO conversation_sessions
                (story_id, owner_id, source_intro_id, intro_messages_snapshot,
-                initial_request_fingerprint)
-           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-        (story_id, owner_id, intro_id, Jsonb(messages), fingerprint),
+                initial_request_fingerprint, selected_model_id)
+           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+        (story_id, owner_id, intro_id, Jsonb(messages), fingerprint, selected_model_id),
     ).fetchone()["id"]
 
 
@@ -218,9 +226,11 @@ def copy_relationships(conn: Connection, session_id: int):
 
 def get_session(conn: Connection, session_id: int, owner_id: int):
     return conn.execute(
-        """SELECT cs.id, s.title AS story_title, cs.intro_messages_snapshot,
-                  s.deleted_at IS NOT NULL AS read_only
+        """SELECT cs.id, s.title AS story_title, cs.intro_messages_snapshot, m.name AS model,
+                  s.deleted_at IS NOT NULL AS read_only, up.name AS play_name
            FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
+           JOIN models m ON m.id = cs.selected_model_id
+           JOIN conversation_user_profiles up ON up.session_id = cs.id
            WHERE cs.id = %s AND cs.owner_id = %s
              AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
                   OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))""",

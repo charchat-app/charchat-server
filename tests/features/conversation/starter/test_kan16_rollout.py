@@ -11,7 +11,8 @@ PLAYER = {"X-User-Id": "2"}
 
 
 def seed_legacy_rooms(db):
-    # KAN-16 이전 스키마에서도 이 데이터 준비를 그대로 실행할 수 있다.
+    # KAN-16 이전 방과 같은 컬럼만 채운다. selected_model_id(KAN-17 팀 DDL, NOT NULL)는
+    # 현재 스키마에서 필요해 기본 모델 행으로 채운다.
     with db.transaction():
         story = db.execute(
             "INSERT INTO stories (owner_id, title, save_state) "
@@ -33,8 +34,11 @@ def seed_legacy_rooms(db):
         edited_room, deleted_room = (
             row["id"]
             for row in db.execute(
-                "INSERT INTO conversation_sessions (owner_id, story_id, source_intro_id) "
-                "VALUES (2, %s, %s), (2, %s, %s) RETURNING id",
+                "INSERT INTO conversation_sessions "
+                "(owner_id, story_id, source_intro_id, selected_model_id) "
+                "SELECT 2, v.story, v.intro, (SELECT id FROM models WHERE name = '루나') "
+                "FROM (VALUES (%s::bigint, %s::bigint, 1), (%s, %s, 2)) v(story, intro, ord) "
+                "ORDER BY v.ord RETURNING id",
                 (story, kept_intro, story, deleted_intro),
             )
         )
