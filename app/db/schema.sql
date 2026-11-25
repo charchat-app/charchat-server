@@ -38,17 +38,18 @@ CREATE TABLE stories (
 -- deleted_at은 공개 범위와 별개다. 소프트 삭제 시 자식/세션/이미지 연결을 유지한다.
 
 -- CREATE-US-07: 허용 상태 전환과 복구/물리 삭제 금지를 DB에서도 지키는 구현 제안.
--- CREATE-US-08: 검토 메타데이터(적용 등급·검토 상태·사유·요청 표)만 실제로 바뀐 UPDATE는 저장본
+-- CREATE-US-08: 검토 메타데이터(적용 등급·검토 상태·사유·요청 표·통과 지문)만 실제로 바뀐 UPDATE는 저장본
 -- 편집이 아니므로 saved_at을 그대로 둔다(자동 저장 영수증·응답 saved_at 보존). 같은 값 touch,
 -- 제작자 선택(requested_rating)·다른 필드가 바뀐 UPDATE는 saved_at을 새로 쓴다. 컬럼 이름을 jsonb
 -- 키로만 비교하므로 등급 컬럼이 없는 DB에도 적용된다. 기존 DB 적용용 초안:
--- app/db/migrations/create_us08_review_saved_at.sql (함수 본문은 이 정의와 같아야 한다)
+-- app/db/migrations/create_us08_review_saved_at.sql, create_us08_review_pass_digest.sql
+-- (두 파일의 함수 본문은 모두 이 정의와 같아야 한다)
 CREATE FUNCTION enforce_story_lifecycle()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     review_keys CONSTANT text[] := ARRAY[
         'effective_rating', 'rating_review_status', 'rating_review_reason',
-        'rating_requested_at', 'saved_at'];
+        'rating_requested_at', 'rating_pass_digest', 'saved_at'];
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'Stories must be soft deleted and retained indefinitely'
@@ -66,6 +67,19 @@ BEGIN
        OR (OLD.save_state = 'public' AND NEW.save_state = 'private') THEN
         RAISE EXCEPTION 'This story save-state transition is not allowed'
             USING ERRCODE = '23514';
+    END IF;
+    -- CREATE-US-08-AC14: 통과 지문을 모르는 이전 버전 작성기가 검토 중을 부적격·판단 불가 완료
+    -- (적용 등급 SAFE)로 바꾸면서 지문을 그대로 두면, 같은 내용의 거부 뒤에도 통과가 남을 수 있다.
+    -- 지문을 아는 작성기는 같은 트랜잭션에 charchat.rating_pass_digest_writer='v1'을 둔다.
+    -- 그 표시 없는 그런 전환은 지문을 비운다(재사용하지 않고 다시 평가한다).
+    IF to_jsonb(OLD) ->> 'rating_review_status' = 'reviewing'
+       AND to_jsonb(NEW) ->> 'rating_review_status' = 'completed'
+       AND to_jsonb(NEW) ->> 'effective_rating' = 'SAFE'
+       AND to_jsonb(NEW) ->> 'rating_pass_digest' IS NOT NULL
+       AND to_jsonb(NEW) -> 'rating_pass_digest' = to_jsonb(OLD) -> 'rating_pass_digest'
+       AND current_setting('charchat.rating_pass_digest_writer', true)
+           IS DISTINCT FROM 'v1' THEN
+        NEW := jsonb_populate_record(NEW, '{"rating_pass_digest": null}'::jsonb);
     END IF;
     IF to_jsonb(NEW) - review_keys = to_jsonb(OLD) - review_keys
        AND to_jsonb(NEW) - 'saved_at' IS DISTINCT FROM to_jsonb(OLD) - 'saved_at' THEN
@@ -662,6 +676,16 @@ ALTER TABLE stories
         CHECK (effective_rating IN ('SAFE', 'UNSAFE')),
     ADD CONSTRAINT stories_rating_review_status_check
         CHECK (rating_review_status IN ('not_reviewed', 'reviewing', 'completed', 'failed'));
+
+-- CREATE-US-08-AC14 영속 마지막 통과 지문. 원문 없이 `v<개정>:<평가기 이름공간>:<SHA-256>`만 둔다.
+-- 현재 검토가 적격으로 끝날 때만 쓰고, 같은 지문의 UNSAFE 확정 저장은 평가 없이 재사용한다.
+-- 지문을 모르는 작성기(트랜잭션 표시 charchat.rating_pass_digest_writer='v1' 없음)가 검토 중을
+-- 거부 완료(SAFE)로 바꾸면 enforce_story_lifecycle()이 그대로 남은 지문을 비운다.
+-- 기존 DB 적용용 초안: app/db/migrations/create_us08_review_pass_digest.sql
+ALTER TABLE stories
+    ADD COLUMN rating_pass_digest text,
+    ADD CONSTRAINT stories_rating_pass_digest_check
+        CHECK (rating_pass_digest ~ '^v[0-9]{1,9}:[a-z0-9][a-z0-9._-]{0,63}:[0-9a-f]{64}$');
 
 
 -- CHAT-US-02 (KAN-17) 팀 승인 DDL(2026-11-20 공용 DB 적용, Confluence 3047447) 그대로.

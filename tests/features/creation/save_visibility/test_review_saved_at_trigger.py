@@ -12,9 +12,9 @@ import pytest
 
 from tests.features.creation.speech_style.conftest import OWNER_ID, create_story
 
-MIGRATION = (
-    Path(__file__).resolve().parents[4] / "app/db/migrations/create_us08_review_saved_at.sql"
-)
+MIGRATIONS = Path(__file__).resolve().parents[4] / "app/db/migrations"
+MIGRATION = MIGRATIONS / "create_us08_review_saved_at.sql"
+DIGEST_MIGRATION = MIGRATIONS / "create_us08_review_pass_digest.sql"
 
 # 이 수정 전 함수(saved_at을 늘 새로 쓴다). 마이그레이션이 기존 DB에서 고치는지 확인용.
 LEGACY_FUNCTION = """
@@ -48,6 +48,8 @@ REVIEW_ONLY = [
     "rating_review_status='reviewing', rating_requested_at=clock_timestamp()",
     "effective_rating='UNSAFE', rating_review_status='completed'",
     "rating_review_reason='ineligible:underage_stated', rating_review_status='failed'",
+    # CREATE-US-08-AC14 통과 지문도 검토 메타데이터다.
+    f"rating_pass_digest='v1:fake-eval.v1:{'a' * 64}', rating_review_status='completed'",
 ]
 
 ADVANCES = [
@@ -160,3 +162,134 @@ def test_migration_refuses_when_guard_trigger_is_missing_CREATE_US_08_AC03(db):
         assert function_definition(db) == expected
     finally:
         db.execute("ALTER TABLE stories ENABLE TRIGGER stories_lifecycle_guard")
+
+
+# --- CREATE-US-08-AC14 통과 지문 컬럼 마이그레이션(배포 순서·재실행) ---
+
+DIGEST_CHECK = "stories_rating_pass_digest_check"
+
+
+def digest_check(db):
+    found = db.execute(
+        """SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint
+           WHERE conrelid='public.stories'::regclass AND conname=%s""",
+        (DIGEST_CHECK,),
+    ).fetchone()
+    return found and found["d"]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        (DIGEST_MIGRATION, MIGRATION, DIGEST_MIGRATION),
+        (MIGRATION, DIGEST_MIGRATION, MIGRATION),
+        (DIGEST_MIGRATION, DIGEST_MIGRATION),
+    ],
+    ids=["digest-first", "saved-at-first", "digest-replay"],
+)
+def test_digest_migration_any_order_matches_schema_and_keeps_saved_at_CREATE_US_08_AC14(db, order):
+    expected_function, expected_check = function_definition(db), digest_check(db)
+    try:
+        # 마이그레이션 전 기존 DB: 지문 컬럼이 없고 함수는 수정 전이다.
+        db.execute(f"ALTER TABLE stories DROP CONSTRAINT {DIGEST_CHECK}")
+        db.execute("ALTER TABLE stories DROP COLUMN rating_pass_digest")
+        db.execute(LEGACY_FUNCTION)
+        for migration in order:
+            db.execute(migration.read_text(encoding="utf-8"))
+        assert function_definition(db) == expected_function
+        assert digest_check(db) == expected_check
+        story = create_story(db)
+        before = saved_at(db, story)
+        update(db, story, f"rating_pass_digest='v1:fake-eval.v1:{'b' * 64}'")
+        assert saved_at(db, story) == before
+        with pytest.raises(psycopg.errors.CheckViolation):
+            update(db, story, "rating_pass_digest='원문이 들어간 값'")
+    finally:
+        db.execute(DIGEST_MIGRATION.read_text(encoding="utf-8"))
+        db.execute(expected_function)
+    assert function_definition(db) == expected_function
+    assert digest_check(db) == expected_check
+
+
+def test_digest_migration_refuses_unexpected_check_CREATE_US_08_AC14(db):
+    expected_function, expected_check = function_definition(db), digest_check(db)
+    db.execute(f"ALTER TABLE stories DROP CONSTRAINT {DIGEST_CHECK}")
+    db.execute(
+        f"ALTER TABLE stories ADD CONSTRAINT {DIGEST_CHECK} CHECK (rating_pass_digest <> '')"
+    )
+    db.execute(LEGACY_FUNCTION)
+    try:
+        with pytest.raises(psycopg.errors.RaiseException):
+            db.execute(DIGEST_MIGRATION.read_text(encoding="utf-8"))
+        db.execute("ROLLBACK")
+        # 실패하면 함수도 바꾸지 않는다(한 트랜잭션).
+        assert function_definition(db) != expected_function
+    finally:
+        db.execute(f"ALTER TABLE stories DROP CONSTRAINT {DIGEST_CHECK}")
+        db.execute(DIGEST_MIGRATION.read_text(encoding="utf-8"))
+        db.execute(expected_function)
+    assert digest_check(db) == expected_check
+
+
+# --- CREATE-US-08-AC14 이전 버전 작성기 거부 완료 방어 ---
+
+PASS_A = f"v1:fake-eval.v1:{'a' * 64}"
+# 기준 커밋(fcc8a9e)의 결과 쓰기와 같은 SET 목록(지문 컬럼을 모른다).
+LEGACY_REJECT = (
+    "effective_rating='SAFE', rating_review_status='completed',"
+    " rating_review_reason='ineligible:underage_stated'"
+)
+
+
+def reviewing_with_pass(db, story):
+    update(
+        db,
+        story,
+        f"requested_rating='UNSAFE', effective_rating='UNSAFE', rating_review_status='reviewing',"
+        f" rating_requested_at=clock_timestamp(), rating_pass_digest='{PASS_A}'",
+    )
+
+
+def digest(db, story):
+    return db.execute(
+        "SELECT rating_pass_digest FROM stories WHERE id=%s", (story["id"],)
+    ).fetchone()["rating_pass_digest"]
+
+
+def test_legacy_writer_rejection_invalidates_kept_digest_CREATE_US_08_AC14(db):
+    story = create_story(db)
+    reviewing_with_pass(db, story)
+    before = saved_at(db, story)
+    update(db, story, LEGACY_REJECT)
+    assert digest(db, story) is None
+    assert saved_at(db, story) == before  # 검토 메타데이터만 바뀌었다.
+
+
+def test_digest_aware_writer_keeps_older_pass_on_other_content_rejection_CREATE_US_08_AC14(db):
+    """지문을 아는 작성기(트랜잭션 표시)는 다른 내용 거부 뒤에도 예전 통과 A를 둔다."""
+    story = create_story(db)
+    reviewing_with_pass(db, story)
+    with db.transaction():
+        db.execute("SELECT set_config('charchat.rating_pass_digest_writer', 'v1', true)")
+        update(db, story, f"{LEGACY_REJECT}, rating_pass_digest='{PASS_A}'")
+    assert digest(db, story) == PASS_A
+    # 표시는 트랜잭션 밖으로 새지 않는다: 다음 이전 버전 거부는 다시 비운다.
+    reviewing_with_pass(db, story)
+    update(db, story, LEGACY_REJECT)
+    assert digest(db, story) is None
+
+
+@pytest.mark.parametrize(
+    "assignments",
+    [
+        # 실패·적격 완료·SAFE 선택은 거부가 아니다(지문을 그대로 둔다).
+        "rating_review_status='failed', rating_review_reason='unavailable:evaluator_failure'",
+        "effective_rating='UNSAFE', rating_review_status='completed'",
+        "requested_rating='SAFE', effective_rating='SAFE', rating_review_status='not_reviewed'",
+    ],
+)
+def test_legacy_non_rejection_keeps_digest_CREATE_US_08_AC14(db, assignments):
+    story = create_story(db)
+    reviewing_with_pass(db, story)
+    update(db, story, assignments)
+    assert digest(db, story) == PASS_A

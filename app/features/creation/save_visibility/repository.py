@@ -86,28 +86,52 @@ def mark_rating_safe(connection, story_id):
     )
 
 
+def reuse_review_pass(connection, story_id, digest):
+    """CREATE-US-08-AC14: 통과 지문이 정확히 같으면 평가 없이 완료(UNSAFE)로 쓴다.
+
+    확정 저장 트랜잭션 안(스토리 잠금 중)에서 부른다. 새 요청 표를 돌려주고, 맞지 않으면 None.
+    새 요청 표와 `completed` 상태라 앞선 요청 표의 대기·평가 중 결과는 쓰이지 않는다.
+    """
+    row = connection.execute(
+        f"""UPDATE stories SET effective_rating='UNSAFE', rating_review_status='completed',
+                rating_review_reason=NULL, rating_requested_at={_NEW_TICKET}
+            WHERE id=%s AND rating_pass_digest=%s AND requested_rating='UNSAFE'
+              AND deleted_at IS NULL
+            RETURNING rating_requested_at""",
+        (story_id, digest),
+    ).fetchone()
+    return None if row is None else row["rating_requested_at"]
+
+
 def lock_review_target(connection, story_id):
-    """검토 결과를 쓰기 전에 스토리를 잠그고 요청 표·상태를 읽는다."""
+    """검토 결과를 쓰기 전에 스토리를 잠그고 요청 표·상태·통과 지문을 읽는다."""
     return connection.execute(
-        """SELECT requested_rating, rating_review_status, rating_requested_at, deleted_at
+        """SELECT requested_rating, rating_review_status, rating_requested_at, deleted_at,
+                  rating_pass_digest
            FROM stories WHERE id=%s FOR UPDATE""",
         (story_id,),
     ).fetchone()
 
 
-def apply_review_result(connection, story_id, ticket, effective_rating, status, reason) -> bool:
+def apply_review_result(
+    connection, story_id, ticket, effective_rating, status, reason, pass_digest
+) -> bool:
     """요청 표가 그대로이고 UNSAFE 선택·검토 중·삭제되지 않았을 때만 결과를 쓴다.
 
-    `effective_rating`이 None이면 적용 등급을 그대로 둔다.
+    `effective_rating`이 None이면 적용 등급을 그대로 둔다. `pass_digest`는 같은 잠금 안에서
+    정한 통과 지문(그대로 두려면 읽은 값을 그대로 준다).
+    결과 쓰기 트랜잭션 안에서 부른다. 같은 트랜잭션에 지문을 아는 작성기 표시를 둬, DB 트리거가
+    이 쓰기를 이전 버전 작성기의 거부로 보고 지문을 비우지 않게 한다(CREATE-US-08-AC14).
     """
+    connection.execute("SELECT set_config('charchat.rating_pass_digest_writer', 'v1', true)")
     row = connection.execute(
         """UPDATE stories
            SET effective_rating=COALESCE(%s, effective_rating),
-               rating_review_status=%s, rating_review_reason=%s
+               rating_review_status=%s, rating_review_reason=%s, rating_pass_digest=%s
            WHERE id=%s AND rating_requested_at=%s AND requested_rating='UNSAFE'
              AND rating_review_status='reviewing' AND deleted_at IS NULL
            RETURNING id""",
-        (effective_rating, status, reason, story_id, ticket),
+        (effective_rating, status, reason, pass_digest, story_id, ticket),
     ).fetchone()
     return row is not None
 

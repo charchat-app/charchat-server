@@ -27,15 +27,36 @@
   출력·넘김 실패는 앞선 적용 등급을 유지한 채 실패로 기록한다(부적격이 아니다). 사유는 허용
   목록 코드만 쓰고 평가기 원문은 쓰지 않는다. 새 재시도 정책은 없다(다음 확정 저장이 다시 넘긴다).
 - 이 경로는 프로세스 메모리 통과 기록·중복 제거를 쓰지 않는다. 메모리 기록은 영속하지 않고 다른
-  경로로 정본이 바뀌었는지 알 수 없어 잘못 재사용할 수 있으므로, UNSAFE 확정 저장마다 새로
-  검토한다. 앞선 요청의 평가는 요청 표가 달라 결과를 쓰지 못한다.
+  경로로 정본이 바뀌었는지 알 수 없어 잘못 재사용할 수 있다. 앞선 요청의 평가는 요청 표가 달라
+  결과를 쓰지 못한다.
+
+영속 마지막 통과 재사용(CREATE-US-08-AC14, `results`와 `reuse_namespace`를 함께 줄 때만):
+- 통과 지문(`stories.rating_pass_digest`)은 정본 검토 비교 내용의 버전 붙은 SHA-256 해시만
+  담는다(원문 없음). `v<개정>:<이름공간>:<내용 해시>` 형식이며 이름공간은 평가기(공급자·모델·
+  정책)를 가리킨다. 이름공간이나 개정이 다르면 문자열이 달라 재사용하지 않는다(암묵적 공급자 간
+  재사용 없음). 비교 계약(내용 구성·인코딩)이 바뀌면 `PASS_DIGEST_REVISION`을 올린다.
+- 지문은 결과 쓰기와 같은 스토리 잠금·같은 UPDATE에서, 요청 표가 그대로인 현재 검토가 적격으로
+  끝날 때만 쓴다. 이름공간이 없는 적격 완료는 지문을 비운다(마지막 통과를 알 수 없음). 부적격·판단
+  불가 완료는 같은 내용의 지문만 비우고, 실패·결과 없음은 지문을 바꾸지 않는다(다른 내용의 예전
+  통과를 덮어쓰지 않는다).
+- 지문을 모르는 이전 버전 작성기는 거부 완료 때 지문을 그대로 둔다. 그래서 결과 쓰기는 같은
+  트랜잭션에 작성기 표시를 두고, DB 트리거는 표시 없는 검토 중 → 거부 완료(SAFE) 전환에서 남은
+  지문을 비운다(이전 버전이 같은 내용을 거부한 뒤 재사용하지 않는다).
+- 확정 저장 트랜잭션(스토리 잠금 안)에서 방금 쓴 정본 내용의 지문이 저장된 지문과 정확히 같으면
+  평가기를 부르지 않고 적용 등급 UNSAFE·완료와 새 요청 표를 같은 트랜잭션에 쓴다. 새 요청 표와
+  `completed` 상태가 다른 프로세스의 대기·평가 중 결과를 막고(DB 울타리), 조정기는 그 스토리의 최신
+  내용을 검토 대상 아님으로 알려 이 프로세스의 대기 검토도 평가하지 않게 한다(프로세스 울타리).
+  임시 저장본은 읽지 않으며 메모리 값은 판단 근거로 쓰지 않는다.
 - 남은 한계: 재시작·`close()`로 대기·평가 중 검토가 사라지면 그 스토리는 다음 확정 저장까지
   `reviewing`(앞선 적용 등급 유지)으로 남는다. 다른 경로로 정본이 바뀌어 내용이 어긋난 결과도
-  쓰지 않으므로 같은 상태로 남는다. 영속 통과 기록(재시작 뒤 재사용)·재시도·복구 작업은 미정이다.
+  쓰지 않으므로 같은 상태로 남는다. 재시도·복구 작업(영속 대기열)은 미정이다.
 """
 
+import hashlib
 import itertools
+import json
 import logging
+import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -93,6 +114,52 @@ def build_snapshot(world_description, characters, relations) -> ReviewSnapshot:
     return ReviewSnapshot(world_description, people, links)
 
 
+# 통과 지문 개정. 검토 비교 내용의 구성·인코딩이나 평가 계약이 바뀌면 올린다(예전 지문은 재사용되지
+# 않는다). DB 형식 검사(stories_rating_pass_digest_check)는 숫자 개정이면 그대로 받는다.
+PASS_DIGEST_REVISION = 1
+# 평가기 이름공간. 공급자·모델·정책 개정을 담는 짧은 식별자이며 원문을 담지 않는다.
+_NAMESPACE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+
+
+def valid_namespace(namespace: str | None) -> str | None:
+    if namespace is not None and (
+        not isinstance(namespace, str) or not _NAMESPACE.fullmatch(namespace)
+    ):
+        raise ValueError("reuse_namespace는 소문자·숫자·._- 1~64자여야 합니다.")
+    return namespace
+
+
+def content_digest(story_id: int, snapshot: ReviewSnapshot) -> str:
+    """검토 비교 내용의 결정적 해시(16진수). 이름공간과 무관하다(같은 내용 비교용).
+
+    스토리 ID·개정과 필드 이름·순서를 함께 넣어 구조가 다른 내용이 같은 해시가 되지 않게 한다.
+    """
+    payload = {
+        "revision": PASS_DIGEST_REVISION,
+        "story_id": int(story_id),
+        "world_description": snapshot.world_description,
+        "characters": [list(person) for person in snapshot.characters],
+        "relations": [list(link) for link in snapshot.relations],
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def pass_digest(namespace: str, story_id: int, snapshot: ReviewSnapshot) -> str:
+    """DB에 두는 통과 지문. `v<개정>:<이름공간>:<내용 해시>`."""
+    return f"v{PASS_DIGEST_REVISION}:{namespace}:{content_digest(story_id, snapshot)}"
+
+
+def same_content(stored: str | None, story_id: int, snapshot: ReviewSnapshot) -> bool:
+    """저장된 지문이 이 내용(현재 개정)을 가리키는가. 이름공간은 보지 않는다."""
+    if not stored:
+        return False
+    revision, _, rest = stored.partition(":")
+    return revision == f"v{PASS_DIGEST_REVISION}" and rest.rpartition(":")[2] == content_digest(
+        story_id, snapshot
+    )
+
+
 def capture_snapshot(connection, story_id) -> ReviewSnapshot:
     """같은 트랜잭션 안에서 이번 저장이 쓴 정본을 읽는다."""
     return build_snapshot(
@@ -142,6 +209,22 @@ class ReviewResult:
     effective_rating: str | None  # None이면 앞선 적용 등급을 유지한다.
     status: str
     reason: str | None
+    # 검증된 적격 판정이었는가. 통과 지문은 이것이 참일 때만 쓴다.
+    passed: bool = False
+
+
+def next_pass_digest(stored, namespace, story_id, snapshot, result: ReviewResult) -> str | None:
+    """결과를 쓸 때 함께 둘 통과 지문. 스토리 잠금 안에서 DB에서 읽은 `stored`로 정한다.
+
+    - 적격 완료: 이 내용의 지문(이름공간이 없으면 비움).
+    - 부적격·판단 불가 완료: 같은 내용의 지문이면 비우고, 다른 내용의 예전 통과는 그대로 둔다.
+    - 실패: 그대로 둔다.
+    """
+    if result.passed:
+        return None if namespace is None else pass_digest(namespace, story_id, snapshot)
+    if result.status == "completed" and same_content(stored, story_id, snapshot):
+        return None
+    return stored
 
 
 _OUTCOME_TARGETS = {
@@ -189,7 +272,9 @@ def review_result(verdict) -> ReviewResult:
     if checked is None:
         checked = unavailable(EligibilityReason.INVALID_SIGNALS)
     effective, status = _OUTCOME_TARGETS[checked.outcome]
-    return ReviewResult(effective, status, encode_reason(checked))
+    return ReviewResult(
+        effective, status, encode_reason(checked), checked.outcome is Eligibility.ELIGIBLE
+    )
 
 
 # 평가기 예외·넘김 실패·울타리 대기 시간 초과. 앞선 적용 등급을 유지한다.
@@ -205,11 +290,12 @@ class ReviewResults(Protocol):
         snapshot: ReviewSnapshot,
         ticket: datetime,
         result: ReviewResult,
+        namespace: str | None = None,
     ) -> bool:
         """요청 표와 정본 내용이 그대로일 때만 쓰고, 썼는지 돌려준다.
 
-        현재 검토 상태(stories)만 쓴다. 요청키 영수증(재전송 응답)은 커밋 시점 값으로 고정되어
-        바꾸지 않는다.
+        현재 검토 상태(stories)와 통과 지문만 쓴다(`next_pass_digest`). 요청키 영수증(재전송
+        응답)은 커밋 시점 값으로 고정되어 바꾸지 않는다.
         """
 
 
@@ -222,7 +308,7 @@ class DatabaseReviewResults:
     def __repr__(self):
         return "DatabaseReviewResults(...)"  # 접속 정보를 싣지 않는다.
 
-    def apply(self, story_id, snapshot, ticket, result) -> bool:
+    def apply(self, story_id, snapshot, ticket, result, namespace=None) -> bool:
         with psycopg.connect(self._conninfo, autocommit=True, row_factory=dict_row) as connection:
             with connection.transaction():
                 row = repository.lock_review_target(connection, story_id)
@@ -232,8 +318,11 @@ class DatabaseReviewResults:
                     or row["requested_rating"] != "UNSAFE"
                     or row["rating_review_status"] != "reviewing"
                     or row["rating_requested_at"] != ticket
-                    or capture_snapshot(connection, story_id) != snapshot
                 ):
+                    return False
+                # 지문은 잠근 뒤 다시 읽은 정본 내용으로 만든다(평가한 내용과 같을 때만).
+                canonical = capture_snapshot(connection, story_id)
+                if canonical != snapshot:
                     return False
                 return repository.apply_review_result(
                     connection,
@@ -242,6 +331,9 @@ class DatabaseReviewResults:
                     result.effective_rating,
                     result.status,
                     result.reason,
+                    next_pass_digest(
+                        row["rating_pass_digest"], namespace, story_id, canonical, result
+                    ),
                 )
 
 
@@ -263,9 +355,12 @@ class RatingReviewCoordinator:
         max_workers: int = 1,
         fence_timeout: float = 30.0,
         results: ReviewResults | None = None,
+        reuse_namespace: str | None = None,
     ):
         self._evaluator = evaluator
         self._results = results
+        # 영속 통과 재사용 이름공간(결과 보관소가 있을 때만 쓴다). None이면 재사용·지문 기록이 없다.
+        self._reuse_namespace = valid_namespace(reuse_namespace)
         self._store = store if store is not None else ProcessLastPassStore()
         self._executor = ThreadPoolExecutor(max_workers, thread_name_prefix="rating-review")
         self._fence_timeout = fence_timeout
@@ -285,18 +380,26 @@ class RatingReviewCoordinator:
         """검토 결과를 DB에 쓰는가(결과 보관소를 줬는가)."""
         return self._results is not None
 
+    @property
+    def reuse_namespace(self) -> str | None:
+        """영속 마지막 통과를 재사용할 이름공간. 결과 보관소가 없으면 None."""
+        return self._reuse_namespace if self.persists else None
+
     @contextmanager
     def fence(
         self,
         story_id: int,
         snapshot: ReviewSnapshot | None,
         request_ticket: datetime | None = None,
+        reused: bool = False,
     ):
         """확정 저장 트랜잭션의 마지막 단계(스토리 잠금 안, COMMIT 직전)에 들어간다.
 
         트랜잭션을 감싼 바깥 문맥에서 나오므로 COMMIT이 끝난 뒤 나온다. 예외 없이 나올 때만
         세대·내용을 알리고, 예외(커밋·저장 실패)면 알리지 않는다. 알림 실패는 로그만 남긴다.
-        `request_ticket`은 결과 저장 경로에서 이번 저장이 쓴 요청 표다.
+        `request_ticket`은 결과 저장 경로에서 이번 저장이 쓴 요청 표다. `reused`면 이번 저장이
+        영속 통과를 재사용해 완료로 썼으므로 넘기지 않고, 최신 내용을 검토 대상 아님으로 알려 이
+        프로세스의 대기·평가 중 검토가 결과·통과를 남기지 않게 한다.
         """
         with self._cond:
             ticket = Publication(next(self._generations))
@@ -310,7 +413,7 @@ class RatingReviewCoordinator:
                 try:
                     if committed:
                         ticket.outcome = self._publish(
-                            story_id, ticket.generation, snapshot, request_ticket
+                            story_id, ticket.generation, snapshot, request_ticket, reused
                         )
                 except Exception as exc:
                     ticket.outcome = "failed"
@@ -334,11 +437,15 @@ class RatingReviewCoordinator:
             pass
         return ticket.outcome
 
-    def _publish(self, story_id, generation, snapshot, request_ticket=None) -> str:
+    def _publish(self, story_id, generation, snapshot, request_ticket=None, reused=False) -> str:
         """조정기 잠금 안에서 부른다. 외부 IO 없이 끝난다."""
         latest = self._latest.get(story_id)
         if latest is not None and generation <= latest[0]:
             return "stale"  # 더 나중에 커밋된 저장이 이미 알려졌다.
+        if reused:
+            # 이미 완료로 커밋됐다. 대기·평가 중인 검토는 모두 최신이 아니게 된다.
+            self._latest[story_id] = (generation, None)
+            return "reused"
         self._latest[story_id] = (generation, snapshot)
         if snapshot is None:
             return "invalidated"
@@ -398,7 +505,9 @@ class RatingReviewCoordinator:
     def _record(self, story_id, snapshot, generation, request_ticket, result) -> bool:
         """조정기 잠금 밖에서 부른다. 요청 표·정본 내용이 그대로일 때만 결과가 쓰인다."""
         try:
-            applied = self._results.apply(story_id, snapshot, request_ticket, result)
+            applied = self._results.apply(
+                story_id, snapshot, request_ticket, result, namespace=self._reuse_namespace
+            )
         except Exception as exc:
             logger.warning(
                 "등급 검토 결과 기록 실패 story_id=%s generation=%s error=%s",
@@ -418,7 +527,7 @@ class RatingReviewCoordinator:
         요청 표가 달라 쓰이지 않는다. 현재 검토 상태만 쓰고, 요청키 영수증과 이미 만든 응답은
         커밋 시점 값(검토 중)으로 두며 바꾸지 않는다(CREATE-US-08-AC02·AC11).
         """
-        if publication is None or publication.outcome in (None, "submitted"):
+        if publication is None or publication.outcome in (None, "submitted", "reused"):
             return
         self._record(story_id, snapshot, publication.generation, request_ticket, FAILURE)
 
@@ -436,8 +545,14 @@ class RatingReviewCoordinator:
             if not active:
                 del self._active[story_id]
 
-    def _is_current(self, story_id, snapshot) -> bool:
-        """잠금 안에서 부른다. 커밋 중인 울타리가 닫히기를 기다린 뒤 최신 내용인지 본다."""
+    def _is_current(self, story_id, snapshot, generation=None) -> bool:
+        """잠금 안에서 부른다. 커밋 중인 울타리가 닫히기를 기다린 뒤 최신 내용인지 본다.
+
+        `generation`을 주면(결과 저장 경로) 내용뿐 아니라 맡긴 세대도 최신 세대와 정확히 같아야
+        한다. 대기 중에 같은 내용이 다시 알려졌으면(예: B → 재사용 A → B) 앞선 세대는 평가하지
+        않는다(요청 표가 달라 어차피 쓰이지 않는다). 주지 않으면 기존 프로세스 경로의 내용 기준
+        중복 제거 의미를 그대로 둔다.
+        """
         settled = self._cond.wait_for(
             lambda: not self._fenced.get(story_id), timeout=self._fence_timeout
         )
@@ -445,13 +560,17 @@ class RatingReviewCoordinator:
             logger.warning("등급 검토 울타리 대기 시간 초과 story_id=%s", story_id)
             return False
         latest = self._latest.get(story_id)
-        return latest is not None and latest[1] == snapshot
+        if latest is None or latest[1] != snapshot:
+            return False
+        return generation is None or latest[0] == generation
 
     def _run(self, story_id, snapshot, generation, request_ticket=None):
         released = False
         try:
             with self._cond:
-                current = self._is_current(story_id, snapshot)
+                # 결과 저장 경로는 맡긴 세대까지 정확히 최신이어야 평가한다.
+                exact = generation if request_ticket is not None else None
+                current = self._is_current(story_id, snapshot, exact)
                 if not current:
                     # 대기 중에 더 나중 저장이 커밋됐다(또는 울타리 대기 시간 초과).
                     # 평가하지 않는다.
@@ -544,6 +663,8 @@ def capture(connection, story_id) -> ReviewSnapshot | None:
 class FinalSaveHandoff:
     snapshot: ReviewSnapshot | None = field(repr=False)
     request_ticket: datetime | None = None
+    # 영속 마지막 통과를 재사용해 이미 완료로 썼다(넘기지 않는다).
+    reused: bool = False
 
 
 def prepare_final_save(
@@ -553,11 +674,21 @@ def prepare_final_save(
 
     결과 저장 경로면 UNSAFE는 검토 중·새 요청 표를, SAFE는 적용 등급 SAFE를 같은 트랜잭션에
     쓴다. UNSAFE인데 내용을 읽지 못했으면 넘길 수 없으므로 실패로 쓴다(적용 등급 유지).
+    CREATE-US-08-AC14: 방금 쓴 정본 내용의 지문이 DB의 마지막 통과 지문과 정확히 같으면
+    평가 없이 완료(UNSAFE)·새 요청 표를 쓴다(새 요청 표가 앞선 대기 검토를 막는다).
     """
     snapshot = capture(connection, story_id)
     if not coordinator.persists:
         return FinalSaveHandoff(snapshot)
     if snapshot is not None:
+        namespace = coordinator.reuse_namespace
+        if namespace is not None:
+            ticket = repository.reuse_review_pass(
+                connection, story_id, pass_digest(namespace, story_id, snapshot)
+            )
+            if ticket is not None:
+                logger.info("등급 검토 통과 재사용 story_id=%s", story_id)
+                return FinalSaveHandoff(snapshot, ticket, reused=True)
         return FinalSaveHandoff(snapshot, repository.mark_review_pending(connection, story_id))
     if repository.read_rating(connection, story_id)["requested_rating"] == "UNSAFE":
         repository.mark_review_failed(connection, story_id, FAILURE.reason)
@@ -579,7 +710,7 @@ def fence_final_save(
     실패로 기록한다(같은 요청 표일 때만). 요청키 영수증과 이번 응답은 커밋 시점 값 그대로다.
     """
     entered = {}
-    if handoff.request_ticket is not None:
+    if handoff.request_ticket is not None and not handoff.reused:
 
         def record():
             coordinator.record_handoff(
@@ -589,5 +720,5 @@ def fence_final_save(
         # ExitStack은 거꾸로 닫히므로 울타리를 나온 뒤에 불린다.
         after_commit.callback(record)
     entered["publication"] = after_commit.enter_context(
-        coordinator.fence(story_id, handoff.snapshot, handoff.request_ticket)
+        coordinator.fence(story_id, handoff.snapshot, handoff.request_ticket, handoff.reused)
     )

@@ -287,3 +287,63 @@ def test_wait_observes_cancelled_queued_work_CREATE_US_08_AC02(parts, monkeypatc
             evaluator.gate.set()
         assert completed.result(timeout=3)
     assert len(evaluator.calls) == 1
+
+
+class RecordingResults:
+    """결과 보관소 가짜(DB 없음). 요청 표마다 받은 결과만 기록한다."""
+
+    def __init__(self):
+        self.applied = []
+
+    def apply(self, story_id, snapshot, ticket, result, namespace=None):
+        self.applied.append((story_id, ticket, result.status))
+        return True
+
+
+def test_persisted_queue_evaluates_only_exact_latest_generation_CREATE_US_08_AC14():
+    """결과 저장 경로: 대기 B → 재사용 A → 다시 B면 최신 세대 B만 평가한다."""
+    evaluator, results = FakeEvaluator(), RecordingResults()
+    coordinator = RatingReviewCoordinator(evaluator, results=results, reuse_namespace="fake.v1")
+    try:
+        evaluator.gate.clear()
+        # 작업자 1개를 다른 스토리 검토로 막아 B를 대기열에 둔다.
+        with coordinator.fence(STORY + 1, snap(world="막기"), "t0"):
+            pass
+        assert evaluator.started.wait(5)
+        with coordinator.fence(STORY, snap(world="B"), "t1") as first_b:
+            pass
+        with coordinator.fence(STORY, snap(), "t2", reused=True) as reused_a:
+            pass
+        with coordinator.fence(STORY, snap(world="B"), "t3") as latest_b:
+            pass
+        assert (first_b.outcome, reused_a.outcome, latest_b.outcome) == (
+            "submitted",
+            "reused",
+            "submitted",
+        )
+        evaluator.gate.set()
+        assert coordinator.wait(5)
+        assert [(s, x) for s, x in evaluator.calls if s == STORY] == [(STORY, snap(world="B"))]
+        # 앞선 세대(t1)는 평가하지 않고 실패 기록만 시도한다(요청 표가 달라 DB에는 쓰이지 않는다).
+        # 최신 세대(t3)만 평가 결과를 쓴다.
+        assert (STORY, "t1", "failed") in results.applied
+        assert (STORY, "t1", "completed") not in results.applied
+        assert (STORY, "t3", "completed") in results.applied
+    finally:
+        evaluator.gate.set()
+        coordinator.close()
+
+
+def test_legacy_queue_keeps_content_dedupe_CREATE_US_08_AC14(parts):
+    """프로세스 경로(결과 보관소 없음)는 기존처럼 같은 내용의 대기 검토를 중복 제거한다."""
+    evaluator, store, coordinator = parts
+    evaluator.gate.clear()
+    coordinator.publish(STORY + 1, snap(world="막기"))
+    assert evaluator.started.wait(5)
+    assert coordinator.publish(STORY, snap(world="B")) == "submitted"
+    assert coordinator.publish(STORY, None) == "invalidated"
+    assert coordinator.publish(STORY, snap(world="B")) == "deduplicated"
+    evaluator.gate.set()
+    assert coordinator.wait(5)
+    assert [x for s, x in evaluator.calls if s == STORY] == [snap(world="B")]
+    assert store.get(STORY) == snap(world="B")
