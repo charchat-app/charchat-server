@@ -8,7 +8,7 @@ from hashlib import sha256
 from psycopg import Connection
 
 from app.core import common_safety
-from app.core.common_safety import CommonSafetyGuard, SafetyMessage
+from app.core.common_safety import CommonSafetyGuard, SafetyMessage, SafetyProfile
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.starter import repository
@@ -215,20 +215,41 @@ def _bound_intro(rows) -> tuple[SafetyMessage, ...]:
     return tuple(common_safety.safety_message(row) for row in rows)
 
 
-def _start_surface(conn: Connection, story_id: int, start: _Start | None):
-    """시작 응답에 묶이는 정본. 재시도면 기존 세션에 저장된 인트로·플레이 이름을 판정한다."""
+def _applied_profile(name: str, description: str | None) -> SafetyProfile:
+    """응답에 묶이는 적용 프로필(적용 이름·설명). 저장값과 같은 규칙으로 만든다."""
+    return SafetyProfile(name=name, description=description or "")
+
+
+def _start_surface(conn: Connection, story_id: int, start: _Start | None, *, lock: bool = False):
+    """시작 응답에 묶이는 정본. 재시도면 기존 세션에 저장된 인트로·플레이 이름을 판정한다.
+
+    lock=True는 잠금 후 재확인에서만 쓴다. 저장된 세션·적용 프로필 행을 잠근 채 읽어,
+    비교 뒤 응답 전까지 판정한 값이 바뀌지 않게 한다.
+    """
     bound: tuple[SafetyMessage, ...] = ()
     play_name = None
+    applied = None
     if start is not None and start.existing_id is not None:
-        existing = repository.get_session_bound(conn, start.existing_id)
+        # 재시도는 원본 프로필이 아니라 저장된 적용 프로필 스냅숏을 판정한다.
+        existing = repository.get_session_bound(conn, start.existing_id, lock=lock)
+        if existing is None:
+            # 저장된 세션이나 적용 프로필이 없으면 판정한 값과 같다고 볼 수 없다(닫힘).
+            return None
         bound = _bound_intro(existing["intro_messages_snapshot"])
         play_name = existing["play_name"]
+        applied = _applied_profile(play_name, existing["applied_description"])
     elif start is not None:
         bound = _bound_intro(start.snapshot)
         play_name = start.name
+        applied = _applied_profile(start.name, start.profile["description"])
     # 입력 오류(start=None)로 바인딩 값이 없어도 세션 유래 판정이다.
     return common_safety.read_story_surface(
-        conn, story_id, bound_intro=bound, bound_play_name=play_name, session_origin=True
+        conn,
+        story_id,
+        bound_intro=bound,
+        bound_play_name=play_name,
+        bound_applied_profile=applied,
+        session_origin=True,
     )
 
 
@@ -266,7 +287,7 @@ def create_session(
         start = _prepare_start(conn, owner_id, story_id, request, lock=True)
         # 잠금 후 정본이 판정한 것과 다르면 판정하지 않은 내용으로 시작하지 않는다.
         # (통과 재사용 금지)
-        if expected is not None and _start_surface(conn, story_id, start) != expected:
+        if expected is not None and _start_surface(conn, story_id, start, lock=True) != expected:
             raise StoryNotFoundError()
         if start.existing_id is not None:
             return SessionCreatedResponse(id=start.existing_id)
@@ -306,6 +327,9 @@ def get_session(
             bound_intro=_bound_intro(session["intro_messages_snapshot"]),
             bound_character_names=tuple(row["name"] or "" for row in characters),
             bound_play_name=session["play_name"],
+            bound_applied_profile=_applied_profile(
+                session["play_name"], session["applied_description"]
+            ),
             session_origin=True,
         ):
             raise SessionNotFoundError()

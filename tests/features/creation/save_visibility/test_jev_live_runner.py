@@ -483,6 +483,7 @@ def _recording_child(seen):
     [
         (runner.MODE_RATING, ["--child"]),  # 기본 모드는 그대로다.
         (runner.MODE_STORY_SAFETY, ["--child", "--story-safety"]),
+        (runner.MODE_SESSION_SAFETY, ["--child", "--session-safety"]),
     ],
 )
 def test_parent_forwards_single_mode_to_fixed_child_module_CREATE_US_08_AC15(mode, child_args):
@@ -538,6 +539,8 @@ def test_parent_rejects_unknown_mode_before_docker_CREATE_US_08_AC15():
         (["--story-safety"], ("parent", runner.MODE_STORY_SAFETY)),
         (["--child"], ("child", runner.MODE_RATING)),
         (["--child", "--story-safety"], ("child", runner.MODE_STORY_SAFETY)),
+        (["--session-safety"], ("parent", runner.MODE_SESSION_SAFETY)),
+        (["--child", "--session-safety"], ("child", runner.MODE_SESSION_SAFETY)),
     ],
 )
 def test_main_dispatches_single_explicit_mode_CREATE_US_08_AC15(monkeypatch, argv, expected):
@@ -555,6 +558,11 @@ def test_main_dispatches_single_explicit_mode_CREATE_US_08_AC15(monkeypatch, arg
         ["--story-safety", "--story-safety"],
         ["--child", "--story-safety", "x"],
         ["--other"],
+        ["--session-safety", "--child"],
+        ["--session-safety", "--story-safety"],
+        ["--story-safety", "--session-safety"],
+        ["--child", "--story-safety", "--session-safety"],
+        ["--session-safety=1"],
     ],
 )
 def test_main_rejects_other_argv_CREATE_US_08_AC15(monkeypatch, capsys, argv):
@@ -679,10 +687,11 @@ def _run_child_offline(monkeypatch, mode):
     return connections, verified, smoked
 
 
+@pytest.mark.parametrize("mode", [runner.MODE_STORY_SAFETY, runner.MODE_SESSION_SAFETY])
 def test_story_child_reuses_verified_connection_for_schema_seed_and_app_CREATE_US_08_AC15(
-    monkeypatch,
+    monkeypatch, mode
 ):
-    connections, verified, smoked = _run_child_offline(monkeypatch, runner.MODE_STORY_SAFETY)
+    connections, verified, smoked = _run_child_offline(monkeypatch, mode)
     [connection] = connections  # 연결은 하나뿐이다(DSN으로 다시 연결하지 않는다).
     [(checked, factory_at_verify, executed_before)] = verified
     assert checked is connection
@@ -701,3 +710,115 @@ def test_rating_child_keeps_dsn_based_smoke_unchanged_CREATE_US_08_AC02(monkeypa
     # 기본 모드는 기존대로 스키마 연결을 닫은 뒤 DSN 문자열로 스모크한다.
     assert smoked == [(_LOOPBACK_DSN, False, True)]
     assert connection.closed
+
+
+# --- 세션 안전 모드(--session-safety) -------------------------------------------------
+
+
+def test_session_safety_mode_is_routed_only_by_fixed_argv_CREATE_US_08_AC15():
+    """모드는 고정 argv로만 정해진다(설정·환경변수로 켜지 않는다)."""
+    assert runner._PARENT_ARGV[("--session-safety",)] == runner.MODE_SESSION_SAFETY
+    assert runner._CHILD_ARGS[runner.MODE_SESSION_SAFETY] == ("--child", "--session-safety")
+    assert runner._SMOKES[runner.MODE_SESSION_SAFETY] is runner._session_safety_smoke
+
+
+def test_session_safety_child_refuses_non_loopback_dsn_before_connecting_CREATE_US_08_AC15():
+    lines = []
+    environ = {
+        runner.ENV_DSN: "host=10.0.0.5 port=5432 dbname=jev_smoke_0000000000000000_test",
+        runner.ENV_DBNAME: "jev_smoke_0000000000000000_test",
+        runner.ENV_MARKER: "m",
+        runner.ENV_KEY: KEY,
+    }
+    try:
+        assert runner.child_main(environ, mode=runner.MODE_SESSION_SAFETY, out=lines.append) == 1
+    finally:
+        logging.disable(logging.NOTSET)
+    assert lines == [runner.status(result="failed", stage="dsn")]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            (
+                {
+                    "posts": 1,
+                    "status": 200,
+                    "elapsed_ms": 5,
+                    "transport": "ok",
+                    "outcome": "start_201",
+                },
+                201,
+                1,
+                True,
+            ),
+            0,
+        ),
+        (
+            (
+                {
+                    "posts": 1,
+                    "status": 200,
+                    "elapsed_ms": 5,
+                    "transport": "ok",
+                    "outcome": "start_201",
+                },
+                201,
+                2,
+                True,
+            ),
+            1,
+        ),  # 두 번째 외부 요청 시도
+        (
+            (
+                {
+                    "posts": 1,
+                    "status": 200,
+                    "elapsed_ms": 5,
+                    "transport": "ok",
+                    "outcome": "start_201",
+                },
+                201,
+                1,
+                False,
+            ),
+            1,
+        ),  # 저장 스냅숏 불일치
+        (
+            (
+                {
+                    "posts": 1,
+                    "status": 200,
+                    "elapsed_ms": 5,
+                    "transport": "ok",
+                    "outcome": "start_404",
+                },
+                404,
+                1,
+                False,
+            ),
+            1,
+        ),
+    ],
+)
+def test_session_safety_smoke_loader_reports_evidence_and_asserts_CREATE_US_08_AC15(
+    monkeypatch, result, expected
+):
+    from tests.features.creation.save_visibility import jev_session_safety_live as live
+
+    seen = []
+    monkeypatch.setattr(
+        live, "run_start_smoke", lambda connection, transport: seen.append(connection) or result
+    )
+    lines = []
+    marker = object()
+    check = runner._session_safety_smoke()(marker, object(), lines.append)
+    assert seen == [marker]
+    assert lines == [runner.evidence(result[0])]
+    assert runner.sanitize(lines[0]) == lines
+    if expected == 0:
+        check()
+    else:
+        with pytest.raises((AssertionError, live.PersistMismatch)):
+            check()

@@ -92,6 +92,9 @@ class SafetySurface:
     bound_profiles: tuple[SafetyProfile, ...] = ()
     # 세션 시작·조회 응답에 묶이는 실제 플레이 이름(재시도·조회는 저장된 값).
     bound_play_name: str | None = None
+    # 세션 시작·조회 응답에 묶이는 적용 프로필(적용 이름·설명). 개인 프로필일 수 있어
+    # 외부 판정기로 보내지 않는다(로컬 검사 전용, `app.core.session_safety`).
+    bound_applied_profile: SafetyProfile | None = None
     # 세션 유래 판정(대화 시작 사전 판정·세션 조회)인가. 입력 오류로 바인딩 값이 없어도 True다.
     session_origin: bool = False
 
@@ -136,6 +139,7 @@ def read_story_surface(
     bound_intro: tuple[SafetyMessage, ...] = (),
     bound_character_names: tuple[str, ...] = (),
     bound_play_name: str | None = None,
+    bound_applied_profile: SafetyProfile | None = None,
     session_origin: bool = False,
 ) -> SafetySurface | None:
     """저장본 정본 텍스트를 읽는다. 호출자의 트랜잭션(스냅숏·잠금)을 그대로 쓴다.
@@ -212,6 +216,7 @@ def read_story_surface(
             for row in presets
         ),
         bound_play_name=bound_play_name,
+        bound_applied_profile=bound_applied_profile,
         session_origin=session_origin,
     )
 
@@ -224,6 +229,7 @@ def story_is_clear(
     bound_intro: tuple[SafetyMessage, ...] = (),
     bound_character_names: tuple[str, ...] = (),
     bound_play_name: str | None = None,
+    bound_applied_profile: SafetyProfile | None = None,
     session_origin: bool = False,
 ) -> bool:
     """정본을 읽어 판정한다. 정본이 없으면 제공하지 않는다."""
@@ -233,6 +239,7 @@ def story_is_clear(
         bound_intro=bound_intro,
         bound_character_names=bound_character_names,
         bound_play_name=bound_play_name,
+        bound_applied_profile=bound_applied_profile,
         session_origin=session_origin,
     )
     return surface is not None and is_clear(guard, surface)

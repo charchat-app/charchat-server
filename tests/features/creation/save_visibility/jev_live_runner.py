@@ -1,12 +1,16 @@
 """CREATE-US-08-AC02·AC04 Jev 실제 호출 개발자 스모크 러너.
 
 pytest 수집 대상이 아니며 CI에서 실행하지 않는다.
-사용: `python -m tests.features.creation.save_visibility.jev_live_runner [--story-safety]`
+사용: `python -m tests.features.creation.save_visibility.jev_live_runner
+       [--story-safety | --session-safety]`
 - 인자 없음(기본): CREATE-US-08-AC02·AC04 등급 검토 스모크(기존 동작 그대로).
 - `--story-safety`: CREATE-US-08-AC15 스토리 공통 안전 후보의 관람 미리보기 1회 스모크.
   같은 고정 자식 모듈·일회용 DB·DSN 격리·정리를 그대로 쓰고, 자식에 모드 하나만 넘긴다.
   자식은 대상 확인을 마친 연결 객체 하나로 스키마·시드·앱 요청 커넥션을 모두 처리하고,
   보내기 전에 요청 전체를 고정 기대 요청과 비교한다.
+- `--session-safety`: CREATE-US-08-AC15 세션 안전 조합 판정기(테스트 전용 모의 로컬 검사 → Jev
+  정본)의 대화 시작 POST 1회 스모크. `--story-safety`와 같은 격리·같은 연결 객체를 쓰고,
+  201과 같은 연결로 저장된 세션 스냅숏, 외부 전송 시도 1회를 확인한다.
 실행 셸에 `OPENROUTER_API_KEY`를 명시적으로 넣는다(`.env`를 읽지 않는다).
 
 부모(`app`을 import하지 않음)
@@ -94,11 +98,20 @@ ENV_MARKER = "CHARCHAT_JEV_SMOKE_MARKER"
 ENV_KEY = "OPENROUTER_API_KEY"
 MODE_RATING = "rating"
 MODE_STORY_SAFETY = "story_safety"
+MODE_SESSION_SAFETY = "session_safety"
 # 모드마다 고정 자식 argv(모듈은 `MODULE` 하나로 고정).
-_CHILD_ARGS = {MODE_RATING: ("--child",), MODE_STORY_SAFETY: ("--child", "--story-safety")}
-_PARENT_ARGV = {(): MODE_RATING, ("--story-safety",): MODE_STORY_SAFETY}
+_CHILD_ARGS = {
+    MODE_RATING: ("--child",),
+    MODE_STORY_SAFETY: ("--child", "--story-safety"),
+    MODE_SESSION_SAFETY: ("--child", "--session-safety"),
+}
+_PARENT_ARGV = {
+    (): MODE_RATING,
+    ("--story-safety",): MODE_STORY_SAFETY,
+    ("--session-safety",): MODE_SESSION_SAFETY,
+}
 _CHILD_ARGV = {args: mode for mode, args in _CHILD_ARGS.items()}
-# 스토리 공통 안전 모드의 증거 줄에 싣는 기록 키(원문·응답은 싣지 않는다).
+# 스토리·세션 공통 안전 모드의 증거 줄에 싣는 기록 키(원문·응답은 싣지 않는다).
 EVIDENCE_KEYS = ("posts", "status", "elapsed_ms", "transport", "outcome")
 
 
@@ -571,7 +584,7 @@ def verify_target(connection, dbname, marker):
 
 
 # 모드별 스모크 적재기: import만 하고 `run(target, transport, out) -> check`를 돌려준다.
-# 기본(등급) 모드의 `target`은 DSN이고, 스토리 공통 안전 모드는 확인을 마친 연결 객체다.
+# 기본(등급) 모드의 `target`은 DSN이고, 스토리·세션 공통 안전 모드는 확인을 마친 연결 객체다.
 def _rating_smoke():
     from tests.features.creation.save_visibility.test_jev_live_smoke import (
         assert_approved,
@@ -599,7 +612,25 @@ def _story_safety_smoke():
     return run
 
 
-_SMOKES = {MODE_RATING: _rating_smoke, MODE_STORY_SAFETY: _story_safety_smoke}
+def _session_safety_smoke():
+    from tests.features.creation.save_visibility.jev_session_safety_live import (
+        assert_start_persisted,
+        run_start_smoke,
+    )
+
+    def run(connection, transport, out):
+        record, start_status, attempts, persisted = run_start_smoke(connection, transport)
+        out(evidence(record))  # 허용 키 값만. 부모가 `sanitize`로 다시 거른다.
+        return lambda: assert_start_persisted(record, start_status, attempts, persisted)
+
+    return run
+
+
+_SMOKES = {
+    MODE_RATING: _rating_smoke,
+    MODE_STORY_SAFETY: _story_safety_smoke,
+    MODE_SESSION_SAFETY: _session_safety_smoke,
+}
 
 
 def child_main(environ=None, *, mode=MODE_RATING, out=print):

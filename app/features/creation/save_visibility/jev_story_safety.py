@@ -62,12 +62,14 @@ _ALLOWED = {QUESTION: frozenset(CHOICES)}
 
 
 def _has_session_values(surface: SafetySurface) -> bool:
-    """세션 유래 판정이거나 세션 유래 값(렌더링 인트로·플레이 이름·세션 캐릭터 이름)이 있는가."""
+    """세션 유래 판정이거나 세션 유래 값(렌더링 인트로·플레이 이름·세션 캐릭터 이름·적용 프로필)이
+    있는가."""
     return bool(
         surface.session_origin
         or surface.bound_intro
         or surface.bound_character_names
         or surface.bound_play_name is not None
+        or surface.bound_applied_profile is not None
     )
 
 

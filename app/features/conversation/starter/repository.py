@@ -234,7 +234,8 @@ def copy_relationships(conn: Connection, session_id: int):
 def get_session(conn: Connection, session_id: int, owner_id: int):
     return conn.execute(
         """SELECT cs.id, cs.story_id, s.title AS story_title, cs.intro_messages_snapshot,
-                  m.name AS model, s.deleted_at IS NOT NULL AS read_only, up.name AS play_name
+                  m.name AS model, s.deleted_at IS NOT NULL AS read_only, up.name AS play_name,
+                  up.description AS applied_description
            FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
            JOIN models m ON m.id = cs.selected_model_id
            JOIN conversation_user_profiles up ON up.session_id = cs.id
@@ -253,12 +254,18 @@ def list_session_characters(conn: Connection, session_id: int):
     ).fetchall()
 
 
-def get_session_bound(conn: Connection, session_id: int):
-    """재시도 응답에 묶이는 기존 세션의 인트로 스냅숏과 저장된 플레이 이름."""
-    return conn.execute(
-        """SELECT cs.intro_messages_snapshot, up.name AS play_name
-           FROM conversation_sessions cs
-           JOIN conversation_user_profiles up ON up.session_id = cs.id
-           WHERE cs.id = %s""",
-        (session_id,),
-    ).fetchone()
+def get_session_bound(conn: Connection, session_id: int, *, lock: bool = False):
+    """재시도 응답에 묶이는 기존 세션의 인트로 스냅숏과 저장된 적용 프로필(이름·설명).
+
+    lock=True(잠금 후 재확인)는 세션 행과 적용 프로필 행을 모두 `FOR SHARE`로 잠근다.
+    내부 조인이라 잠글 쪽에 NULL 행이 없고, 둘 중 하나라도 없으면 행 없음(None)이다.
+    읽기 전용 사전 판정에서는 잠글 수 없어 lock=False로 읽는다.
+    """
+    query = """SELECT cs.intro_messages_snapshot, up.name AS play_name,
+                      up.description AS applied_description
+               FROM conversation_sessions cs
+               JOIN conversation_user_profiles up ON up.session_id = cs.id
+               WHERE cs.id = %s"""
+    if lock:
+        query += " FOR SHARE OF cs, up"
+    return conn.execute(query, (session_id,)).fetchone()
