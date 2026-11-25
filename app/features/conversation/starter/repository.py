@@ -88,17 +88,24 @@ def get_latest_session_id(conn: Connection, story_id: int, owner_id: int) -> int
     return row["id"] if row else None
 
 
-def get_selected_profile(conn: Connection, story_id: int, owner_id: int, kind, profile_id: int):
+def get_selected_profile(
+    conn: Connection, story_id: int, owner_id: int, kind, profile_id: int, *, lock: bool = True
+):
+    # 읽기 전용 사전 판정(CREATE-US-08-AC15)에서는 행 잠금을 걸 수 없어
+    # lock=False로 읽는다.
+    share = " FOR SHARE" if lock else ""
     if kind == "preset":
         row = conn.execute(
             """SELECT id, name, description, image_id FROM story_user_presets
-               WHERE id = %s AND story_id = %s FOR SHARE""",
+               WHERE id = %s AND story_id = %s"""
+            + share,
             (profile_id, story_id),
         ).fetchone()
     else:
         row = conn.execute(
             """SELECT id, name, description, image_id FROM user_profiles
-               WHERE id = %s AND owner_id = %s FOR SHARE""",
+               WHERE id = %s AND owner_id = %s"""
+            + share,
             (profile_id, owner_id),
         ).fetchone()
     return dict(row, kind=kind) if row else None
@@ -226,8 +233,8 @@ def copy_relationships(conn: Connection, session_id: int):
 
 def get_session(conn: Connection, session_id: int, owner_id: int):
     return conn.execute(
-        """SELECT cs.id, s.title AS story_title, cs.intro_messages_snapshot, m.name AS model,
-                  s.deleted_at IS NOT NULL AS read_only, up.name AS play_name
+        """SELECT cs.id, cs.story_id, s.title AS story_title, cs.intro_messages_snapshot,
+                  m.name AS model, s.deleted_at IS NOT NULL AS read_only, up.name AS play_name
            FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
            JOIN models m ON m.id = cs.selected_model_id
            JOIN conversation_user_profiles up ON up.session_id = cs.id
@@ -244,3 +251,14 @@ def list_session_characters(conn: Connection, session_id: int):
            WHERE session_id = %s ORDER BY id""",
         (session_id,),
     ).fetchall()
+
+
+def get_session_bound(conn: Connection, session_id: int):
+    """재시도 응답에 묶이는 기존 세션의 인트로 스냅숏과 저장된 플레이 이름."""
+    return conn.execute(
+        """SELECT cs.intro_messages_snapshot, up.name AS play_name
+           FROM conversation_sessions cs
+           JOIN conversation_user_profiles up ON up.session_id = cs.id
+           WHERE cs.id = %s""",
+        (session_id,),
+    ).fetchone()

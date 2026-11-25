@@ -2,10 +2,13 @@
 
 import json
 from collections import defaultdict
+from dataclasses import dataclass
 from hashlib import sha256
 
 from psycopg import Connection
 
+from app.core import common_safety
+from app.core.common_safety import CommonSafetyGuard, SafetyMessage, SafetyProfile
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.starter import repository
@@ -56,11 +59,29 @@ def _message(row) -> MessageResponse:
     )
 
 
-def get_story(conn: Connection, owner_id: int, story_id: int) -> StoryResponse:
+def get_story(
+    conn: Connection, owner_id: int, story_id: int, guard: CommonSafetyGuard | None = None
+) -> StoryResponse:
     with conn.transaction():
         repository.set_consistent_read(conn)
         story = repository.get_story(conn, story_id, owner_id)
         if story is None:
+            raise StoryNotFoundError()
+        profiles = [
+            row
+            for row in repository.list_profiles(conn, story_id, owner_id)
+            if _eligible_profile(row)
+        ]
+        # CREATE-US-08-AC15: 응답과 같은 스냅숏의 정본과 응답에 나가는 제작자 프리셋을
+        # 판정한다. 비공개 소유자도 우회하지 않는다.
+        presets = tuple(
+            SafetyProfile(name=row["name"], description=row["description"] or "")
+            for row in profiles
+            if row["kind"] == "preset"
+        )
+        if guard is not None and not common_safety.story_is_clear(
+            conn, guard, story_id, bound_profiles=presets
+        ):
             raise StoryNotFoundError()
         messages = defaultdict(list)
         for row in repository.list_intro_messages(conn, story_id):
@@ -93,8 +114,7 @@ def get_story(conn: Connection, owner_id: int, story_id: int) -> StoryResponse:
                     if _is_placeholder_preset(row)
                     else row["name"],
                 )
-                for row in repository.list_profiles(conn, story_id, owner_id)
-                if _eligible_profile(row)
+                for row in profiles
             ],
             existing_session_id=repository.get_latest_session_id(conn, story_id, owner_id),
             tags=repository.list_tags(conn, story_id),
@@ -160,39 +180,114 @@ def _render_message(row, name: str) -> MessageResponse:
     return message
 
 
-def create_session(
-    conn: Connection, owner_id: int, story_id: int, request: SessionCreateRequest
-) -> SessionCreatedResponse:
+@dataclass
+class _Start:
+    """잠금 전 사전 판정과 잠금 후 저장이 같은 규칙으로 계산하는 시작 준비 결과."""
+
+    fingerprint: bytes
+    existing_id: int | None
+    profile: dict | None = None
+    name: str | None = None
+    snapshot: list[dict] | None = None
+
+
+def _prepare_start(
+    conn: Connection, owner_id: int, story_id: int, request: SessionCreateRequest, *, lock: bool
+) -> _Start:
+    # 제작 저장·삭제와 동일한 스토리 행 잠금으로 저장본 세대를 고정한다.
+    if repository.get_story(conn, story_id, owner_id, lock=lock) is None:
+        raise StoryNotFoundError()
+    # 기본 이름이나 원본 선택지가 바뀌어도 최초의 검증된 요청으로 재시도를 찾는다.
+    payload = json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":"))
+    fingerprint = sha256(payload.encode("ascii")).digest()
+    existing_id = repository.get_initial_session_id(conn, story_id, owner_id, fingerprint)
+    if existing_id is not None:
+        return _Start(fingerprint, existing_id)
+    if not any(row["id"] == request.intro_id for row in repository.list_intros(conn, story_id)):
+        raise IntroNotFoundError()
+    profile = repository.get_selected_profile(
+        conn, story_id, owner_id, request.profile_kind, request.profile_id, lock=lock
+    )
+    if profile is None or not _eligible_profile(profile):
+        raise ProfileNotFoundError()
+    name = _play_name(conn, owner_id, request, profile, repository.list_characters(conn, story_id))
+    snapshot = [
+        _render_message(row, name).model_dump()
+        for row in repository.list_intro_messages(conn, story_id, request.intro_id)
+    ]
+    return _Start(fingerprint, None, profile, name, snapshot)
+
+
+def _bound_intro(rows) -> tuple[SafetyMessage, ...]:
+    return tuple(common_safety.safety_message(row) for row in rows)
+
+
+def _start_surface(conn: Connection, story_id: int, start: _Start | None):
+    """시작 응답에 묶이는 정본. 재시도면 기존 세션에 저장된 인트로·플레이 이름을 판정한다."""
+    bound: tuple[SafetyMessage, ...] = ()
+    play_name = None
+    if start is not None and start.existing_id is not None:
+        existing = repository.get_session_bound(conn, start.existing_id)
+        bound = _bound_intro(existing["intro_messages_snapshot"])
+        play_name = existing["play_name"]
+    elif start is not None:
+        bound = _bound_intro(start.snapshot)
+        play_name = start.name
+    return common_safety.read_story_surface(
+        conn, story_id, bound_intro=bound, bound_play_name=play_name
+    )
+
+
+_START_INPUT_ERRORS = (IntroNotFoundError, ProfileNotFoundError, InvalidPlayNameError)
+
+
+def _preflight_surface(conn: Connection, owner_id: int, story_id: int, request):
+    """CREATE-US-08-AC15 잠금 전 사전 판정용 정본. 판정기 호출 동안 스토리 잠금을 잡지 않는다.
+
+    선택 입력이 틀리면 정본만 판정한다(차단 스토리는 입력 오류보다 먼저 미노출로 닫는다).
+    잠금 후에는 같은 입력 오류가 다시 나거나, 그 사이 입력이 유효해졌다면 정본이 달라 닫힌다.
+    """
     with conn.transaction():
-        # 제작 저장·삭제와 동일한 스토리 행 잠금으로 저장본 세대를 고정한다.
-        if repository.get_story(conn, story_id, owner_id, lock=True) is None:
+        repository.set_consistent_read(conn)
+        try:
+            start = _prepare_start(conn, owner_id, story_id, request, lock=False)
+        except _START_INPUT_ERRORS:
+            start = None
+        return _start_surface(conn, story_id, start)
+
+
+def create_session(
+    conn: Connection,
+    owner_id: int,
+    story_id: int,
+    request: SessionCreateRequest,
+    guard: CommonSafetyGuard | None = None,
+) -> SessionCreatedResponse:
+    expected = None
+    if guard is not None:
+        expected = _preflight_surface(conn, owner_id, story_id, request)
+        if expected is None or not common_safety.is_clear(guard, expected):
             raise StoryNotFoundError()
-        # 기본 이름이나 원본 선택지가 바뀌어도 최초의 검증된 요청으로 재시도를 찾는다.
-        payload = json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":"))
-        fingerprint = sha256(payload.encode("ascii")).digest()
-        existing_id = repository.get_initial_session_id(conn, story_id, owner_id, fingerprint)
-        if existing_id is not None:
-            return SessionCreatedResponse(id=existing_id)
-        if not any(row["id"] == request.intro_id for row in repository.list_intros(conn, story_id)):
-            raise IntroNotFoundError()
-        profile = repository.get_selected_profile(
-            conn, story_id, owner_id, request.profile_kind, request.profile_id
-        )
-        if profile is None or not _eligible_profile(profile):
-            raise ProfileNotFoundError()
-        name = _play_name(
-            conn, owner_id, request, profile, repository.list_characters(conn, story_id)
-        )
-        snapshot = [
-            _render_message(row, name).model_dump()
-            for row in repository.list_intro_messages(conn, story_id, request.intro_id)
-        ]
+    with conn.transaction():
+        start = _prepare_start(conn, owner_id, story_id, request, lock=True)
+        # 잠금 후 정본이 판정한 것과 다르면 판정하지 않은 내용으로 시작하지 않는다.
+        # (통과 재사용 금지)
+        if expected is not None and _start_surface(conn, story_id, start) != expected:
+            raise StoryNotFoundError()
+        if start.existing_id is not None:
+            return SessionCreatedResponse(id=start.existing_id)
         # 세션 시작 때 기본 모델을 고정한다(KAN-16 AC20). 이후 생성은 이 모델을 쓴다.
         model_id = _default_model_id(conn)
         session_id = repository.insert_session(
-            conn, story_id, owner_id, request.intro_id, snapshot, fingerprint, model_id
+            conn,
+            story_id,
+            owner_id,
+            request.intro_id,
+            start.snapshot,
+            start.fingerprint,
+            model_id,
         )
-        repository.insert_applied_profile(conn, session_id, profile, name)
+        repository.insert_applied_profile(conn, session_id, start.profile, start.name)
         repository.copy_scene_state(conn, session_id, request.intro_id)
         repository.copy_character_states(conn, session_id, story_id, request.intro_id)
         repository.copy_affinities(conn, session_id)
@@ -200,11 +295,24 @@ def create_session(
     return SessionCreatedResponse(id=session_id)
 
 
-def get_session(conn: Connection, owner_id: int, session_id: int) -> SessionResponse:
+def get_session(
+    conn: Connection, owner_id: int, session_id: int, guard: CommonSafetyGuard | None = None
+) -> SessionResponse:
     with conn.transaction():
         repository.set_consistent_read(conn)
         session = repository.get_session(conn, session_id, owner_id)
         if session is None:
+            raise SessionNotFoundError()
+        characters = repository.list_session_characters(conn, session_id)
+        # CREATE-US-08-AC15: 현재 정본과 이 응답에 나가는 세션 인트로·캐릭터 이름을 함께 판정한다.
+        if guard is not None and not common_safety.story_is_clear(
+            conn,
+            guard,
+            session["story_id"],
+            bound_intro=_bound_intro(session["intro_messages_snapshot"]),
+            bound_character_names=tuple(row["name"] or "" for row in characters),
+            bound_play_name=session["play_name"],
+        ):
             raise SessionNotFoundError()
         return SessionResponse(
             id=session_id,
@@ -216,7 +324,6 @@ def get_session(conn: Connection, owner_id: int, session_id: int) -> SessionResp
             play_name=session["play_name"],
             messages=session["intro_messages_snapshot"],
             characters=[
-                CharacterResponse(id=row["id"], name=row["name"] or "")
-                for row in repository.list_session_characters(conn, session_id)
+                CharacterResponse(id=row["id"], name=row["name"] or "") for row in characters
             ],
         )

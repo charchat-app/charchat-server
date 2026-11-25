@@ -917,7 +917,15 @@ def test_autosave_receipt_finalizes_after_review_completion_CREATE_US_07_AC09_US
     assert ctx.coordinator.wait(5)
     assert rating_view(ctx)[:2] == ("UNSAFE", "completed")
 
-    final = put(ctx.client, ctx.story, finalize_payload(saved, "auto-during-review"), "final")
-    assert final.status_code == 200, final.text
-    assert final.json()["finalize_auto_request_id"] is None
-    assert_matches_canonical(ctx, final)
+    ctx.evaluator.gate.clear()
+    try:
+        final = put(ctx.client, ctx.story, finalize_payload(saved, "auto-during-review"), "final")
+        assert final.status_code == 200, final.text
+        assert final.json()["finalize_auto_request_id"] is None
+        assert final.json()["rating_review_status"] == "reviewing"
+        assert_matches_canonical(ctx, final)
+    finally:
+        ctx.evaluator.gate.set()
+    assert ctx.coordinator.wait(5)
+    assert rating_view(ctx) == ("UNSAFE", "completed", None)
+    assert creation(ctx).json()["saved_at"] == final.json()["saved_at"]

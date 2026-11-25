@@ -7,6 +7,11 @@ from psycopg import Connection
 Row = dict[str, Any]
 
 
+def set_consistent_read(conn: Connection) -> None:
+    """검색 결과와 공통 안전 판정(CREATE-US-08-AC15)이 같은 스냅숏을 보게 한다."""
+    conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+
 def insert_story(
     conn: Connection, owner_id: int, title: str | None, subtitle: str | None, world: str | None
 ) -> Row:
