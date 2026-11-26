@@ -692,6 +692,10 @@ INSERT INTO public.models (name, provider, provider_model_id) VALUES
 -- text: 스트리밍 누적 원문(롱 폴링 offset 기준). 완료 시 파싱 결과는 conversation_message_parts에 둔다.
 -- billable은 정상 응답 및 본문을 제공한 모델 출력 한도 종료에 true. 서버·저장 실패는 false.
 -- updated_at은 작업의 갱신 시각(멈춘 작업 정리 기준)이다.
+-- CHAT-US-13: model_id는 이 생성이 요청한 모델(생성 행을 만들 때의 세션 선택 모델)이고,
+-- reported_model은 공급자가 응답에 실어 보낸 실제 모델 ID(예: OpenAI SSE 조각의 "model")다.
+-- 공급자가 알려 주지 않았거나 첫 조각 전에 실패하면 NULL이다.
+-- (reported_model은 app/db/migrations/kan23_model_change.sql로 기존 DB에 추가한다.)
 CREATE TABLE public.conversation_generations (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     session_id bigint NOT NULL REFERENCES public.conversation_sessions(id),
@@ -707,6 +711,7 @@ CREATE TABLE public.conversation_generations (
     billable boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    reported_model text,
     CONSTRAINT conversation_generations_request_unique UNIQUE (session_id, request_id),
     CONSTRAINT conversation_generations_assistant_message_unique UNIQUE (assistant_message_id),
     CONSTRAINT conversation_generations_user_message_fk
