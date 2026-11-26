@@ -8,6 +8,11 @@ from app.main import create_app
 OWNER_ID = 100
 
 
+@pytest.fixture(autouse=True)
+def dev_user_header(dev_user_header_enabled):
+    """BASE-03: 이 폴더 테스트는 개발용 X-User-Id 헤더로 사용자를 정한다(tests/conftest.py)."""
+
+
 def create_story(db):
     return db.execute(
         """INSERT INTO stories(owner_id,title,world_description) VALUES (%s,%s,%s)

@@ -61,6 +61,9 @@ class GenerationResponse(BaseModel):
     next_offset: int
     error_code: str | None
     retryable: bool
+    # 이 생성이 요청한 모델의 표시 이름(models.name of model_id, CHAT-US-13). 진행 중 생성은
+    # 세션 모델을 바꿔도 이 모델로 끝까지 진행한다.
+    model: str
 
 
 class TurnsResponse(BaseModel):
@@ -68,3 +71,5 @@ class TurnsResponse(BaseModel):
     active_generation: GenerationResponse | None
     last_failed_generation: GenerationResponse | None
     model: str
+    # 세션의 현재 선택 모델 id(CHAT-US-13). 다음 전송·재시도가 이 모델로 요청한다.
+    model_id: int

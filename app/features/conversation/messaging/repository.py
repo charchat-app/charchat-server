@@ -15,11 +15,13 @@ MESSAGE_STATUS = {
     "failed_partial": "interrupted",
 }
 
+# model_name은 생성이 요청한 모델(g.model_id)의 표시 이름이다. 세션의 현재 선택 모델과 다를 수 있다.
 _GENERATION_COLUMNS = """g.id, g.session_id, cs.owner_id, g.status, g.user_message_id,
-    g.assistant_message_id, g.error_code, g.model_id, g.billable, g.request_id,
-    char_length(g.text) AS text_length"""
+    g.assistant_message_id, g.error_code, g.model_id, gm.name AS model_name, g.reported_model,
+    g.billable, g.request_id, char_length(g.text) AS text_length"""
 _GENERATION_FROM = """conversation_generations g
-    JOIN conversation_sessions cs ON cs.id = g.session_id"""
+    JOIN conversation_sessions cs ON cs.id = g.session_id
+    JOIN models gm ON gm.id = g.model_id"""
 # 팀 메시지 표에는 시각 컬럼이 없어 생성 작업의 시각을 쓴다. 이용자 메시지는 처음 만든 생성 요청의
 # 시각, AI 메시지는 그 생성의 마지막 갱신(완료) 시각이다.
 _MESSAGE_CREATED_AT = """COALESCE(
@@ -38,6 +40,17 @@ def set_consistent_read(conn: Connection) -> None:
 
 def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool = False):
     # 시작 API(get_session)와 같은 접근 규칙: 삭제 스토리 세션은 읽기 전용으로 남는다.
+    if lock:
+        # 조인 없이 세션 행만 먼저 잠근다. 조인 쿼리에 FOR UPDATE를 붙이면, 기다리는 동안
+        # 모델이 바뀐 경우(CHAT-US-13) 바뀐 행을 옛 models 행과 다시 맞춰 보다가 0행이 되어
+        # 세션을 못 찾은 것처럼 404가 난다. 잠금을 얻은 뒤 아래 조회는 커밋된 최신 값을 읽는다.
+        locked = conn.execute(
+            "SELECT cs.id FROM conversation_sessions cs"
+            " WHERE cs.id = %s AND cs.owner_id = %s FOR UPDATE",
+            (session_id, owner_id),
+        ).fetchone()
+        if locked is None:
+            return None
     query = """
         SELECT cs.id, cs.story_id, cs.selected_model_id, md.name AS model_name,
                cs.intro_messages_snapshot, s.deleted_at IS NOT NULL AS read_only
@@ -47,8 +60,6 @@ def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool 
           AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
                OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))
     """
-    if lock:
-        query += " FOR UPDATE OF cs"
     return conn.execute(query, (session_id, owner_id)).fetchone()
 
 
@@ -270,13 +281,19 @@ def mark_streaming(conn: Connection, generation_id: int):
     ).fetchone()
 
 
-def append_text(conn: Connection, generation_id: int, chunk: str) -> bool:
-    """누적 원문 뒤에 붙인다. 진행 중이 아니면(정리됨) False."""
+def append_text(
+    conn: Connection, generation_id: int, chunk: str, reported_model: str | None = None
+) -> bool:
+    """누적 원문 뒤에 붙인다. 진행 중이 아니면(정리됨) False.
+
+    공급자가 알려 준 실제 모델 ID가 있으면 처음 값을 함께 남긴다(CHAT-US-13).
+    """
     row = conn.execute(
         """UPDATE conversation_generations
-           SET text = text || %s, updated_at = clock_timestamp()
+           SET text = text || %s, reported_model = COALESCE(reported_model, %s),
+               updated_at = clock_timestamp()
            WHERE id = %s AND status = 'streaming' RETURNING id""",
-        (chunk, generation_id),
+        (chunk, reported_model, generation_id),
     ).fetchone()
     return row is not None
 
@@ -288,12 +305,18 @@ def finish_generation(
     *,
     error_code: str | None = None,
     billable: bool = False,
+    reported_model: str | None = None,
 ) -> bool:
-    """streaming인 생성을 끝내고 assistant 메시지 상태를 MESSAGE_STATUS로 맞춘다."""
+    """streaming인 생성을 끝내고 assistant 메시지 상태를 MESSAGE_STATUS로 맞춘다.
+
+    reported_model은 공급자가 알려 준 실제 모델 ID다. 이미 기록된 값이 있으면 그대로 둔다.
+    """
     row = conn.execute(
         """WITH g AS (
                UPDATE conversation_generations
-               SET status = %s, error_code = %s, billable = %s, updated_at = clock_timestamp()
+               SET status = %s, error_code = %s, billable = %s,
+                   reported_model = COALESCE(reported_model, %s),
+                   updated_at = clock_timestamp()
                WHERE id = %s AND status = 'streaming'
                RETURNING id, session_id, assistant_message_id
            ), message AS (
@@ -301,7 +324,7 @@ def finish_generation(
                FROM g WHERE m.session_id = g.session_id AND m.id = g.assistant_message_id
            )
            SELECT id FROM g""",
-        (status, error_code, billable, generation_id, MESSAGE_STATUS[status]),
+        (status, error_code, billable, reported_model, generation_id, MESSAGE_STATUS[status]),
     ).fetchone()
     return row is not None
 

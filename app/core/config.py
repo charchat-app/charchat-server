@@ -1,8 +1,13 @@
 """환경 설정. 값은 환경변수 또는 .env에서 읽는다."""
 
+import secrets
 from typing import Literal
 
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# staging·production의 AUTH_JWT_SECRET 최소 길이(HS256 키 256비트).
+JWT_SECRET_MIN_BYTES = 32
 
 
 class Settings(BaseSettings):
@@ -39,6 +44,72 @@ class Settings(BaseSettings):
     # fake 공급자의 조각 사이 지연(밀리초)과 강제 실패(before: 내용 없이, after: 일부 후).
     chat_fake_chunk_delay_ms: int = 30
     chat_fake_fail_mode: Literal["none", "before", "after"] = "none"
+    # BASE-03 로그인. staging·production에서 아래 개발용 플래그가 하나라도 켜져 있으면
+    # 시작하지 않는다.
+    app_env: Literal["local", "test", "staging", "production"] = "local"
+    # 켜면 Authorization 헤더가 없을 때만 예전 개발용 X-User-Id 헤더로 사용자를 정한다.
+    auth_dev_header_enabled: bool = False
+    # 켜면 dev 제공자(POST /auth/tokens grant_type=dev)로 키만으로 로그인할 수 있다.
+    auth_dev_login_enabled: bool = False
+    # 액세스 토큰 수명(초)과 리프레시 토큰 수명(일). 리프레시는 회전할 때마다 다시 연장된다.
+    auth_access_ttl_seconds: int = Field(default=1800, gt=0)
+    auth_refresh_ttl_days: int = Field(default=60, gt=0)
+    # 온보딩 필수 동의 버전(약관·개인정보). 만 14세 이상 자기 확인은 'self-v1'로 고정한다.
+    # staging·production은 draft-로 시작하는 버전이면 시작하지 않는다(실제 가입 전 확정 버전 필수).
+    auth_terms_version: str = Field(default="draft-v1", min_length=1)
+    auth_privacy_version: str = Field(default="draft-v1", min_length=1)
+    # 이메일·비밀번호 회원가입과 로그인(POST /auth/signup, grant_type=password).
+    auth_password_login_enabled: bool = True
+    # 액세스 토큰(JWT HS256) 서명 키. staging·production은 32바이트 이상이 아니면 시작하지 않는다.
+    # local·test에서 비워 두면 프로세스 시작 때 임시 키를 만든다. 재시작(--reload 포함)하면
+    # 이전 액세스 토큰이 AUTH_TOKEN_INVALID가 되고 앱은 리프레시 없이 로그아웃한다.
+    # 로컬도 .env에 고정 키를 넣기를 권장한다.
+    auth_jwt_secret: SecretStr = SecretStr("")
+    auth_jwt_issuer: str = Field(default="charchat", min_length=1)
+
+    @model_validator(mode="after")
+    def _ephemeral_jwt_secret_for_local(self) -> "Settings":
+        if self.app_env in ("local", "test") and not self.auth_jwt_secret.get_secret_value():
+            self.auth_jwt_secret = SecretStr(secrets.token_urlsafe(48))
+        return self
+
+    def assert_safe_for_startup(self) -> None:
+        """staging·production에서 개발용 인증 경로가 켜져 있거나, JWT 서명 키가 없거나 32바이트
+        미만이거나 약관·개인정보 버전이 draft-로 시작하면 시작을 거부한다."""
+        secret_bytes = len(self.auth_jwt_secret.get_secret_value().encode("utf-8"))
+        if self.app_env in ("staging", "production") and secret_bytes < JWT_SECRET_MIN_BYTES:
+            raise RuntimeError(
+                f"APP_ENV={self.app_env}에서는 AUTH_JWT_SECRET을 "
+                f"{JWT_SECRET_MIN_BYTES}바이트 이상으로 설정해야 합니다."
+            )
+        drafts = [
+            name
+            for name, version in (
+                ("AUTH_TERMS_VERSION", self.auth_terms_version),
+                ("AUTH_PRIVACY_VERSION", self.auth_privacy_version),
+            )
+            if version.startswith("draft-")
+        ]
+        if self.app_env in ("staging", "production") and drafts:
+            raise RuntimeError(
+                f"APP_ENV={self.app_env}에서는 확정된 약관·개인정보 버전이 필요합니다"
+                f"(draft-로 시작하는 값 불가): {', '.join(drafts)}"
+            )
+        if self.app_env not in ("staging", "production"):
+            return
+        enabled = [
+            name
+            for name, on in (
+                ("AUTH_DEV_HEADER_ENABLED", self.auth_dev_header_enabled),
+                ("AUTH_DEV_LOGIN_ENABLED", self.auth_dev_login_enabled),
+            )
+            if on
+        ]
+        if enabled:
+            raise RuntimeError(
+                f"APP_ENV={self.app_env}에서는 개발용 인증 설정을 켤 수 없습니다: "
+                f"{', '.join(enabled)}"
+            )
 
 
 settings = Settings()

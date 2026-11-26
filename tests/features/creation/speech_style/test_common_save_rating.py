@@ -23,6 +23,7 @@ from tests.features.creation.speech_style.test_common_save_api import (
 )
 from tests.features.creation.speech_style.test_working_copy_save import (
     publish,
+    stored_custom_style,
     working_copy_rows,
 )
 
@@ -533,8 +534,17 @@ def _image_working_copy(client, story, saved, dsn):
 
 
 def _other_visibility(client, story, saved, dsn):
-    staged = put(client, story, rating_only_stage(saved), "s1").json()
-    return staged["working_copy_saved_at"], {"save_state": "public"}
+    # 비공개→공개만 허용한다. 공개 스토리를 비공개로 되돌리는 반영은 그대로 거절한다.
+    public = put(client, story, current_payload(saved, "public"), "go-public")
+    assert public.status_code == 200, public.text
+    staged = put(client, story, rating_only_stage(public.json()), "s1").json()
+    return staged["working_copy_saved_at"], {"save_state": "private"}
+
+
+def _stale_by_restage_to_public(client, story, saved, dsn):
+    first = put(client, story, rating_only_stage(saved), "s1").json()
+    assert put(client, story, rating_only_stage(saved, "SAFE"), "s2").status_code == 200
+    return first["working_copy_saved_at"], {"save_state": "public"}
 
 
 @pytest.mark.parametrize(
@@ -545,6 +555,7 @@ def _other_visibility(client, story, saved, dsn):
         _mixed_then_rating,
         _image_working_copy,
         _other_visibility,
+        _stale_by_restage_to_public,
     ],
 )
 def test_rating_finalize_rejects_stale_or_mixed_copy_CREATE_US_08_AC13(context, arrange):
@@ -573,6 +584,89 @@ def test_rating_finalize_rejects_stale_or_mixed_copy_CREATE_US_08_AC13(context, 
         ).fetchone()[0]
     assert copy_after == copy_before
     assert recorded == 0
+
+
+def commit_newer_scene(dsn, story, text="정본 최신 장면"):
+    """임시 저장 뒤 다른 경로가 정본 장면을 바꾼 상황을 흉내 낸다."""
+    with psycopg.connect(dsn) as connection:
+        connection.execute(
+            "UPDATE story_expression_settings SET custom_style=%s WHERE story_id=%s",
+            (text, story["id"]),
+        )
+
+
+def test_rating_finalize_private_to_public_uses_latest_committed_scene_CREATE_US_08_AC13(
+    context,
+):
+    client, _, story, _, dsn = context
+    saved = publish(client, story, dsn)
+    before = set_review_state(dsn, story, REVIEW_STATES[2])
+    staged = put(client, story, rating_only_stage(saved), "rating-stage")
+    assert staged.status_code == 200, staged.text
+    assert staged.json()["rating_only_working_copy"] is True
+    commit_newer_scene(dsn, story)
+    finalize = rating_finalize(saved, staged.json()["working_copy_saved_at"], save_state="public")
+    result = put(client, story, finalize, "rating-finalize-public")
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["save_state"] == "public"
+    assert data["requested_rating"] == "UNSAFE"
+    assert data["working_copy_saved_at"] is None
+    assert data["rating_only_working_copy"] is False
+    assert data["expression"]["custom_style"] == "정본 최신 장면"
+    assert stored_custom_style(dsn, story) == "정본 최신 장면"
+    after = rating_row(dsn, story)
+    assert after["requested_rating"] == "UNSAFE"
+    assert review_part(after) == review_part(before)
+    assert working_copy_rows(dsn, story) == 0
+
+
+@pytest.mark.parametrize("restage", [False, True], ids=["direct", "omitted-rating-restage"])
+@pytest.mark.parametrize("state", ["private", "public"])
+def test_tokenless_final_save_on_rating_only_copy_keeps_latest_scene_CREATE_US_08_AC13(
+    context, state, restage
+):
+    # 예전 클라이언트: 등급 전용 임시 저장본을 토큰 없이 preserve_scene 「저장」으로 반영한다.
+    client, _, story, _, dsn = context
+    saved = publish(client, story, dsn)
+    staged = put(client, story, rating_only_stage(saved), "rating-stage")
+    assert staged.status_code == 200, staged.text
+    assert staged.json()["rating_only_working_copy"] is True
+    if restage:
+        # 등급을 빼고 다시 보낸 preserve_scene 임시 저장도 등급 전용 표시를 잃지 않는다.
+        again = {k: v for k, v in rating_only_stage(saved).items() if k != "requested_rating"}
+        restaged = put(client, story, again, "rating-restage")
+        assert restaged.status_code == 200, restaged.text
+        assert restaged.json()["rating_only_working_copy"] is True
+        assert restaged.json()["requested_rating"] == "UNSAFE"
+    commit_newer_scene(dsn, story)
+    final = {**current_payload(saved, state), "preserve_scene": True}
+    result = put(client, story, final, "legacy-final")
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["save_state"] == state
+    assert data["requested_rating"] == "UNSAFE"
+    assert data["working_copy_saved_at"] is None
+    assert stored_custom_style(dsn, story) == "정본 최신 장면"
+    assert rating_row(dsn, story)["requested_rating"] == "UNSAFE"
+    assert working_copy_rows(dsn, story) == 0
+
+
+def test_tokenless_final_save_keeps_genuine_scene_copy_CREATE_US_08_AC13(context):
+    # 장면을 담은 임시 저장본은 예전처럼 그 장면을 반영한다.
+    client, _, story, _, dsn = context
+    saved = publish(client, story, dsn)
+    scene = current_payload(saved)
+    scene["expression"]["custom_style"] = "임시 장면"
+    assert put(client, story, {**scene, "kind": "temporary"}, "s1").status_code == 200
+    rated = put(client, story, rating_only_stage(saved), "s2").json()
+    assert rated["rating_only_working_copy"] is False
+    commit_newer_scene(dsn, story)
+    final = {**current_payload(saved), "preserve_scene": True}
+    result = put(client, story, final, "legacy-final")
+    assert result.status_code == 200, result.text
+    assert stored_custom_style(dsn, story) == "임시 장면"
+    assert result.json()["requested_rating"] == "UNSAFE"
 
 
 # --- 제작자 목록(AC12 일부) ---------------------------------------------------------------

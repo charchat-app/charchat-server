@@ -15,7 +15,7 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.main import create_app
 
 SCHEMA_SQL = Path(__file__).resolve().parents[1] / "app" / "db" / "schema.sql"
@@ -30,6 +30,29 @@ def _ensure_database(url: str) -> None:
         exists = admin.execute("SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)).fetchone()
         if not exists:
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(dbname)))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def dev_user_header_code_default():
+    """BASE-03: .env에 AUTH_DEV_HEADER_ENABLED=true가 있어도 코드 기본값(꺼짐)에서 시작한다."""
+    previous = settings.auth_dev_header_enabled
+    settings.auth_dev_header_enabled = Settings.model_fields["auth_dev_header_enabled"].default
+    yield
+    settings.auth_dev_header_enabled = previous
+
+
+@pytest.fixture
+def dev_user_header_enabled():
+    """BASE-03: 개발용 X-User-Id 헤더를 켠다(코드 기본값은 꺼짐). 자동 적용하지 않는다.
+
+    헤더로 사용자를 정하는 기존 테스트 폴더의 conftest가 autouse로 요청하고,
+    그 밖의 테스트는 필요할 때만 인자로 받는다. 나머지는 기본값(꺼짐) 그대로 돈다.
+    테스트 안의 monkeypatch.undo()에 풀리지 않도록 monkeypatch를 쓰지 않는다.
+    """
+    previous = settings.auth_dev_header_enabled
+    settings.auth_dev_header_enabled = True
+    yield
+    settings.auth_dev_header_enabled = previous
 
 
 @pytest.fixture(scope="session")

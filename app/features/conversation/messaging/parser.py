@@ -13,6 +13,11 @@
 import re
 from dataclasses import dataclass
 
+# 앱 String.prototype.trim()의 WhiteSpace + LineTerminator. 저장 파서는 기본 strip을 유지한다.
+JS_TRIM_CHARS = (
+    "\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009"
+    "\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 NARRATOR_TAG = "나레이터"
 _TAG = re.compile(r"^@([^:\n]+?):[ \t]?(.*)$")
 
@@ -24,7 +29,9 @@ class ParsedPart:
     body: str
 
 
-def parse_assistant_text(text: str, character_names: list[str]) -> list[ParsedPart]:
+def parse_assistant_text(
+    text: str, character_names: list[str], *, trim_chars: str | None = None
+) -> list[ParsedPart]:
     names = set(character_names)
     blocks: list[list] = []  # [kind, name, lines]
     # \r\n·\r 등 모든 줄 경계를 같은 줄바꿈으로 본다(앱 splitPythonLines와 같은 규칙).
@@ -43,7 +50,7 @@ def parse_assistant_text(text: str, character_names: list[str]) -> list[ParsedPa
             blocks[-1][2].append(line)
     parts = []
     for kind, name, lines in blocks:
-        body = "\n".join(lines).strip()
+        body = "\n".join(lines).strip(trim_chars)
         if body:
             parts.append(ParsedPart(speaker_kind=kind, character_name=name, body=body))
     return parts

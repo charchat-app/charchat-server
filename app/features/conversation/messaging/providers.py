@@ -5,13 +5,17 @@
 - openai_compatible: provider가 'openai'인 모델을 `{CHAT_LLM_BASE_URL}/chat/completions`
   (기본 https://api.openai.com/v1)로 `stream: true` 호출하고 SSE `data:` 줄을 읽는다.
   키는 CHAT_LLM_API_KEY에서만 읽는다. 새 런타임 의존성 없이 표준 라이브러리 urllib만 쓴다.
+
+CHAT-US-13: 공급자는 응답이 알려 준 실제 모델 ID를 `ProviderRequest.report_model`로 남긴다
+(OpenAI 호환은 SSE payload의 `model`, fake는 `request.model`). 처음 받은 값만 기억한다.
+다른 모델로 다시 호출(fallback)하지 않는다. 실패는 그대로 ProviderError로 올린다.
 """
 
 import json
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -21,6 +25,7 @@ FAIL_BEFORE_MARKER = "#fail-before"
 FAIL_AFTER_MARKER = "#fail-after"
 # 실제 호출을 지원하는 models.provider 값.
 SUPPORTED_PROVIDERS = ("openai",)
+MODEL_OUTPUT_LIMIT = "MODEL_OUTPUT_LIMIT"
 
 
 class ProviderError(Exception):
@@ -29,6 +34,10 @@ class ProviderError(Exception):
     def __init__(self, code: str, message: str = "") -> None:
         self.code = code
         super().__init__(message or code)
+
+
+# 공급자가 알려 준 실제 모델 ID의 최대 길이(CHAT-US-13). 넘으면 기록하지 않는다.
+REPORTED_MODEL_MAX_LENGTH = 200
 
 
 @dataclass
@@ -40,6 +49,22 @@ class ProviderRequest:
     # fake 공급자가 응답을 만들 때 쓰는 보조 정보. 실제 공급자는 messages만 보낸다.
     character_names: list[str] = field(default_factory=list)
     last_user_text: str = ""
+    # 공급자가 응답에 실어 보낸 실제 모델 ID(CHAT-US-13). 알려 주지 않으면 None.
+    reported_model: str | None = None
+
+    def report_model(self, model: object) -> None:
+        """처음 받은 쓸 수 있는 문자열만 기억한다.
+
+        NUL이 든 값(PostgreSQL text에 저장할 수 없음)이나 지나치게 긴 값은 기록하지 않는다.
+        """
+        if (
+            self.reported_model is None
+            and isinstance(model, str)
+            and model
+            and "\x00" not in model
+            and len(model) <= REPORTED_MODEL_MAX_LENGTH
+        ):
+            self.reported_model = model
 
 
 class Provider(Protocol):
@@ -79,11 +104,17 @@ class FakeProvider:
                 raise ProviderError("STREAM_INTERRUPTED", "가짜 공급자: 일부 응답 후 실패")
             if self.delay_ms:
                 time.sleep(self.delay_ms / 1000)
+            # 실제 공급자처럼 첫 조각과 함께 응답 모델을 알려 준다(요청 모델 그대로).
+            request.report_model(request.model)
             yield chunk
 
 
-def iter_sse_content(lines: Iterable[bytes | str]) -> Iterator[str]:
+def iter_sse_content(
+    lines: Iterable[bytes | str], on_model: Callable[[object], None] | None = None
+) -> Iterator[str]:
     """OpenAI 호환 SSE 줄에서 delta.content만 순서대로 꺼낸다.
+
+    on_model이 있으면 payload마다 `model` 값을 넘긴다(CHAT-US-13 실제 모델 기록).
 
     `data: [DONE]` 또는 choice의 `finish_reason`을 받아야 정상 완료로 본다. 완료 신호 없이
     스트림이 끝나면(연결 끊김·프록시 절단 등) 응답이 잘렸을 수 있으므로 STREAM_INTERRUPTED로
@@ -103,12 +134,17 @@ def iter_sse_content(lines: Iterable[bytes | str]) -> Iterator[str]:
             payload = json.loads(data)
         except json.JSONDecodeError as exc:
             raise ProviderError("STREAM_INTERRUPTED", "SSE 데이터 형식 오류") from exc
+        if on_model is not None and isinstance(payload, dict) and payload.get("model"):
+            on_model(payload["model"])
         if payload.get("error"):
             raise ProviderError("PROVIDER_ERROR", str(payload["error"]))
         for choice in payload.get("choices") or []:
             content = (choice.get("delta") or {}).get("content")
             if content:
                 yield content
+            if choice.get("finish_reason") == "length":
+                # 모델이 출력 한도에 도달한 경우. 전송 단절이나 정상 완료와 구분한다.
+                raise ProviderError(MODEL_OUTPUT_LIMIT)
             if choice.get("finish_reason"):
                 finished = True
     if not finished:
@@ -141,7 +177,7 @@ class OpenAICompatibleProvider:
             raise ProviderError("PROVIDER_ERROR", type(exc).__name__) from exc
         with response:
             try:
-                yield from iter_sse_content(response)
+                yield from iter_sse_content(response, on_model=request.report_model)
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 raise ProviderError("STREAM_INTERRUPTED", type(exc).__name__) from exc
 

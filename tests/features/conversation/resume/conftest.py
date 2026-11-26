@@ -7,6 +7,11 @@ from app.core.config import settings
 
 
 @pytest.fixture(autouse=True)
+def dev_user_header(dev_user_header_enabled):
+    """BASE-03: 이 폴더 테스트는 개발용 X-User-Id 헤더로 사용자를 정한다(tests/conftest.py)."""
+
+
+@pytest.fixture(autouse=True)
 def inline_worker(monkeypatch):
     monkeypatch.setattr(settings, "chat_generation_worker", "inline")
     monkeypatch.setattr(settings, "chat_fake_chunk_delay_ms", 0)

@@ -217,11 +217,15 @@ def staged_baseline(copy):
     return set(baseline["character_ids"]) if baseline else None
 
 
-def apply_basic_with_existing_roster(connection, story, basic):
+def apply_basic_with_existing_roster(connection, story, basic, *, allow_additions=False):
     """다른 편집 영역의 연결을 지우지 않도록 공통 저장에서 명단을 유지한다."""
     story_id = story["id"]
     if basic.characters is not None:
-        requested = [character.id for character in basic.characters]
+        requested = [
+            character.id
+            for character in basic.characters
+            if not allow_additions or character.id is not None
+        ]
         existing = {person["id"] for person in fewshot_service.characters(connection, story_id)}
         if len(requested) != len(existing) or set(requested) != existing:
             issue = FieldIssue(
@@ -307,14 +311,21 @@ def mark_rating_only(result, copy) -> None:
 
 
 def rating_copy_unchanged(story, body, copy) -> bool:
-    """CREATE-US-08-AC13: 스토리 잠금 안에서, 반영하려는 등급 임시 저장본이 그대로인지."""
+    """CREATE-US-08-AC13: 스토리 잠금 안에서, 반영하려는 등급 임시 저장본이 그대로인지.
+
+    공개 상태는 그대로이거나 비공개→공개만 허용한다(공개 전환 조건은 완성 검사가 확인).
+    """
+    transition = (story["save_state"], body.save_state)
     return bool(
-        copy
-        and copy["images"] is None
-        and working_copy.is_rating_only(copy["creation"])
+        is_rating_only_copy(copy)
         and copy["creation_saved_at"] == body.finalize_rating_working_copy_at
-        and body.save_state == story["save_state"]
+        and (transition[0] == transition[1] or transition == ("private", "public"))
     )
+
+
+def is_rating_only_copy(copy) -> bool:
+    """등급만 담은 공통 임시 저장본이고 사진 임시 저장본이 없는지."""
+    return bool(copy and copy["images"] is None and working_copy.is_rating_only(copy["creation"]))
 
 
 def too_long(field, code, length, limit, message):
@@ -815,7 +826,10 @@ def _save_creation(
             raise app_error(422, issue.code, issue.message, issues=[issue.model_dump()])
         if body.preserve_scene and temporary and story["save_state"] == "draft":
             if body.basic is not None:
-                apply_basic_with_existing_roster(connection, story, body.basic)
+                # 기존 ID 누락은 연쇄 삭제를 막기 위해 거절한다.
+                apply_basic_with_existing_roster(
+                    connection, story, body.basic, allow_additions=True
+                )
             admitted = preset_service.lock_preset_images(
                 connection,
                 story_ref,
@@ -836,8 +850,12 @@ def _save_creation(
             return result, set()
         if body.preserve_scene:
             # 등급 전용 임시본의 장면은 저장 당시 복사본일 뿐이다.
-            # 다른 경로에서 바꾼 정본 장면을 되돌리지 않는다.
-            scene_copy = None if body.finalize_rating_working_copy_at is not None else copy
+            # 다른 경로에서 바꾼 정본 장면을 되돌리지 않는다. 토큰 없는 예전 「저장」도
+            # 등급 전용 임시본이면 잠금 안의 최신 정본 장면을 쓴다.
+            rating_only = body.finalize_rating_working_copy_at is not None or (
+                not temporary and is_rating_only_copy(copy)
+            )
+            scene_copy = None if rating_only else copy
             body = with_latest_scene(connection, story, body, scene_copy)
         current, target = story["save_state"], body.save_state
         if temporary and current != "draft":
@@ -866,14 +884,28 @@ def _save_creation(
             # CREATE-US-08-AC13: 이번 쓰기가 등급만 보낸 preserve_scene 임시 저장이고, 앞의
             # 임시 저장본이 비었거나 등급만 담았고, 사진 임시 저장본이 없을 때만 표시를 남긴다.
             # 문서는 매번 새로 만들므로 다른 임시 저장은 표시를 남기지 않는다(보수적으로 지움).
+            # 등급을 빼고 보낸 경우는 앞의 임시 저장본이 실제 등급 전용이고 공개 상태 선택이
+            # 그대로일 때만 표시를 유지한다(장면 임시 저장본을 등급 전용으로 올리지 않는다).
+            previous_rating_only = creation_doc is not None and working_copy.is_rating_only(
+                creation_doc
+            )
             if (
                 body.preserve_scene
-                and body.requested_rating is not None
                 and body.basic is None
                 and body.presets is None
                 and body.images is None
-                and (creation_doc is None or working_copy.is_rating_only(creation_doc))
                 and (not copy or copy["images"] is None)
+                and (
+                    (
+                        body.requested_rating is not None
+                        and (creation_doc is None or previous_rating_only)
+                    )
+                    or (
+                        body.requested_rating is None
+                        and previous_rating_only
+                        and creation_doc.get("save_state") == document.get("save_state")
+                    )
+                )
             ):
                 document[working_copy.RATING_ONLY] = True
             # CREATE-US-07-AC09: 쓰기 전 임시 저장본 기준으로 확정 가능 여부를
