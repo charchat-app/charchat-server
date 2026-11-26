@@ -1,9 +1,13 @@
 """환경 설정. 값은 환경변수 또는 .env에서 읽는다."""
 
+import secrets
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# staging·production의 AUTH_JWT_SECRET 최소 길이(HS256 키 256비트).
+JWT_SECRET_MIN_BYTES = 32
 
 
 class Settings(BaseSettings):
@@ -52,9 +56,28 @@ class Settings(BaseSettings):
     # 온보딩 필수 동의 버전(약관·개인정보). 만 14세 이상 자기 확인은 'self-v1'로 고정한다.
     auth_terms_version: str = Field(default="draft-v1", min_length=1)
     auth_privacy_version: str = Field(default="draft-v1", min_length=1)
+    # 이메일·비밀번호 회원가입과 로그인(POST /auth/signup, grant_type=password).
+    auth_password_login_enabled: bool = True
+    # 액세스 토큰(JWT HS256) 서명 키. staging·production은 32바이트 이상이 아니면 시작하지 않는다.
+    # local·test에서 비워 두면 프로세스 시작 때 임시 키를 만든다(재시작하면 이전 액세스 토큰 무효).
+    auth_jwt_secret: SecretStr = SecretStr("")
+    auth_jwt_issuer: str = Field(default="charchat", min_length=1)
+
+    @model_validator(mode="after")
+    def _ephemeral_jwt_secret_for_local(self) -> "Settings":
+        if self.app_env in ("local", "test") and not self.auth_jwt_secret.get_secret_value():
+            self.auth_jwt_secret = SecretStr(secrets.token_urlsafe(48))
+        return self
 
     def assert_safe_for_startup(self) -> None:
-        """production에서 개발용 인증 경로가 켜져 있으면 시작을 거부한다."""
+        """production에서 개발용 인증 경로가 켜져 있거나, staging·production에서 JWT 서명 키가
+        없거나 32바이트 미만이면 시작을 거부한다."""
+        secret_bytes = len(self.auth_jwt_secret.get_secret_value().encode("utf-8"))
+        if self.app_env in ("staging", "production") and secret_bytes < JWT_SECRET_MIN_BYTES:
+            raise RuntimeError(
+                f"APP_ENV={self.app_env}에서는 AUTH_JWT_SECRET을 "
+                f"{JWT_SECRET_MIN_BYTES}바이트 이상으로 설정해야 합니다."
+            )
         if self.app_env != "production":
             return
         enabled = [

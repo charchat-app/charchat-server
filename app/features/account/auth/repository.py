@@ -1,4 +1,7 @@
-"""BASE-03 로그인 계정·로그인 세션 DB 접근. 토큰 원문은 다루지 않고 sha256 해시만 쓴다."""
+"""BASE-03 로그인 계정·이메일 로그인 정보·로그인 세션 DB 접근.
+
+리프레시 토큰은 sha256 해시만, 비밀번호는 bcrypt 해시만 다룬다. 액세스 토큰(JWT)은 저장하지 않는다.
+"""
 
 from psycopg import Connection
 
@@ -37,34 +40,53 @@ def create_identity(conn: Connection, user_id: int, provider: str, subject: str)
     return row is not None
 
 
+def create_password_credential(
+    conn: Connection, user_id: int, email: str, password_hash: str
+) -> bool:
+    """이메일 로그인 정보를 만든다. 같은 이메일이 이미(또는 동시에 먼저) 있으면 False."""
+    row = conn.execute(
+        """INSERT INTO user_password_credentials (user_id, email, password_hash)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (email) DO NOTHING RETURNING user_id""",
+        (user_id, email, password_hash),
+    ).fetchone()
+    return row is not None
+
+
+def find_password_credential(conn: Connection, email: str):
+    return conn.execute(
+        """SELECT c.user_id, c.password_hash, u.status FROM user_password_credentials c
+           JOIN users u ON u.id = c.user_id
+           WHERE c.email = %s""",
+        (email,),
+    ).fetchone()
+
+
 def create_session(
     conn: Connection,
     user_id: int,
     client_platform: str,
-    access_hash: bytes,
     refresh_hash: bytes,
-    access_ttl_seconds: int,
     refresh_ttl_days: int,
 ) -> int:
     return conn.execute(
-        """INSERT INTO auth_sessions (user_id, client_platform, access_token_hash,
-                                      access_expires_at, refresh_token_hash, refresh_expires_at)
-           VALUES (%s, %s, %s, clock_timestamp() + make_interval(secs => %s), %s,
-                   clock_timestamp() + make_interval(days => %s))
+        """INSERT INTO auth_sessions (user_id, client_platform, refresh_token_hash,
+                                      refresh_expires_at)
+           VALUES (%s, %s, %s, clock_timestamp() + make_interval(days => %s))
            RETURNING id""",
-        (user_id, client_platform, access_hash, access_ttl_seconds, refresh_hash, refresh_ttl_days),
+        (user_id, client_platform, refresh_hash, refresh_ttl_days),
     ).fetchone()["id"]
 
 
-def find_session_by_access(conn: Connection, access_hash: bytes):
+def find_session(conn: Connection, session_id: int):
+    """액세스 토큰(JWT)의 sid로 세션과 계정 상태를 한 번에 읽는다."""
     return conn.execute(
         """SELECT s.id, s.user_id, u.status,
                   s.revoked_at IS NOT NULL AS revoked,
-                  s.access_expires_at <= clock_timestamp() AS expired,
                   s.last_used_at < clock_timestamp() - interval '1 minute' AS stale
            FROM auth_sessions s JOIN users u ON u.id = s.user_id
-           WHERE s.access_token_hash = %s""",
-        (access_hash,),
+           WHERE s.id = %s""",
+        (session_id,),
     ).fetchone()
 
 
@@ -92,24 +114,17 @@ def lock_session_by_refresh(conn: Connection, refresh_hash: bytes, grace_seconds
 
 
 def rotate_session(
-    conn: Connection,
-    session_id: int,
-    access_hash: bytes,
-    refresh_hash: bytes,
-    access_ttl_seconds: int,
-    refresh_ttl_days: int,
+    conn: Connection, session_id: int, refresh_hash: bytes, refresh_ttl_days: int
 ) -> None:
     conn.execute(
         """UPDATE auth_sessions SET
                previous_refresh_hash = refresh_token_hash,
                refresh_token_hash = %s,
                refresh_expires_at = clock_timestamp() + make_interval(days => %s),
-               access_token_hash = %s,
-               access_expires_at = clock_timestamp() + make_interval(secs => %s),
                rotated_at = clock_timestamp(),
                last_used_at = clock_timestamp()
            WHERE id = %s""",
-        (refresh_hash, refresh_ttl_days, access_hash, access_ttl_seconds, session_id),
+        (refresh_hash, refresh_ttl_days, session_id),
     )
 
 

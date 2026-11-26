@@ -124,7 +124,8 @@ def test_backfill_runs_on_explicitly_named_local_database_BASE_03(probe_db):
 
 def test_backfill_requires_base03_tables_BASE_03(db):
     db.execute(
-        "DROP TABLE auth_login_attempts, auth_sessions, user_consents, user_identities, users"
+        "DROP TABLE auth_login_attempts, auth_sessions, user_password_credentials, "
+        "user_consents, user_identities, users"
     )
     try:
         with pytest.raises(psycopg.errors.RaiseException, match="apply base03_accounts.sql first"):

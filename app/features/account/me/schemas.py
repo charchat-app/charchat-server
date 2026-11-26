@@ -24,7 +24,7 @@ class RequiredConsentsResponse(BaseModel):
 class MeResponse(BaseModel):
     user_id: int
     status: Literal["pending", "active"]
-    # 연결된 로그인 수단(kakao·google·apple·dev). 제공자 토큰·이메일은 저장하지 않는다.
+    # 연결된 로그인 수단(email·dev, 후속 kakao·google·apple). 응답에 이메일 주소는 넣지 않는다.
     providers: list[str]
     default_play_name: str | None
     # 종류별로 가장 최근에 동의한 버전. 없으면 null.

@@ -1,7 +1,8 @@
 -- BASE-03 (KAN-2) 계정·로그인 세션 표. 로그인 서버 배포 전 기존 DB에 독립적으로 적용한다.
 -- 절차 및 롤백: docs/base03-accounts-rollout.md
 --
--- 새 표 5개(users, user_identities, user_consents, auth_sessions, auth_login_attempts)만 만든다.
+-- 새 표 6개(users, user_identities, user_consents, user_password_credentials, auth_sessions,
+-- auth_login_attempts)만 만든다.
 -- 기존 표와 owner_id 컬럼은 건드리지 않는다(FK 연결은 후속 작업).
 -- 결과는 app/db/schema.sql과 같은 정의다. 이미 있는 표가 기대 정의와 다르면 예외로 전체를
 -- 되돌린다. 다시 실행해도 데이터와 정의가 바뀌지 않는다.
@@ -123,7 +124,28 @@ con user_consents_pkey PRIMARY KEY (user_id, kind, version)
 con user_consents_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 con user_consents_version_check CHECK ((version <> ''::text))$exp$);
 
--- 4. 로그인 세션(불투명 토큰의 sha256 해시)
+-- 3-1. 이메일·비밀번호 로그인 정보(bcrypt 해시)
+CREATE TABLE IF NOT EXISTS public.user_password_credentials (
+    user_id bigint PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+    email text NOT NULL CHECK (email = lower(email) AND email <> '' AND length(email) <= 254),
+    password_hash text NOT NULL CHECK (password_hash LIKE '$2%'),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT user_password_credentials_email_key UNIQUE (email)
+);
+SELECT pg_temp.base03_expect('public.user_password_credentials', $exp$rel r p
+col user_id bigint NOT NULL
+col email text NOT NULL
+col password_hash text NOT NULL
+col created_at timestamp with time zone NOT NULL DEFAULT clock_timestamp()
+col updated_at timestamp with time zone NOT NULL DEFAULT clock_timestamp()
+con user_password_credentials_email_check CHECK (((email = lower(email)) AND (email <> ''::text) AND (length(email) <= 254)))
+con user_password_credentials_email_key UNIQUE (email)
+con user_password_credentials_password_hash_check CHECK ((password_hash ~~ '$2%'::text))
+con user_password_credentials_pkey PRIMARY KEY (user_id)
+con user_password_credentials_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE$exp$);
+
+-- 4. 로그인 세션(리프레시 토큰의 sha256 해시. 액세스 토큰은 JWT라 저장하지 않는다)
 DO $base03$
 BEGIN
     IF to_regclass('public.auth_sessions') IS NULL THEN
@@ -131,8 +153,6 @@ BEGIN
             id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             user_id bigint NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
             client_platform text NOT NULL CHECK (client_platform IN ('ios', 'android', 'web')),
-            access_token_hash bytea NOT NULL UNIQUE,
-            access_expires_at timestamptz NOT NULL,
             refresh_token_hash bytea NOT NULL UNIQUE,
             refresh_expires_at timestamptz NOT NULL,
             previous_refresh_hash bytea UNIQUE,
@@ -153,8 +173,6 @@ SELECT pg_temp.base03_expect('public.auth_sessions', $exp$rel r p
 col id bigint NOT NULL IDENTITY ALWAYS
 col user_id bigint NOT NULL
 col client_platform text NOT NULL
-col access_token_hash bytea NOT NULL
-col access_expires_at timestamp with time zone NOT NULL
 col refresh_token_hash bytea NOT NULL
 col refresh_expires_at timestamp with time zone NOT NULL
 col previous_refresh_hash bytea
@@ -163,7 +181,6 @@ col created_at timestamp with time zone NOT NULL DEFAULT clock_timestamp()
 col last_used_at timestamp with time zone NOT NULL DEFAULT clock_timestamp()
 col revoked_at timestamp with time zone
 col revoke_reason text
-con auth_sessions_access_token_hash_key UNIQUE (access_token_hash)
 con auth_sessions_client_platform_check CHECK ((client_platform = ANY (ARRAY['ios'::text, 'android'::text, 'web'::text])))
 con auth_sessions_pkey PRIMARY KEY (id)
 con auth_sessions_previous_refresh_hash_key UNIQUE (previous_refresh_hash)

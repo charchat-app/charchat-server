@@ -1,10 +1,14 @@
 """BASE-03 계정·로그인 테스트 공용 도우미(픽스처 아님)."""
 
+import time
+
+import jwt
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
 
 TOKENS = "/api/v1/auth/tokens"
+SIGNUP = "/api/v1/auth/signup"
 PROVIDERS = "/api/v1/auth/providers"
 CURRENT_SESSION = "/api/v1/auth/sessions/current"
 ME = "/api/v1/me"
@@ -38,6 +42,65 @@ def dev_login(client: TestClient, key: str, platform: str = "web") -> dict:
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def signup(client: TestClient, email: str, password: str = "abcd1234", platform: str = "web"):
+    return client.post(
+        SIGNUP, json={"email": email, "password": password, "client_platform": platform}
+    )
+
+
+def password_login(client: TestClient, email: str, password: str, platform: str = "web"):
+    return client.post(
+        TOKENS,
+        json={
+            "grant_type": "password",
+            "email": email,
+            "password": password,
+            "client_platform": platform,
+        },
+    )
+
+
+def jwt_claims(token: str) -> dict:
+    """서명 확인 없이 JWT 본문을 읽는다(테스트 확인용)."""
+    return jwt.decode(token, options={"verify_signature": False})
+
+
+def mint_access_token(
+    user_id: int | str,
+    session_id: int | str,
+    *,
+    secret: str | None = None,
+    algorithm: str = "HS256",
+    issued_at: int | None = None,
+    ttl: int | None = None,
+    drop: tuple[str, ...] = (),
+    **overrides,
+) -> str:
+    """서버와 같은 모양의 JWT를 직접 만든다(만료·다른 키·클레임 변조 확인용)."""
+    now = int(time.time()) if issued_at is None else issued_at
+    claims = {
+        "iss": settings.auth_jwt_issuer,
+        "sub": str(user_id),
+        "sid": str(session_id),
+        "iat": now,
+        "exp": now + (settings.auth_access_ttl_seconds if ttl is None else ttl),
+        "typ": "access",
+        **overrides,
+    }
+    for name in drop:
+        claims.pop(name, None)
+    key = settings.auth_jwt_secret.get_secret_value() if secret is None else secret
+    return jwt.encode(claims, key, algorithm=algorithm)
+
+
+def expired_access_token(token: str) -> str:
+    """같은 계정·세션을 가리키는, 서명은 맞고 이미 만료된 JWT."""
+    claims = jwt_claims(token)
+    return mint_access_token(
+        claims["sub"], claims["sid"], issued_at=int(time.time()) - 3600, ttl=1800
+    )
 
 
 def refresh(client: TestClient, refresh_token: str):

@@ -727,7 +727,7 @@ CREATE UNIQUE INDEX conversation_generations_one_active_idx
 CREATE INDEX conversation_generations_session_idx
     ON public.conversation_generations(session_id, id);
 
--- BASE-03 (KAN-2): 계정·외부 로그인 연결·동의·로그인 세션. 기존 DB 적용은
+-- BASE-03 (KAN-2): 계정·외부 로그인 연결·이메일 로그인·동의·로그인 세션. 기존 DB 적용은
 -- app/db/migrations/base03_accounts.sql(절차: docs/base03-accounts-rollout.md).
 -- 기존 owner_id 컬럼(stories, images, conversation_sessions, user_profiles, user_play_settings,
 -- creation_write_requests)은 users.id 값을 담는다. FK 연결은 후속 작업(테스트가 임의 owner_id를 직접 넣음).
@@ -769,14 +769,23 @@ CREATE TABLE user_consents (
     PRIMARY KEY (user_id, kind, version)
 );
 
--- 로그인 세션(불투명 토큰). 토큰 원문은 저장하지 않고 sha256만 둔다. 회전 때 access/refresh 해시를
--- 함께 바꾸고 직전 refresh 해시를 previous_refresh_hash에 남겨 재사용을 탐지한다.
+-- 이메일·비밀번호 로그인 정보. 이메일은 소문자로 정규화해 저장하고 비밀번호는 bcrypt 해시만 둔다.
+-- 이메일 계정은 user_identities에 행을 만들지 않는다.
+CREATE TABLE user_password_credentials (
+    user_id bigint PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    email text NOT NULL CHECK (email = lower(email) AND email <> '' AND length(email) <= 254),
+    password_hash text NOT NULL CHECK (password_hash LIKE '$2%'),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT user_password_credentials_email_key UNIQUE (email)
+);
+
+-- 로그인 세션. 액세스 토큰은 JWT(sid = 이 표의 id)라 저장하지 않는다. 리프레시 토큰은 원문 없이
+-- sha256만 두고, 회전 때 직전 refresh 해시를 previous_refresh_hash에 남겨 재사용을 탐지한다.
 CREATE TABLE auth_sessions (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     client_platform text NOT NULL CHECK (client_platform IN ('ios', 'android', 'web')),
-    access_token_hash bytea NOT NULL UNIQUE,
-    access_expires_at timestamptz NOT NULL,
     refresh_token_hash bytea NOT NULL UNIQUE,
     refresh_expires_at timestamptz NOT NULL,
     previous_refresh_hash bytea UNIQUE,

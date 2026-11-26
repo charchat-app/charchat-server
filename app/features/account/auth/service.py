@@ -1,10 +1,13 @@
-"""BASE-03 로그인 세션: 불투명 토큰 발급·확인·회전·폐기.
+"""BASE-03 로그인: 이메일·비밀번호 가입·로그인, JWT 액세스 토큰, 리프레시 토큰 회전·폐기.
 
-- 액세스 토큰 `cca_…`, 리프레시 토큰 `ccr_…`(`secrets.token_urlsafe(32)`). DB에는 sha256만 둔다.
-- 리프레시할 때마다 두 토큰을 모두 새로 발급한다. 직전 리프레시 토큰이 회전 후
-  `REFRESH_REUSE_GRACE_SECONDS` 안에 다시 오면 409(동시 요청으로 보고 폐기하지 않음),
-  그 뒤에 오면 탈취 가능성으로 보고 세션을 폐기한 뒤 401을 낸다.
-- 토큰 원문은 로그·예외 메시지에 넣지 않는다.
+- 액세스 토큰은 JWT(HS256, `access_tokens`)라 저장하지 않는다. 서명을 확인한 뒤 sid로
+  auth_sessions·users를 한 번 읽어 로그아웃(폐기)을 바로 반영하고 pending/active를 최신으로 본다.
+- 리프레시 토큰 `ccr_…`(`secrets.token_urlsafe(32)`)은 DB에 sha256만 둔다. 리프레시할 때마다
+  리프레시 토큰을 새로 발급하고 새 JWT를 준다. 이전 JWT는 세션이 살아 있으면 만료까지 쓸 수 있다.
+  직전 리프레시 토큰이 회전 후 `REFRESH_REUSE_GRACE_SECONDS` 안에 다시 오면 409(동시 요청으로 보고
+  폐기하지 않음), 그 뒤에 오면 탈취 가능성으로 보고 세션을 폐기한 뒤 401을 낸다.
+- 비밀번호는 bcrypt(cost 12) 해시만 저장한다(`passwords`).
+- 토큰·비밀번호 원문은 로그·예외 메시지에 넣지 않는다.
 """
 
 import hashlib
@@ -12,25 +15,27 @@ import re
 import secrets
 from typing import NamedTuple
 
+import jwt
 from psycopg import Connection
+from psycopg.errors import CheckViolation
 
 from app.core.config import settings
 from app.core.exceptions import AppError, UnauthenticatedError
-from app.features.account.auth import repository
+from app.features.account.auth import access_tokens, passwords, repository
 from app.features.account.auth.schemas import (
     DevTokenRequest,
+    PasswordTokenRequest,
     ProviderResponse,
     ProvidersResponse,
     RefreshTokenRequest,
+    SignupRequest,
     TokenResponse,
 )
 from app.features.account.me import service as me_service
 
-ACCESS_PREFIX = "cca_"
 REFRESH_PREFIX = "ccr_"
 REFRESH_REUSE_GRACE_SECONDS = 10
 # 접두어 + token_urlsafe(32)(43자). 형식이 다르면 DB를 조회하지 않고 거절한다.
-_ACCESS_TOKEN = re.compile(r"^cca_[A-Za-z0-9_-]{43}$")
 _REFRESH_TOKEN = re.compile(r"^ccr_[A-Za-z0-9_-]{43}$")
 
 
@@ -78,18 +83,48 @@ class DevLoginDisabledError(AppError):
     title = "개발용 로그인이 꺼져 있습니다"
 
 
+class PasswordLoginDisabledError(AppError):
+    status = 404
+    code = "AUTH_PASSWORD_LOGIN_DISABLED"
+    title = "이메일 로그인이 꺼져 있습니다"
+
+
+class InvalidCredentialsError(AppError):
+    status = 401
+    code = "AUTH_INVALID_CREDENTIALS"
+    title = "이메일 또는 비밀번호가 맞지 않습니다"
+
+
+class EmailInvalidError(AppError):
+    status = 422
+    code = "EMAIL_INVALID"
+    title = "이메일 형식이 올바르지 않습니다"
+
+
+class PasswordInvalidError(AppError):
+    status = 422
+    code = "PASSWORD_INVALID"
+    title = "비밀번호 규칙에 맞지 않습니다"
+
+
+class EmailAlreadyRegisteredError(AppError):
+    status = 409
+    code = "EMAIL_ALREADY_REGISTERED"
+    title = "이미 가입한 이메일입니다"
+
+
 def hash_token(token: str) -> bytes:
     return hashlib.sha256(token.encode("ascii")).digest()
 
 
-def _new_token(prefix: str) -> str:
-    return prefix + secrets.token_urlsafe(32)
+def _new_refresh_token() -> str:
+    return REFRESH_PREFIX + secrets.token_urlsafe(32)
 
 
 def _parse_bearer(authorization: str) -> str:
     scheme, _, token = authorization.strip().partition(" ")
     token = token.strip()
-    if scheme.lower() != "bearer" or not _ACCESS_TOKEN.fullmatch(token):
+    if scheme.lower() != "bearer" or not token:
         raise AuthTokenInvalidError(
             "Authorization 헤더는 'Bearer <액세스 토큰>' 형식이어야 합니다."
         )
@@ -97,12 +132,25 @@ def _parse_bearer(authorization: str) -> str:
 
 
 def authenticate_access_token(conn: Connection, authorization: str) -> Account:
-    """Authorization 헤더의 액세스 토큰으로 계정을 찾는다. 폐기·미등록은 INVALID, 만료는 EXPIRED."""
+    """Authorization 헤더의 JWT로 계정을 찾는다.
+
+    서명·형식·발급자가 틀리거나 세션이 폐기·없음·sub 불일치·탈퇴 계정이면 INVALID.
+    서명이 맞고 세션도 살아 있는데 exp만 지났으면 EXPIRED(앱이 리프레시한다).
+    """
     token = _parse_bearer(authorization)
-    row = repository.find_session_by_access(conn, hash_token(token))
-    if row is None or row["revoked"] or row["status"] == "deleted":
+    try:
+        claims = access_tokens.decode_access_token(token)
+    except jwt.InvalidTokenError:
+        raise AuthTokenInvalidError() from None
+    row = repository.find_session(conn, claims.session_id)
+    if (
+        row is None
+        or row["revoked"]
+        or row["user_id"] != claims.user_id
+        or row["status"] == "deleted"
+    ):
         raise AuthTokenInvalidError()
-    if row["expired"]:
+    if claims.expired:
         raise AuthTokenExpiredError("액세스 토큰을 리프레시 토큰으로 갱신하세요.")
     if row["stale"]:
         # 쓰기를 줄이려고 1분 이상 지났을 때만 갱신한다.
@@ -125,21 +173,76 @@ def require_active(account: Account) -> int:
 
 def list_providers() -> ProvidersResponse:
     providers = []
+    if settings.auth_password_login_enabled:
+        providers.append(ProviderResponse(provider="email", flows=["password"]))
     if settings.auth_dev_login_enabled:
         providers.append(ProviderResponse(provider="dev", flows=["direct"]))
     return ProvidersResponse(providers=providers)
 
 
-def _issue(conn: Connection, user_id: int, is_new_user: bool, tokens: tuple[str, str]):
-    access, refresh = tokens
+def _create_session(conn: Connection, user_id: int, client_platform: str, refresh: str) -> int:
+    return repository.create_session(
+        conn, user_id, client_platform, hash_token(refresh), settings.auth_refresh_ttl_days
+    )
+
+
+def _issue(
+    conn: Connection, user_id: int, session_id: int, refresh: str, is_new_user: bool
+) -> TokenResponse:
     return TokenResponse(
-        access_token=access,
+        access_token=access_tokens.issue_access_token(user_id, session_id),
         expires_in=settings.auth_access_ttl_seconds,
         refresh_token=refresh,
         refresh_expires_in=settings.auth_refresh_ttl_days * 86400,
         user=me_service.get_me(conn, user_id),
         is_new_user=is_new_user,
     )
+
+
+def _require_password_login() -> None:
+    if not settings.auth_password_login_enabled:
+        raise PasswordLoginDisabledError()
+
+
+def signup(conn: Connection, request: SignupRequest) -> TokenResponse:
+    """이메일·비밀번호 회원가입. pending 계정과 로그인 세션을 만든다."""
+    _require_password_login()
+    email = passwords.normalize_email(request.email)
+    if not passwords.is_valid_email(email):
+        raise EmailInvalidError(f"이메일 형식을 확인하세요({passwords.EMAIL_MAX_LENGTH}자 이하).")
+    problems = passwords.password_problems(request.password)
+    if problems:
+        raise PasswordInvalidError(" ".join(problems))
+    password_hash = passwords.hash_password(request.password)
+    refresh = _new_refresh_token()
+    try:
+        with conn.transaction():
+            user_id = repository.create_pending_user(conn)
+            # 같은 이메일의 동시 가입은 유일 제약에서 하나만 남는다. 진 쪽은 계정 생성까지 되돌린다.
+            if not repository.create_password_credential(conn, user_id, email, password_hash):
+                raise EmailAlreadyRegisteredError("로그인하거나 다른 이메일을 쓰세요.")
+            session_id = _create_session(conn, user_id, request.client_platform, refresh)
+    except CheckViolation:
+        # 파이썬과 DB의 소문자 규칙이 다른 문자 등. 저장하지 않고 형식 오류로 돌려준다.
+        raise EmailInvalidError("이메일 형식을 확인하세요.") from None
+    return _issue(conn, user_id, session_id, refresh, True)
+
+
+def login_password(conn: Connection, request: PasswordTokenRequest) -> TokenResponse:
+    """이메일·비밀번호 로그인. 없는 이메일과 틀린 비밀번호는 같은 401이다."""
+    _require_password_login()
+    email = passwords.normalize_email(request.email)
+    row = None
+    if passwords.is_valid_email(email):
+        row = repository.find_password_credential(conn, email)
+    stored = row["password_hash"] if row is not None and row["status"] != "deleted" else None
+    # 없는 이메일도 더미 해시로 bcrypt 검사를 한 번 한다(응답 시간 차이 줄이기).
+    if not passwords.check_password(request.password, stored):
+        raise InvalidCredentialsError()
+    refresh = _new_refresh_token()
+    with conn.transaction():
+        session_id = _create_session(conn, row["user_id"], request.client_platform, refresh)
+    return _issue(conn, row["user_id"], session_id, refresh, False)
 
 
 def _find_or_create_user(conn: Connection, provider: str, subject: str) -> tuple[int, bool]:
@@ -164,28 +267,20 @@ def login_dev(conn: Connection, request: DevTokenRequest) -> TokenResponse:
     """dev 제공자 로그인. 처음 보는 키면 pending 계정을 새로 만든다."""
     if not settings.auth_dev_login_enabled:
         raise DevLoginDisabledError()
-    access, refresh = _new_token(ACCESS_PREFIX), _new_token(REFRESH_PREFIX)
+    refresh = _new_refresh_token()
     with conn.transaction():
         user_id, is_new_user = _find_or_create_user(conn, "dev", request.dev_user_key)
-        repository.create_session(
-            conn,
-            user_id,
-            request.client_platform,
-            hash_token(access),
-            hash_token(refresh),
-            settings.auth_access_ttl_seconds,
-            settings.auth_refresh_ttl_days,
-        )
-    return _issue(conn, user_id, is_new_user, (access, refresh))
+        session_id = _create_session(conn, user_id, request.client_platform, refresh)
+    return _issue(conn, user_id, session_id, refresh, is_new_user)
 
 
 def refresh_tokens(conn: Connection, request: RefreshTokenRequest) -> TokenResponse:
-    """리프레시 토큰 회전. 실패 결과(폐기)는 커밋한 뒤 예외를 낸다."""
+    """리프레시 토큰 회전과 새 JWT 발급. 실패 결과(폐기)는 커밋한 뒤 예외를 낸다."""
     if not _REFRESH_TOKEN.fullmatch(request.refresh_token):
         raise RefreshInvalidError()
-    access, refresh = _new_token(ACCESS_PREFIX), _new_token(REFRESH_PREFIX)
+    refresh = _new_refresh_token()
     error: AppError | None = None
-    user_id = 0
+    user_id = session_id = 0
     with conn.transaction():
         row = repository.lock_session_by_refresh(
             conn, hash_token(request.refresh_token), REFRESH_REUSE_GRACE_SECONDS
@@ -202,18 +297,13 @@ def refresh_tokens(conn: Connection, request: RefreshTokenRequest) -> TokenRespo
             repository.revoke_session(conn, row["id"], "expired")
             error = RefreshInvalidError()
         else:
-            user_id = row["user_id"]
+            user_id, session_id = row["user_id"], row["id"]
             repository.rotate_session(
-                conn,
-                row["id"],
-                hash_token(access),
-                hash_token(refresh),
-                settings.auth_access_ttl_seconds,
-                settings.auth_refresh_ttl_days,
+                conn, session_id, hash_token(refresh), settings.auth_refresh_ttl_days
             )
     if error is not None:
         raise error
-    return _issue(conn, user_id, False, (access, refresh))
+    return _issue(conn, user_id, session_id, refresh, False)
 
 
 def logout(conn: Connection, account: Account) -> None:

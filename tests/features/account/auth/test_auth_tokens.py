@@ -19,6 +19,8 @@ from tests.features.account.account_helpers import (
     active_login,
     bearer,
     dev_login,
+    expired_access_token,
+    jwt_claims,
     refresh,
 )
 
@@ -39,9 +41,13 @@ def age_rotation(db, user_id: int, seconds: int) -> None:
     )
 
 
-def test_providers_lists_dev_only_when_enabled_BASE_03(client, monkeypatch):
-    assert client.get(PROVIDERS).json() == {"providers": [{"provider": "dev", "flows": ["direct"]}]}
+def test_providers_lists_email_and_dev_when_enabled_BASE_03(client, monkeypatch):
+    email = {"provider": "email", "flows": ["password"]}
+    dev = {"provider": "dev", "flows": ["direct"]}
+    assert client.get(PROVIDERS).json() == {"providers": [email, dev]}
     monkeypatch.setattr(settings, "auth_dev_login_enabled", False)
+    assert client.get(PROVIDERS).json() == {"providers": [email]}
+    monkeypatch.setattr(settings, "auth_password_login_enabled", False)
     assert client.get(PROVIDERS).json() == {"providers": []}
 
 
@@ -58,7 +64,7 @@ def test_dev_login_disabled_is_404_BASE_03(client, db, monkeypatch):
 def test_dev_login_creates_pending_account_once_and_stores_only_hashes_BASE_03(client, db):
     first = dev_login(client, "alice", "ios")
     assert first["token_type"] == "Bearer"
-    assert first["access_token"].startswith("cca_")
+    assert first["access_token"].startswith("eyJ")  # JWT
     assert first["refresh_token"].startswith("ccr_")
     assert first["expires_in"] == 1800
     assert first["refresh_expires_in"] == 60 * 86400
@@ -74,7 +80,7 @@ def test_dev_login_creates_pending_account_once_and_stores_only_hashes_BASE_03(c
 
     rows = db.execute("SELECT * FROM auth_sessions ORDER BY id").fetchall()
     assert [r["client_platform"] for r in rows] == ["ios", "web"]
-    assert rows[0]["access_token_hash"] == sha256(first["access_token"])
+    assert jwt_claims(first["access_token"])["sid"] == str(rows[0]["id"])
     assert rows[0]["refresh_token_hash"] == sha256(first["refresh_token"])
     dump = repr(db.execute("SELECT * FROM auth_sessions").fetchall())
     assert first["access_token"] not in dump and first["refresh_token"] not in dump
@@ -113,21 +119,18 @@ def test_refresh_rotates_both_tokens_BASE_03(client, db):
     assert row["refresh_token_hash"] == sha256(rotated["refresh_token"])
     assert row["previous_refresh_hash"] == sha256(first["refresh_token"])
     assert row["rotated_at"] is not None
-    # 새 액세스 토큰은 쓰이고 이전 액세스 토큰은 더 이상 쓰이지 않는다.
+    # 새 JWT는 같은 세션을 가리킨다. 이전 JWT도 세션이 살아 있으면 만료까지 쓰인다.
+    assert jwt_claims(rotated["access_token"])["sid"] == jwt_claims(first["access_token"])["sid"]
     assert client.get(STORIES, headers=bearer(rotated["access_token"])).status_code == 200
-    old = client.get(STORIES, headers=bearer(first["access_token"]))
-    assert old.status_code == 401
-    assert old.json()["code"] == "AUTH_TOKEN_INVALID"
+    assert client.get(STORIES, headers=bearer(first["access_token"])).status_code == 200
     # 새 리프레시 토큰으로 다시 회전할 수 있다.
     assert refresh(client, rotated["refresh_token"]).status_code == 201
 
 
 def test_refresh_after_access_expiry_restores_access_BASE_03(client, db):
     first = active_login(client, "alice")
-    db.execute("UPDATE auth_sessions SET access_expires_at = clock_timestamp()")
-    assert client.get(STORIES, headers=bearer(first["access_token"])).json()["code"] == (
-        "AUTH_TOKEN_EXPIRED"
-    )
+    expired = expired_access_token(first["access_token"])
+    assert client.get(STORIES, headers=bearer(expired)).json()["code"] == "AUTH_TOKEN_EXPIRED"
     rotated = refresh(client, first["refresh_token"]).json()
     assert client.get(STORIES, headers=bearer(rotated["access_token"])).status_code == 200
 

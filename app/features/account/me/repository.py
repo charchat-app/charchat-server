@@ -11,9 +11,13 @@ def get_user(conn: Connection, user_id: int, *, lock: bool = False):
 
 
 def list_providers(conn: Connection, user_id: int) -> list[str]:
+    """연결된 로그인 수단. 이메일 로그인 정보가 있으면 'email'을 넣는다."""
     rows = conn.execute(
-        "SELECT DISTINCT provider FROM user_identities WHERE user_id = %s ORDER BY provider",
-        (user_id,),
+        """SELECT provider FROM user_identities WHERE user_id = %s
+           UNION
+           SELECT 'email' FROM user_password_credentials WHERE user_id = %s
+           ORDER BY provider""",
+        (user_id, user_id),
     ).fetchall()
     return [row["provider"] for row in rows]
 

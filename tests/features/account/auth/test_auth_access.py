@@ -15,16 +15,9 @@ from tests.features.account.account_helpers import (
     bearer,
     create_story,
     dev_login,
+    expired_access_token,
     seed_conversation_session,
 )
-
-
-def expire_access(db, access_token_owner_id: int) -> None:
-    db.execute(
-        "UPDATE auth_sessions SET access_expires_at = clock_timestamp() - interval '1 second' "
-        "WHERE user_id = %s",
-        (access_token_owner_id,),
-    )
 
 
 def assert_problem(response, status: int, code: str) -> None:
@@ -46,13 +39,11 @@ def test_valid_access_token_identifies_account_BASE_03(client):
     assert me["user_id"] == tokens["user"]["user_id"]
 
 
-def test_expired_access_token_is_401_auth_token_expired_BASE_03(client, db):
+def test_expired_access_token_is_401_auth_token_expired_BASE_03(client):
     tokens = active_login(client, "alice")
-    expire_access(db, tokens["user"]["user_id"])
-    assert_problem(
-        client.get(STORIES, headers=bearer(tokens["access_token"])), 401, "AUTH_TOKEN_EXPIRED"
-    )
-    headers = bearer(tokens["access_token"])
+    expired = expired_access_token(tokens["access_token"])
+    assert_problem(client.get(STORIES, headers=bearer(expired)), 401, "AUTH_TOKEN_EXPIRED")
+    headers = bearer(expired)
     assert_problem(client.get(ME, headers=headers), 401, "AUTH_TOKEN_EXPIRED")
 
 
@@ -73,8 +64,11 @@ def test_unknown_or_malformed_token_is_401_auth_token_invalid_BASE_03(client, au
 
 def test_tampered_access_token_is_401_auth_token_invalid_BASE_03(client):
     token = active_login(client, "alice")["access_token"]
-    last = token[-1]
-    tampered = token[:-1] + ("B" if last != "B" else "C")
+    header, payload, signature = token.split(".")
+    # 서명 가운데 글자를 바꾼다(마지막 글자는 base64 패딩 비트라 바꿔도 같은 바이트일 수 있다).
+    middle = len(signature) // 2
+    flipped = "A" if signature[middle] != "A" else "B"
+    tampered = f"{header}.{payload}.{signature[:middle]}{flipped}{signature[middle + 1 :]}"
     assert_problem(client.get(STORIES, headers=bearer(tampered)), 401, "AUTH_TOKEN_INVALID")
     # 리프레시 토큰을 액세스 토큰 자리에 넣어도 거절한다.
     refresh_token = dev_login(client, "alice")["refresh_token"]
@@ -97,13 +91,12 @@ def test_revoked_check_wins_over_expiry_BASE_03(client, db):
     """폐기된 세션은 만료됐어도 INVALID(앱이 리프레시하지 않고 로그아웃)."""
     tokens = active_login(client, "alice")
     db.execute(
-        "UPDATE auth_sessions SET revoked_at = clock_timestamp(), revoke_reason = 'logout', "
-        "access_expires_at = clock_timestamp() - interval '1 second' WHERE user_id = %s",
+        "UPDATE auth_sessions SET revoked_at = clock_timestamp(), revoke_reason = 'logout' "
+        "WHERE user_id = %s",
         (tokens["user"]["user_id"],),
     )
-    assert_problem(
-        client.get(STORIES, headers=bearer(tokens["access_token"])), 401, "AUTH_TOKEN_INVALID"
-    )
+    expired = expired_access_token(tokens["access_token"])
+    assert_problem(client.get(STORIES, headers=bearer(expired)), 401, "AUTH_TOKEN_INVALID")
 
 
 def test_deleted_account_token_is_401_auth_token_invalid_BASE_03(client, db):

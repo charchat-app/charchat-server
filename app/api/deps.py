@@ -1,7 +1,7 @@
 """공통 의존성(인증, DB 커넥션).
 
 인증 규칙(BASE-03):
-1. Authorization 헤더가 있으면 반드시 `Bearer cca_…` 액세스 토큰으로만 사용자를 정한다.
+1. Authorization 헤더가 있으면 반드시 `Bearer <JWT>` 액세스 토큰으로만 사용자를 정한다.
    이때 X-User-Id는 보지 않는다(헤더 조작으로 남의 계정에 들어갈 수 없게).
 2. Authorization이 없고 `AUTH_DEV_HEADER_ENABLED`가 켜져 있을 때만 개발용 X-User-Id를 받는다.
 3. 그 밖에는 401 UNAUTHENTICATED.
