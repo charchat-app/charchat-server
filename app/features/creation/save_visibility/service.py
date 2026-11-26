@@ -198,11 +198,15 @@ def staged_baseline(copy):
     return set(baseline["character_ids"]) if baseline else None
 
 
-def apply_basic_with_existing_roster(connection, story, basic):
+def apply_basic_with_existing_roster(connection, story, basic, *, allow_additions=False):
     """다른 편집 영역의 연결을 지우지 않도록 공통 저장에서 명단을 유지한다."""
     story_id = story["id"]
     if basic.characters is not None:
-        requested = [character.id for character in basic.characters]
+        requested = [
+            character.id
+            for character in basic.characters
+            if not allow_additions or character.id is not None
+        ]
         existing = {person["id"] for person in fewshot_service.characters(connection, story_id)}
         if len(requested) != len(existing) or set(requested) != existing:
             issue = FieldIssue(
@@ -750,7 +754,10 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             raise app_error(422, issue.code, issue.message, issues=[issue.model_dump()])
         if body.preserve_scene and temporary and story["save_state"] == "draft":
             if body.basic is not None:
-                apply_basic_with_existing_roster(connection, story, body.basic)
+                # 기존 ID 누락은 연쇄 삭제를 막기 위해 거절한다.
+                apply_basic_with_existing_roster(
+                    connection, story, body.basic, allow_additions=True
+                )
             admitted = preset_service.lock_preset_images(
                 connection,
                 story_ref,

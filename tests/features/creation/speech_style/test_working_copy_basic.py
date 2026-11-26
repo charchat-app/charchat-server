@@ -101,6 +101,40 @@ def test_draft_basic_temporary_cannot_drop_scene_roster_CREATE_US_07_AC08(contex
     assert committed_basic(client, story) == ORIGINAL_BASIC
 
 
+def test_draft_preserve_scene_autosave_allocates_new_character_once(context):
+    client, _, story, _, dsn = context
+    complete(dsn, story)
+    original = character_id(dsn, story)
+    before = client.get(url(story)).json()
+    payload = {
+        **body(),
+        "kind": "temporary",
+        "mode": "auto",
+        "preserve_scene": True,
+        "basic": {
+            **VALID_BASIC,
+            "characters": [
+                {"id": original, "name": "첫 인물"},
+                {"id": None, "name": "두 번째 인물"},
+            ],
+        },
+    }
+    saved = put(client, story, payload, "draft-roster-add")
+    assert saved.status_code == 200, saved.text
+    assert put(client, story, payload, "draft-roster-add").json() == saved.json()
+    fresh = client.get(url(story)).json()
+    assert fresh["save_state"] == "draft"
+    new_id = saved.json()["characters"][1]["id"]
+    assert [row["id"] for row in fresh["characters"]] == [original, new_id]
+    assert [row["name"] for row in fresh["characters"]] == ["첫 인물", "두 번째 인물"]
+    for section in ("expression", "intros", "fewshots", "relations", "affinities"):
+        assert fresh[section] == before[section]
+    # An older editor does not know the newly assigned ID. A different request must not remove it.
+    stale = put(client, story, payload, "draft-roster-stale")
+    assert stale.status_code == 422, stale.text
+    assert client.get(url(story)).json()["characters"] == fresh["characters"]
+
+
 def test_final_save_commits_basic_scene_presets_and_images_together_CREATE_US_07_AC07(context):
     client, _, story, _, dsn = context
     saved = publish(client, story, dsn)
