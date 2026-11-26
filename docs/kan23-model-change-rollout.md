@@ -42,8 +42,18 @@ KAN-23 서버는 생성 조회·기록에서 `reported_model`을 읽고 쓴다. 
 
 ## 롤백
 
-서버를 KAN-23 이전 버전으로 되돌린 뒤 필요하면 컬럼을 지운다(기록된 실제 모델 ID는 사라진다).
+순서: **앱 → 서버 → DB.** 앱과 서버를 KAN-23 이전 버전으로 되돌린 뒤, 필요하면 컬럼을 지운다
+(기록된 실제 모델 ID는 사라진다). 컬럼 삭제도 표 잠금(ACCESS EXCLUSIVE)이 필요하므로 짧은 잠금 제한을 둔다.
 
 ```sql
+BEGIN;
+SET LOCAL lock_timeout = '3s';
 ALTER TABLE conversation_generations DROP COLUMN IF EXISTS reported_model;
+COMMIT;
 ```
+
+적용·롤백 중 `lock_timeout`으로 실패하면 트랜잭션 전체가 되돌아가 아무것도 바뀌지 않는다.
+사용이 적은 시간에 그대로 다시 실행하면 된다.
+
+KAN-17 파일은 처음 한 번 사람이 직접 실행하는 파일이다. 배포 때마다 모든 마이그레이션을 다시
+실행하는 절차에 넣지 않는다(위 「주의」 참고).

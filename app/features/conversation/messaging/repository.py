@@ -40,6 +40,17 @@ def set_consistent_read(conn: Connection) -> None:
 
 def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool = False):
     # 시작 API(get_session)와 같은 접근 규칙: 삭제 스토리 세션은 읽기 전용으로 남는다.
+    if lock:
+        # 조인 없이 세션 행만 먼저 잠근다. 조인 쿼리에 FOR UPDATE를 붙이면, 기다리는 동안
+        # 모델이 바뀐 경우(CHAT-US-13) 바뀐 행을 옛 models 행과 다시 맞춰 보다가 0행이 되어
+        # 세션을 못 찾은 것처럼 404가 난다. 잠금을 얻은 뒤 아래 조회는 커밋된 최신 값을 읽는다.
+        locked = conn.execute(
+            "SELECT cs.id FROM conversation_sessions cs"
+            " WHERE cs.id = %s AND cs.owner_id = %s FOR UPDATE",
+            (session_id, owner_id),
+        ).fetchone()
+        if locked is None:
+            return None
     query = """
         SELECT cs.id, cs.story_id, cs.selected_model_id, md.name AS model_name,
                cs.intro_messages_snapshot, s.deleted_at IS NOT NULL AS read_only
@@ -49,8 +60,6 @@ def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool 
           AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
                OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))
     """
-    if lock:
-        query += " FOR UPDATE OF cs"
     return conn.execute(query, (session_id, owner_id)).fetchone()
 
 

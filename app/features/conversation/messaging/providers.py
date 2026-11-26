@@ -36,6 +36,10 @@ class ProviderError(Exception):
         super().__init__(message or code)
 
 
+# 공급자가 알려 준 실제 모델 ID의 최대 길이(CHAT-US-13). 넘으면 기록하지 않는다.
+REPORTED_MODEL_MAX_LENGTH = 200
+
+
 @dataclass
 class ProviderRequest:
     # 공급자 쪽 모델 ID(models.provider_model_id)와 공급자(models.provider).
@@ -49,8 +53,17 @@ class ProviderRequest:
     reported_model: str | None = None
 
     def report_model(self, model: object) -> None:
-        """처음 받은 비어 있지 않은 문자열만 기억한다."""
-        if self.reported_model is None and isinstance(model, str) and model:
+        """처음 받은 쓸 수 있는 문자열만 기억한다.
+
+        NUL이 든 값(PostgreSQL text에 저장할 수 없음)이나 지나치게 긴 값은 기록하지 않는다.
+        """
+        if (
+            self.reported_model is None
+            and isinstance(model, str)
+            and model
+            and "\x00" not in model
+            and len(model) <= REPORTED_MODEL_MAX_LENGTH
+        ):
             self.reported_model = model
 
 

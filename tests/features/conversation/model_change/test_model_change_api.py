@@ -2,7 +2,10 @@
 
 import io
 import json
+import threading
+import time
 
+import psycopg
 import pytest
 from model_change_helpers import (
     AUTHOR,
@@ -382,6 +385,16 @@ def test_chat_us_13_ac01_sse_parser_reports_payload_model():
     assert seen == []
 
 
+def test_chat_us_13_ac01_reported_model_skips_unstorable_values():
+    # NUL이 든 값은 PostgreSQL text에 저장할 수 없고, 지나치게 긴 값은 기록하지 않는다.
+    request = ProviderRequest(model=TERRA_PROVIDER_ID, messages=[])
+    for bad in ("gpt\x00x", "m" * 201, "", None, 7):
+        request.report_model(bad)
+        assert request.reported_model is None
+    request.report_model("m" * 200)
+    assert request.reported_model == "m" * 200
+
+
 class _FakeHttpResponse(io.BytesIO):
     """urlopen 응답 대역(네트워크 없음)."""
 
@@ -471,6 +484,66 @@ def test_chat_us_13_ac03_retry_after_switch_uses_current_model_and_same_prompt(
     old = client.get(f"{GENERATIONS}/{failed['id']}", headers=PLAYER).json()
     assert old["model"] == "루나"
     assert generation_count(db, session) == 2
+
+
+# ---- 모델 변경이 커밋되는 동안 기다리던 전송·재시도 ----
+
+
+def _run_while_model_change_commits(db_url, session_id, new_model, call):
+    """다른 연결이 세션 행을 잠그고 모델을 바꾼 채 있는 동안 call()을 보내고, 잠시 뒤 커밋한다.
+
+    call()은 세션 행 잠금에서 기다렸다가 커밋 뒤에 풀린다. 반환: call()의 응답.
+    """
+    result = {}
+    with psycopg.connect(db_url) as other:
+        other.execute(
+            "UPDATE conversation_sessions SET selected_model_id = %s WHERE id = %s",
+            (new_model, session_id),
+        )
+        thread = threading.Thread(target=lambda: result.setdefault("response", call()))
+        thread.start()
+        time.sleep(0.5)
+        assert thread.is_alive(), "전송·재시도가 세션 행 잠금에서 기다리지 않았다"
+        other.commit()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    return result["response"]
+
+
+def test_chat_us_13_ac01_send_waiting_on_model_change_uses_new_model(
+    client, db, db_url, session, recorder
+):
+    terra = model_id(db, "테라")
+
+    sent = _run_while_model_change_commits(
+        db_url, session, terra, lambda: send(client, session, "바꾸는 중에 보낸 메시지")
+    )
+
+    # 바뀐 모델의 조인 때문에 세션을 못 찾아 404가 나면 안 된다.
+    assert sent.status_code == 202, sent.text
+    assert sent.json()["model"] == "테라"
+    assert generation_row(db, sent.json()["id"])["model_id"] == terra
+    (request,) = recorder.requests
+    assert request.model == TERRA_PROVIDER_ID
+
+
+def test_chat_us_13_ac03_retry_waiting_on_model_change_uses_new_model(
+    client, db, db_url, session, recorder
+):
+    terra = model_id(db, "테라")
+    recorder.error = ProviderError("PROVIDER_ERROR")
+    failed = send(client, session, "루나로 실패").json()
+    assert generation_row(db, failed["id"])["status"] == "failed"
+    recorder.error = None
+
+    retried = _run_while_model_change_commits(
+        db_url, session, terra, lambda: retry(client, failed["id"])
+    )
+
+    assert retried.status_code == 202, retried.text
+    assert retried.json()["model"] == "테라"
+    assert generation_row(db, retried.json()["id"])["model_id"] == terra
+    assert [r.model for r in recorder.requests] == [LUNA_PROVIDER_ID, TERRA_PROVIDER_ID]
 
 
 def test_chat_us_13_ac03_build_messages_identical_before_and_after_model_switch(
