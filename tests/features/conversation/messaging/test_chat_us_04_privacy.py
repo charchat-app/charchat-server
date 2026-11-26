@@ -4,8 +4,10 @@
 세션 주인은 PLAYER(2), 스토리 제작자는 AUTHOR(1), 관계없는 계정은 STRANGER(3)다.
 """
 
+from time import monotonic
+
 import pytest
-from messaging_helpers import AUTHOR, GENERATIONS, PLAYER, SESSIONS, send, user_part
+from messaging_helpers import AUTHOR, GENERATIONS, PLAYER, SESSIONS, send, start_session, user_part
 
 STRANGER = {"X-User-Id": "3"}
 
@@ -26,6 +28,9 @@ def snapshot(db, session_id):
              (SELECT count(*) FROM conversation_generations WHERE billable) AS billable,
              (SELECT row_to_json(s)::text FROM conversation_sessions s
                WHERE s.id = %(s)s) AS session,
+             {rows("conversation_messages")} AS session_messages,
+             {rows("conversation_message_parts")} AS parts,
+             {rows("conversation_user_profiles")} AS profile,
              {rows("conversation_scene_states")} AS scene,
              {rows("conversation_character_states")} AS characters,
              {rows("conversation_relationships")} AS relationships,
@@ -45,8 +50,12 @@ def other_model_id(db, session_id):
 
 @pytest.mark.parametrize("intruder", [AUTHOR, STRANGER], ids=["story_author", "stranger"])
 def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_side_effects(
-    client, db, session, recorder, intruder
+    client, db, saved_story, session, recorder, intruder
 ):
+    # 침입자도 같은 스토리에 자기 대화방이 있다(목록이 비어서 우연히 통과하지 않게).
+    db.execute("INSERT INTO user_play_settings VALUES (3, '지나가는이')")
+    story, intro, _ = saved_story
+    own_session = start_session(client, story, intro, headers=intruder)
     # 세션 주인이 한 번 대화해 둔다(완료된 응답 1건, 모델 호출 1번).
     generation = send(client, session, [user_part("내 이야기")], request_id="owner-0001").json()
     assert client.get(f"{GENERATIONS}/{generation['id']}", headers=PLAYER).json()["status"] == (
@@ -63,6 +72,9 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
             client, session, [user_part("끼어들기")], request_id="intruder-0001", headers=intruder
         ),
         "요청 상태": client.get(f"{GENERATIONS}/{generation['id']}", headers=intruder),
+        "요청 상태 기다리기": client.get(
+            f"{GENERATIONS}/{generation['id']}", params={"wait": 5}, headers=intruder
+        ),
         "요청 ID 조회": client.get(
             f"{SESSIONS}/{session}/generations",
             params={"request_id": "owner-0001"},
@@ -77,6 +89,10 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
             f"{SESSIONS}/{session}/model", json={"model_id": new_model}, headers=intruder
         ),
     }
+    # 롱 폴링도 기다리기 전에 주인을 확인한다(5초를 기다리지 않고 바로 거절).
+    started = monotonic()
+    client.get(f"{GENERATIONS}/{generation['id']}", params={"wait": 5}, headers=intruder)
+    assert monotonic() - started < 2
     statuses = {name: response.status_code for name, response in refused.items()}
     assert statuses == dict.fromkeys(refused, 404)
     # 거절 응답에 주인의 대화 내용이 섞여 나오지 않는다.
@@ -86,7 +102,7 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
     # AC01: 목록에도 남의 대화가 보이지 않는다(제작자도 예외 없음).
     listed = client.get(SESSIONS, headers=intruder)
     assert listed.status_code == 200
-    assert all(item["id"] != session for item in listed.json()["sessions"])
+    assert [item["id"] for item in listed.json()["sessions"]] == [own_session]
 
     # AC03: 메시지·생성 기록·청구·모델·세션 상태가 그대로이고 모델을 부르지 않았다.
     assert snapshot(db, session) == before
