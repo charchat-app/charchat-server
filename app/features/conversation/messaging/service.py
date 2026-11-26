@@ -149,6 +149,7 @@ def _generation_response(
         next_offset=row["text_length"],
         error_code=row["error_code"],
         retryable=retryable,
+        model=row["model_name"],
     )
 
 
@@ -342,8 +343,9 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
             messages=messages,
             active_generation=active,
             last_failed_generation=failed,
-            # 세션에 고정된 모델의 표시 이름(models.name).
+            # 세션의 현재 선택 모델(CHAT-US-13에서 바꿀 수 있음)의 표시 이름(models.name)과 id.
             model=session["model_name"],
+            model_id=session["selected_model_id"],
         )
 
 
@@ -447,13 +449,17 @@ def _speaker_ids(conn: Connection, session_id: int) -> dict[str, int]:
     return mapping
 
 
-def _fail(generation_id: int, streamed: int, code: str) -> None:
+def _fail(generation_id: int, streamed: int, code: str, reported_model: str | None) -> None:
     status = "failed" if streamed == 0 else "failed_partial"
     with worker.connect() as conn:
-        repository.finish_generation(conn, generation_id, status, error_code=code)
+        repository.finish_generation(
+            conn, generation_id, status, error_code=code, reported_model=reported_model
+        )
 
 
-def _finish_output_limit(generation_id: int, session_character_names: list[str]) -> None:
+def _finish_output_limit(
+    generation_id: int, session_character_names: list[str], reported_model: str | None
+) -> None:
     with worker.connect() as conn, conn.transaction():
         text = repository.get_full_text(conn, generation_id)
         visible = bool(
@@ -465,10 +471,11 @@ def _finish_output_limit(generation_id: int, session_character_names: list[str])
             "failed_partial" if visible else "failed",
             error_code=providers.MODEL_OUTPUT_LIMIT,
             billable=visible,
+            reported_model=reported_model,
         )
 
 
-def _save_completed(generation_id: int, claimed) -> None:
+def _save_completed(generation_id: int, claimed, reported_model: str | None) -> None:
     """파싱한 발화자별 부분을 assistant 메시지에 저장하고 생성·메시지를 completed로 바꾼다."""
     session_id = claimed["session_id"]
     with worker.connect() as conn, conn.transaction():
@@ -484,7 +491,9 @@ def _save_completed(generation_id: int, claimed) -> None:
             for part in parse_assistant_text(text, list(ids))
         ]
         repository.insert_parts(conn, session_id, claimed["assistant_message_id"], parts)
-        if not repository.finish_generation(conn, generation_id, "completed", billable=True):
+        if not repository.finish_generation(
+            conn, generation_id, "completed", billable=True, reported_model=reported_model
+        ):
             # 그 사이 중단 정리된 생성이면 응답 저장도 되돌린다.
             raise RuntimeError("생성이 더 이상 진행 중이 아닙니다.")
 
@@ -493,6 +502,8 @@ def _stream(generation_id: int, claimed) -> None:
     with worker.connect() as conn, conn.transaction():
         repository.set_consistent_read(conn)
         context = load_prompt_context(conn, claimed)
+        # 생성 행에 고정된 요청 모델로만 호출한다. 세션 모델을 바꿔도 진행 중 생성은 그대로다
+        # (CHAT-US-13-AC02). 실패해도 다른 모델로 다시 호출하지 않는다(AC03).
         model = repository.get_model(conn, claimed["model_id"])
     request = providers.ProviderRequest(
         model=model["provider_model_id"],
@@ -514,7 +525,7 @@ def _stream(generation_id: int, claimed) -> None:
         chunk = "".join(pending)
         pending = []
         with worker.connect() as conn:
-            if not repository.append_text(conn, generation_id, chunk):
+            if not repository.append_text(conn, generation_id, chunk, request.reported_model):
                 return False
         streamed += len(chunk)
         return True
@@ -531,27 +542,33 @@ def _stream(generation_id: int, claimed) -> None:
         if not flush():
             return
         if exc.code == providers.MODEL_OUTPUT_LIMIT:
-            _finish_output_limit(generation_id, context.session_character_names)
+            _finish_output_limit(
+                generation_id, context.session_character_names, request.reported_model
+            )
         else:
-            _fail(generation_id, streamed, exc.code)
+            _fail(generation_id, streamed, exc.code, request.reported_model)
         return
     except Exception:
         logger.exception("응답 생성 공급자 오류: generation=%s", generation_id)
         flush()
-        _fail(generation_id, streamed, "PROVIDER_ERROR")
+        _fail(generation_id, streamed, "PROVIDER_ERROR", request.reported_model)
         return
     with worker.connect() as conn:
         text = repository.get_full_text(conn, generation_id)
     if not text.strip():
-        _fail(generation_id, 0, "EMPTY_RESPONSE")
+        _fail(generation_id, 0, "EMPTY_RESPONSE", request.reported_model)
         return
     try:
-        _save_completed(generation_id, claimed)
+        _save_completed(generation_id, claimed, request.reported_model)
     except Exception:
         logger.exception("응답 저장 실패: generation=%s", generation_id)
         with worker.connect() as conn:
             repository.finish_generation(
-                conn, generation_id, "save_failed", error_code="SAVE_FAILED"
+                conn,
+                generation_id,
+                "save_failed",
+                error_code="SAVE_FAILED",
+                reported_model=request.reported_model,
             )
 
 
