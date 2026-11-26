@@ -10,11 +10,15 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.db.session import close_pool, open_pool
+from app.features.account.auth.log_masking import install_log_masking
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
     """`database_url`을 주면 그 DB를, 없으면 설정의 `DATABASE_URL`을 쓴다."""
     url = database_url or settings.database_url
+    # BASE-03: staging·production에서 개발용 인증이 켜져 있으면 시작하지 않는다. 로그 토큰은 가린다.
+    settings.assert_safe_for_startup()
+    install_log_masking()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

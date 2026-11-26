@@ -9,6 +9,11 @@ from app.features.creation.images.storage import LocalImageStorage, get_image_st
 from tests.features.creation.images.helpers import OWNER_ID
 
 
+@pytest.fixture(autouse=True)
+def dev_user_header(dev_user_header_enabled):
+    """BASE-03: 이 폴더 테스트는 개발용 X-User-Id 헤더로 사용자를 정한다(tests/conftest.py)."""
+
+
 @pytest.fixture
 def storage(tmp_path):
     return LocalImageStorage(tmp_path / "media")

@@ -145,8 +145,14 @@ def _play_name(conn: Connection, owner_id: int, request: SessionCreateRequest, p
     name = request.play_name
     if name == "" and _is_placeholder_preset(profile):
         name = repository.get_default_play_name(conn, owner_id) or ""
-    if not _real_name(name) or len(name) + len(profile["description"] or "") > PROFILE_TEXT_LIMIT:
+    if not _real_name(name):
         raise InvalidPlayNameError()
+    if len(name) + len(profile["description"] or "") > PROFILE_TEXT_LIMIT:
+        # 기본 플레이 이름(최대 20자)도 긴 프로필 설명과 합치면 넘을 수 있어 할 일을 알려 준다.
+        raise InvalidPlayNameError(
+            f"플레이 이름과 프로필 설명을 합쳐 {PROFILE_TEXT_LIMIT:,}자를 넘을 수 없어요. "
+            "플레이 이름을 줄여 주세요."
+        )
     if any(name_compare_key(c["name"] or "") == name_compare_key(name) for c in chars):
         raise InvalidPlayNameError("등장 캐릭터와 같은 이름을 사용할 수 없습니다.")
     return name

@@ -287,6 +287,27 @@ def test_invalid_selection_or_play_name_creates_no_session(client, db, saved_sto
     assert db.execute("SELECT count(*) AS n FROM conversation_sessions").fetchone()["n"] == 0
 
 
+@pytest.mark.parametrize("play_name", ["", "a" * 20])
+def test_too_long_profile_text_asks_to_shorten_play_name_BASE_03(
+    client, db, saved_story, play_name
+):
+    """기본 플레이 이름 20자 + 프리셋 설명 최대(992자 = 1000 - '{{user}}' 8자)는 한도를 넘는다."""
+    story, _, intro = saved_story
+    db.execute("UPDATE story_user_presets SET description = %s WHERE position = 0", ("x" * 992,))
+    db.execute(
+        "UPDATE user_play_settings SET default_play_name = %s WHERE owner_id = 2", ("b" * 20,)
+    )
+    response = start(client, story, intro, play_name=play_name)
+    assert response.status_code == 422
+    problem = response.json()
+    assert problem["code"] == "CONVERSATION_INVALID_PLAY_NAME"
+    assert problem["detail"] == (
+        "플레이 이름과 프로필 설명을 합쳐 1,000자를 넘을 수 없어요. 플레이 이름을 줄여 주세요."
+    )
+    assert db.execute("SELECT count(*) AS n FROM conversation_sessions").fetchone()["n"] == 0
+    assert start(client, story, intro, play_name="b" * 8).status_code == 201
+
+
 def test_nul_play_name_is_rejected_at_request_validation(client, db, saved_story):
     story, _, intro = saved_story
     response = start(client, story, intro, play_name="Before\0After")
