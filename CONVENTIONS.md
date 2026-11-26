@@ -42,6 +42,7 @@
 ## 4. API
 
 - 경로는 소문자와 복수 명사를 쓴다. 예: `/api/v1/creation/stories`
+  - 예외: `/me`는 현재 로그인한 계정 하나를 가리키는 예외 경로(GET·PATCH)다.
 - 동작은 HTTP 메서드로 표현한다. 경로에 동사를 넣지 않는다.
 - 성공 응답 코드: 생성 `201`, 조회·수정 `200`, 삭제 `204`.
 - 에러 응답은 RFC 9457(Problem Details) 형식을 쓰고, `Content-Type`은 `application/problem+json`이다.

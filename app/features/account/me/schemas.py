@@ -46,6 +46,6 @@ class MeUpdateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # 이름 규칙(앞뒤 공백·{{user}}·길이)은 서비스가 PLAY_NAME_INVALID로 거절한다.
+    # 이름 규칙(1~20자·앞뒤 공백·줄바꿈·NUL·{{user}})은 서비스가 PLAY_NAME_INVALID로 거절한다.
     default_play_name: StrictStr | None = None
     consents: ConsentsUpdateRequest | None = None

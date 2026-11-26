@@ -1,5 +1,6 @@
 """BASE-03 시작 가드: production에서 개발용 인증 설정이 켜져 있거나, staging·production에서
-JWT 서명 키(AUTH_JWT_SECRET)가 없거나 32바이트 미만이면 앱을 만들지 않는다."""
+JWT 서명 키(AUTH_JWT_SECRET)가 없거나 32바이트 미만이거나 약관·개인정보 버전이 draft-로
+시작하면 앱을 만들지 않는다."""
 
 import pytest
 from pydantic import SecretStr
@@ -48,6 +49,8 @@ def test_env_vars_reach_guard_BASE_03(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("AUTH_DEV_HEADER_ENABLED", "true")
     monkeypatch.setenv("AUTH_JWT_SECRET", "s" * 40)
+    monkeypatch.setenv("AUTH_TERMS_VERSION", "terms-2026-11")
+    monkeypatch.setenv("AUTH_PRIVACY_VERSION", "privacy-2026-11")
     with pytest.raises(RuntimeError, match="AUTH_DEV_HEADER_ENABLED"):
         Settings(_env_file=None).assert_safe_for_startup()
 
@@ -83,7 +86,46 @@ def test_production_env_without_jwt_secret_refuses_to_start_BASE_03(monkeypatch)
     with pytest.raises(RuntimeError, match="AUTH_JWT_SECRET"):
         fresh.assert_safe_for_startup()
     monkeypatch.setenv("AUTH_JWT_SECRET", "s" * 40)
+    monkeypatch.setenv("AUTH_TERMS_VERSION", "terms-2026-11")
+    monkeypatch.setenv("AUTH_PRIVACY_VERSION", "privacy-2026-11")
     Settings(_env_file=None).assert_safe_for_startup()
+
+
+@pytest.mark.parametrize("env", ["staging", "production"])
+@pytest.mark.parametrize(
+    ("terms", "privacy", "refused"),
+    [
+        ("draft-v1", "privacy-2026-11", "AUTH_TERMS_VERSION"),
+        ("terms-2026-11", "draft-v2", "AUTH_PRIVACY_VERSION"),
+        ("draft-v1", "draft-v1", "AUTH_TERMS_VERSION, AUTH_PRIVACY_VERSION"),
+    ],
+)
+def test_staging_and_production_refuse_draft_consent_versions_BASE_03(
+    monkeypatch, env, terms, privacy, refused
+):
+    monkeypatch.setattr(settings, "app_env", env)
+    monkeypatch.setattr(settings, "auth_dev_header_enabled", False)
+    monkeypatch.setattr(settings, "auth_dev_login_enabled", False)
+    monkeypatch.setattr(settings, "auth_jwt_secret", SecretStr("x" * 32))
+    monkeypatch.setattr(settings, "auth_terms_version", terms)
+    monkeypatch.setattr(settings, "auth_privacy_version", privacy)
+    with pytest.raises(RuntimeError, match=f"draft-.*: {refused}$"):
+        create_app()
+
+
+def test_draft_consent_versions_are_default_and_allowed_locally_BASE_03(monkeypatch):
+    """코드 기본값은 draft-v1(개발용). local·test는 그대로 시작하고, 환경변수도 가드에 닿는다."""
+    for name in ("AUTH_TERMS_VERSION", "AUTH_PRIVACY_VERSION"):
+        monkeypatch.delenv(name, raising=False)
+    for env in ("local", "test"):
+        monkeypatch.setenv("APP_ENV", env)
+        fresh = Settings(_env_file=None)
+        assert (fresh.auth_terms_version, fresh.auth_privacy_version) == ("draft-v1", "draft-v1")
+        fresh.assert_safe_for_startup()
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "s" * 40)
+    with pytest.raises(RuntimeError, match="AUTH_TERMS_VERSION, AUTH_PRIVACY_VERSION"):
+        Settings(_env_file=None).assert_safe_for_startup()
 
 
 @pytest.mark.parametrize("env", ["local", "test"])

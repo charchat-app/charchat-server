@@ -18,10 +18,10 @@ from app.features.account.me.schemas import (
 )
 from app.features.creation.common.names import has_surrounding_space
 
-# 기본 플레이 이름 상한. 규칙이 미정이라 대화 시작의 프로필 원문 한도
-# (이름+상세 1000자)를 넘지 않게만 둔다.
-PLAY_NAME_MAX_LENGTH = 1000
+# 기본 플레이 이름 상한(임시 규칙 1~20자). 대화 시작은 이름+프로필 설명 1000자 한도로 다시 검사한다.
+PLAY_NAME_MAX_LENGTH = 20
 USER_PLACEHOLDER = "{{user}}"
+FORBIDDEN_PLAY_NAME_CHARS = ("\x00", "\n", "\r")
 
 
 class AccountNotFoundError(AppError):
@@ -74,13 +74,14 @@ def _validate_play_name(name: str) -> None:
         not name.strip()
         or has_surrounding_space(name)
         or name == USER_PLACEHOLDER
-        or "\x00" in name
-        or len(name) > PLAY_NAME_MAX_LENGTH
+        or any(char in name for char in FORBIDDEN_PLAY_NAME_CHARS)
     ):
         raise PlayNameInvalidError(
-            "기본 플레이 이름은 비울 수 없고 앞뒤 공백 없이 "
+            "기본 플레이 이름은 비울 수 없고 앞뒤 공백·줄바꿈 없이 "
             f"{PLAY_NAME_MAX_LENGTH}자 이하로 입력하세요."
         )
+    if len(name) > PLAY_NAME_MAX_LENGTH:
+        raise PlayNameInvalidError(f"플레이 이름은 {PLAY_NAME_MAX_LENGTH}자 이하로 입력하세요.")
 
 
 def update_me(conn: Connection, user_id: int, request: MeUpdateRequest) -> MeResponse:

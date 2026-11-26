@@ -46,6 +46,8 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
      `AUTH_DEV_HEADER_ENABLED=true`. 코드 기본값은 둘 다 `false`다.
    - `AUTH_TERMS_VERSION`, `AUTH_PRIVACY_VERSION`(필수 동의 버전, 기본 `draft-v1`),
      `AUTH_ACCESS_TTL_SECONDS`(1800, JWT `exp`), `AUTH_REFRESH_TTL_DAYS`(60).
+     **staging·production은 `draft-`로 시작하는 동의 버전이면 시작을 거부**한다. 실제 가입을 열기 전에
+     확정된 약관·개인정보 버전을 넣는다(local·test는 `draft-v1` 그대로 시작).
    - `AUTH_JWT_SECRET`: 액세스 토큰(JWT HS256) 서명 키. **staging·production은 32바이트 이상 필수**(없거나
      짧으면 시작 거부). 비밀 저장소·배포 환경변수로만 넣는다. 키를 바꾸면 기존 액세스 토큰이 모두
      `AUTH_TOKEN_INVALID`가 되고 앱은 다시 로그인해야 한다(리프레시 토큰은 유지되지만 앱은 INVALID에서
@@ -53,6 +55,15 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
    - `AUTH_JWT_ISSUER`(기본 `charchat`), `AUTH_PASSWORD_LOGIN_ENABLED`(기본 `true`).
 6. 확인: `GET /api/v1/auth/providers`, 이메일 가입(`POST /api/v1/auth/signup`)·로그인, dev 로그인(개발
    환경), `GET /api/v1/me`.
+
+## 앱이 따르는 인증 오류 계약
+
+액세스 토큰(JWT)이 거절되면 401과 `code`로 구분한다. `AUTH_TOKEN_EXPIRED`(서명은 맞고 만료됨)
+→ 앱이 리프레시 토큰으로 한 번 연장한 뒤 원래 요청을 한 번만 다시 보낸다. `AUTH_TOKEN_INVALID`(변조·다른
+키·세션 폐기·로그아웃·계정 삭제 등) → 재시도 없이 로그아웃 처리한다. 리프레시 회전은 이전 JWT를 무효화하지
+않는다: 같은 세션이 살아 있으면 회전 전 JWT도 만료(최대 `AUTH_ACCESS_TTL_SECONDS`)까지 쓰이므로, 회전과
+겹쳐 이전 JWT로 나간 목록 조회·저장 요청은 그대로 성공한다. 로그아웃이나 세션 폐기(리프레시 재사용 탐지
+포함) 뒤에는 이전·새 JWT 모두 즉시 `AUTH_TOKEN_INVALID`다.
 
 ## 파일이 하는 일
 

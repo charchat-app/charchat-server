@@ -46,7 +46,7 @@ def test_dev_header_is_ignored_for_image_viewer_when_flag_off_BASE_03(
 
 
 def test_image_viewer_bearer_wins_and_bad_or_pending_token_is_rejected_BASE_03(
-    image_api, private_image
+    image_api, private_image, dev_user_header_enabled
 ):
     owner, url = private_image
     other = active_login(image_api, "other")

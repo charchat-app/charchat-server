@@ -17,6 +17,7 @@ from tests.features.account.account_helpers import (
     CURRENT_SESSION,
     ME,
     STORIES,
+    STORY_BODY,
     active_login,
     bearer,
     dev_login,
@@ -195,6 +196,39 @@ def test_refresh_rotation_issues_new_jwt_for_same_session_BASE_03(client, alice)
     assert client.get(STORIES, headers=bearer(new_token)).status_code == 200
     # 리뷰 포인트: 이전 JWT도 세션이 살아 있는 동안은 만료(30분)까지 쓰인다.
     assert client.get(STORIES, headers=bearer(alice["access_token"])).status_code == 200
+
+
+@pytest.mark.parametrize("end", ["logout", "session_revoked"])
+def test_requests_overlapping_rotation_use_old_jwt_until_session_ends_BASE_03(
+    client, db, alice, end
+):
+    """회전과 겹친 요청: 회전 직후 이전 JWT로 보낸 목록 조회·저장이 성공한다.
+    로그아웃·세션 폐기 뒤에는 이전·새 JWT 모두 401 AUTH_TOKEN_INVALID(재시도 없이 로그아웃 대상)."""
+    old = bearer(alice["access_token"])
+    renewed = refresh(client, alice["refresh_token"])
+    assert renewed.status_code == 201
+    new = bearer(renewed.json()["access_token"])
+    assert client.get(STORIES, headers=old).status_code == 200
+    saved = client.post(STORIES, json=STORY_BODY, headers=old)
+    assert saved.status_code == 201, saved.text
+    listed = client.get(STORIES, headers=new)
+    assert [story["id"] for story in listed.json()] == [saved.json()["id"]]
+    if end == "logout":
+        assert client.delete(CURRENT_SESSION, headers=new).status_code == 204
+    else:
+        db.execute(
+            "UPDATE auth_sessions SET revoked_at = clock_timestamp(), "
+            "revoke_reason = 'refresh_reuse' WHERE id = %s",
+            (alice["sid"],),
+        )
+    for headers in (old, new):
+        for response in (
+            client.get(STORIES, headers=headers),
+            client.post(STORIES, json=STORY_BODY, headers=headers),
+        ):
+            assert response.status_code == 401, response.text
+            assert response.json()["code"] == "AUTH_TOKEN_INVALID"
+    assert db.execute("SELECT count(*) AS n FROM stories").fetchone()["n"] == 1
 
 
 def test_jwt_secret_change_invalidates_existing_tokens_BASE_03(client, alice, monkeypatch):

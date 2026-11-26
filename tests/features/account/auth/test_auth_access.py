@@ -116,6 +116,18 @@ def test_forged_dev_header_is_ignored_when_flag_off_BASE_03(client, monkeypatch)
         assert_problem(client.get(path, headers={"X-User-Id": "1"}), 401, "UNAUTHENTICATED")
 
 
+def test_dev_header_is_off_by_default_in_tests_BASE_03(client):
+    """개발용 헤더 폴더(conftest가 켬) 밖에서는 코드 기본값(꺼짐) 그대로: 헤더만 보내면 401."""
+    assert settings.auth_dev_header_enabled is False
+    for path in (STORIES, ME, f"{CONVERSATION_SESSIONS}/1"):
+        assert_problem(client.get(path, headers={"X-User-Id": "1"}), 401, "UNAUTHENTICATED")
+    assert_problem(
+        client.patch(ME, headers={"X-User-Id": "1"}, json={"default_play_name": "민서"}),
+        401,
+        "UNAUTHENTICATED",
+    )
+
+
 def test_dev_header_still_works_when_flag_on_BASE_03(client, monkeypatch):
     monkeypatch.setattr(settings, "auth_dev_header_enabled", True)
     assert client.get(STORIES, headers={"X-User-Id": "1"}).status_code == 200
@@ -137,7 +149,7 @@ def test_bearer_wins_over_dev_header_BASE_03(client, monkeypatch, flag):
     assert me["user_id"] == alice["user"]["user_id"]
 
 
-def test_invalid_bearer_with_valid_dev_header_is_still_401_BASE_03(client):
+def test_invalid_bearer_with_valid_dev_header_is_still_401_BASE_03(client, dev_user_header_enabled):
     headers = {"Authorization": "Bearer cca_" + "Z" * 43, "X-User-Id": "1"}
     assert_problem(client.get(STORIES, headers=headers), 401, "AUTH_TOKEN_INVALID")
 

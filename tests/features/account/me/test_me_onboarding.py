@@ -126,12 +126,28 @@ def test_new_terms_version_requires_new_consent_BASE_03(client, pending, monkeyp
     assert ok.json()["consents"]["terms"] == "terms-2027-01"
 
 
-@pytest.mark.parametrize("name", ["", "   ", " 민서", "민서 ", "{{user}}", "가" * 1001, "a\x00b"])
+@pytest.mark.parametrize(
+    "name", ["", "   ", " 민서", "민서 ", "{{user}}", "가" * 21, "a\x00b", "민\n서", "민\r서"]
+)
 def test_invalid_default_play_name_is_422_BASE_03(client, db, pending, name):
     response = patch_me(client, pending, {"default_play_name": name, "consents": all_consents()})
     assert response.status_code == 422
     assert response.json()["code"] == "PLAY_NAME_INVALID"
     assert db.execute("SELECT count(*) AS n FROM user_consents").fetchone()["n"] == 0
+
+
+def test_default_play_name_length_limit_is_20_BASE_03(client, db, pending):
+    """임시 규칙: 기본 플레이 이름 1~20자. 21자는 할 일을 알려 주는 detail로 거절, 저장 안 함."""
+    for name in ("가" * 21, "a" * 21, "가" * 1000):
+        response = patch_me(client, pending, {"default_play_name": name})
+        assert response.status_code == 422
+        assert response.json()["code"] == "PLAY_NAME_INVALID"
+        assert response.json()["detail"] == "플레이 이름은 20자 이하로 입력하세요."
+    assert db.execute("SELECT count(*) AS n FROM user_play_settings").fetchone()["n"] == 0
+    for name in ("가" * 20, "a", "민 서"):
+        response = patch_me(client, pending, {"default_play_name": name})
+        assert response.status_code == 200, response.text
+        assert response.json()["default_play_name"] == name
 
 
 @pytest.mark.parametrize(
@@ -161,7 +177,7 @@ def test_me_requires_authentication_BASE_03(client):
     assert client.patch(ME, json={}).status_code == 401
 
 
-def test_me_with_dev_header_for_missing_account_is_404_BASE_03(client):
+def test_me_with_dev_header_for_missing_account_is_404_BASE_03(client, dev_user_header_enabled):
     response = client.get(ME, headers={"X-User-Id": "424242"})
     assert response.status_code == 404
     assert response.json()["code"] == "ACCOUNT_NOT_FOUND"
