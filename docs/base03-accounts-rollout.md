@@ -1,7 +1,8 @@
 # BASE-03 (KAN-2) 계정·로그인 세션 DB 배포
 
 로그인 기반(서버 PR S1, 이메일·비밀번호 로그인 포함)은 새 표 6개만 추가한다. 기존 표와 `owner_id` 컬럼은 바꾸지 않는다
-(`owner_id` → `users.id` FK 연결은 후속 작업).
+(`owner_id` → `users.id` FK 연결은 후속 작업). 다만 새 계정이 기존 데이터를 물려받지 않도록 `users.id`
+시퀀스를 기존 `owner_id`보다 앞으로 옮긴다(아래 「새 계정 id와 기존 owner_id」).
 
 | 객체 | 내용 |
 | --- | --- |
@@ -21,6 +22,10 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
 
 1. 대상 DB, 백업/복구 수단, 배포 권한을 확인한다. KAN-16·KAN-17 마이그레이션까지 적용돼 있어야 한다.
    `app/db/schema.sql`은 신규 로컬·테스트 DB 초기화용이며 기존 DB에 실행하지 않는다.
+   마이그레이션 역할에는 대상 DB의 `TEMP` 권한이 필요하다(정의 비교용 `pg_temp.base03_*` 임시 함수).
+   확인: `SELECT has_database_privilege(current_database(), 'TEMP');` → `t`.
+   `users`를 다른 역할이 먼저 만들었다면 `users_id_seq`에 대한 `SELECT`·`UPDATE`(setval) 권한도 필요하다.
+   `owner_id` 컬럼이 있는 모든 `public` 표를 읽을 `SELECT` 권한도 필요하다(시퀀스 보정용 최댓값 조회).
 2. 적용 전 백업: `pg_dump -Fc --dbname="$DB_CONNINFO" > before-base03.dump`
 3. 저장소 루트에서 별도 배포 단계로 실행한다. `DB_CONNINFO`는 운영자가 따로 설정한 접속
    식별자(예: `service=<migration-service>`)다. 비밀값은 파일이나 명령에 적지 않는다.
@@ -37,13 +42,17 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
    SELECT to_regclass('users'), to_regclass('user_identities'), to_regclass('user_consents'),
           to_regclass('user_password_credentials'), to_regclass('auth_sessions'),
           to_regclass('auth_login_attempts');   -- 모두 not null
+   -- 새 계정이 받을 다음 id: 1000 이상이고 모든 owner_id 최댓값보다 커야 한다.
+   SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END AS next_user_id
+   FROM users_id_seq;
    ```
 
 5. 서버 환경변수를 정한 뒤 서버를 올린다.
-   - 운영: `APP_ENV=production`, `AUTH_DEV_HEADER_ENABLED=false`, `AUTH_DEV_LOGIN_ENABLED=false`.
-     production에서 개발용 플래그가 하나라도 켜져 있으면 서버가 **시작을 거부**한다.
-   - 개발·팀 테스트: `AUTH_DEV_LOGIN_ENABLED=true`(dev 키 로그인), 기존 앱이 `X-User-Id`를 쓰는 동안은
-     `AUTH_DEV_HEADER_ENABLED=true`. 코드 기본값은 둘 다 `false`다.
+   - 운영·스테이징: `APP_ENV=production` 또는 `staging`, `AUTH_DEV_HEADER_ENABLED=false`,
+     `AUTH_DEV_LOGIN_ENABLED=false`. staging·production에서 개발용 플래그가 하나라도 켜져 있으면 서버가
+     **시작을 거부**한다(공용 서버에서 `X-User-Id`만으로 이메일 가입 계정 행세를 하지 못하게).
+   - 개발(각자 로컬 서버, `APP_ENV=local`): `AUTH_DEV_LOGIN_ENABLED=true`(dev 키 로그인), 기존 앱이
+     `X-User-Id`를 쓰는 동안은 `AUTH_DEV_HEADER_ENABLED=true`. 코드 기본값은 둘 다 `false`다.
    - `AUTH_TERMS_VERSION`, `AUTH_PRIVACY_VERSION`(필수 동의 버전, 기본 `draft-v1`),
      `AUTH_ACCESS_TTL_SECONDS`(1800, JWT `exp`), `AUTH_REFRESH_TTL_DAYS`(60).
      **staging·production은 `draft-`로 시작하는 동의 버전이면 시작을 거부**한다. 실제 가입을 열기 전에
@@ -51,7 +60,8 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
    - `AUTH_JWT_SECRET`: 액세스 토큰(JWT HS256) 서명 키. **staging·production은 32바이트 이상 필수**(없거나
      짧으면 시작 거부). 비밀 저장소·배포 환경변수로만 넣는다. 키를 바꾸면 기존 액세스 토큰이 모두
      `AUTH_TOKEN_INVALID`가 되고 앱은 다시 로그인해야 한다(리프레시 토큰은 유지되지만 앱은 INVALID에서
-     리프레시하지 않는다). local·test에서 비우면 시작 때 임시 키를 만든다. 서버 프로세스가 여러 개면 같은 키.
+     리프레시하지 않는다). local·test에서 비우면 시작 때마다 임시 키를 만들므로 `--reload`로 재시작할 때마다
+     모든 개발 앱 사용자가 로그아웃된다. 로컬도 `.env`에 고정 키를 넣는다. 서버 프로세스가 여러 개면 같은 키.
    - `AUTH_JWT_ISSUER`(기본 `charchat`), `AUTH_PASSWORD_LOGIN_ENABLED`(기본 `true`).
 6. 확인: `GET /api/v1/auth/providers`, 이메일 가입(`POST /api/v1/auth/signup`)·로그인, dev 로그인(개발
    환경), `GET /api/v1/me`.
@@ -65,6 +75,10 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
 겹쳐 이전 JWT로 나간 목록 조회·저장 요청은 그대로 성공한다. 로그아웃이나 세션 폐기(리프레시 재사용 탐지
 포함) 뒤에는 이전·새 JWT 모두 즉시 `AUTH_TOKEN_INVALID`다.
 
+로그아웃(`DELETE /api/v1/auth/sessions/current`)만은 exp가 지난 액세스 토큰도 받는다. 서명·발급자·
+클레임이 맞고 세션이 살아 있으면 세션을 폐기하고 204를 준다(앱을 30분 넘게 켜 둔 뒤 로그아웃해도 서버
+세션과 리프레시 토큰이 끊긴다). 변조·다른 키 토큰이나 이미 폐기된 세션은 그대로 401 `AUTH_TOKEN_INVALID`다.
+
 ## 파일이 하는 일
 
 - 같은 배포가 동시에 돌지 않도록 트랜잭션 advisory lock(`charchat.base03_accounts`)을 잡는다.
@@ -76,8 +90,26 @@ S1 서버는 모든 인증된 요청(Bearer)과 `/auth/*`, `/me`에서 새 표�
 - 표마다 정의(컬럼 타입·NOT NULL·identity·기본값, NOT NULL 외 제약 이름·정의, 제약 외 인덱스)를
   `schema.sql`로 만든 DB와 문자열로 비교한다. 다르면 `BASE-03: unexpected public.<표> definition`
   예외(DETAIL에 기대값/실제값)로 전체가 되돌아간다. 그때는 서버를 배포하지 않고 원인을 확인한다.
+- `users`를 만든 뒤 `users.id` 시퀀스를 앞으로 옮긴다(아래 절).
 - 잠금 대기 3초, 문장 실행 60초로 제한한다. 실패하면 제한을 높이지 말고 원인을 확인한 뒤 파일을
   처음부터 다시 실행한다. 이미 적용된 DB에 다시 실행해도 데이터와 정의를 바꾸지 않는다.
+
+## 새 계정 id와 기존 owner_id
+
+기존 기능은 `owner_id = users.id`로 권한을 정한다. 공용 DB에는 계정 없이 `X-User-Id`(1, 2, …)로 쌓인
+스토리·이미지·대화 세션·`user_profiles`·`user_play_settings` 등이 있으므로, 새 계정 id가 1부터 시작하면
+첫 가입자가 owner 1의 비공개 데이터와 기본 플레이 이름을 물려받는다. 그래서 마이그레이션은 `users`를
+만든 뒤 시퀀스의 다음 값을 다음 중 가장 큰 값으로 맞춘다.
+
+- 현재 다음 값(뒤로 가지 않는다. 재실행해도 줄지 않는다)
+- `owner_id` 컬럼이 있는 **모든** `public` 표(`information_schema`가 아니라 `pg_attribute`로 실행 때 찾으므로
+  나중에 추가된 표도 포함)와 `users.id`의 최댓값 + 1
+- 1000
+
+**공용 DB에서 손으로 쓰는 개발용 `X-User-Id` 값은 1000 미만(1~999)으로 유지한다.** 1000 이상은 실제 계정
+id와 겹칠 수 있다. 마이그레이션 뒤에 1000 이상인 `X-User-Id`로 데이터를 만들었다면 마이그레이션을 다시
+실행해 시퀀스를 그 값 너머로 옮긴다(재실행은 안전하다). 큰 표는 `owner_id` 최댓값 조회가 전체 스캔이 될
+수 있으니 문장 제한(60초)에 걸리면 원인을 확인한다.
 
 ## 개발 DB 이관 (개발 DB 전용, 선택)
 
@@ -92,7 +124,8 @@ psql -X --dbname="$DEV_DB_CONNINFO" --set=ON_ERROR_STOP=1 \
 - 6개 표(`stories`, `images`, `conversation_sessions`, `user_profiles`, `user_play_settings`,
   `creation_write_requests`)의 `owner_id`마다 같은 id의 `users(status='active')`와
   `user_identities(provider='dev', provider_user_id=owner_id 문자열)`을 만든다. 이미 있으면 건너뛴다.
-  그 뒤 `users.id` 시퀀스를 최댓값 다음으로 맞춰 새 계정이 옮긴 id와 겹치지 않게 한다.
+  그 뒤 `users.id` 시퀀스를 최댓값 다음으로 맞춰 새 계정이 옮긴 id와 겹치지 않게 한다. 앞으로만 옮기므로
+  마이그레이션이 정한 값(1000 이상)보다 뒤로 가지 않는다.
 - 결과: dev 로그인 키 `"1"`로 로그인하면 예전 `X-User-Id: 1`의 데이터가 그대로 보인다.
   이관된 계정은 동의 기록 없이 `active`다(개발 데이터 호환용).
 - 가드: DB 이름이 `_dev` 또는 `_test`로 끝날 때만 실행한다. 접미어가 없는 로컬 DB(예: Docker 기본
@@ -104,8 +137,10 @@ psql -X --dbname="$DEV_DB_CONNINFO" --set=ON_ERROR_STOP=1 \
     --file=app/db/migrations/base03_dev_owner_backfill.sql
   ```
 
-- 이관하지 않은 개발 DB에서 dev 로그인으로 새 계정을 만들면, 새 계정 id가 기존 `owner_id`와 같을 수
-  있다(그 데이터가 새 계정 것으로 보인다). 기존 개발 데이터가 있는 DB는 dev 로그인 전에 이관한다.
+- 이관하지 않은 DB(공용 DB 포함)에서도 이메일 가입·dev 로그인으로 만든 새 계정은 기존 `owner_id`와
+  겹치지 않는다(마이그레이션의 시퀀스 보정). 새 계정은 기존 데이터를 볼 수 없으므로, 개발 DB에서 예전
+  데이터를 dev 로그인으로 보려면 이관한다. 마이그레이션 뒤 1000 이상 `X-User-Id`로 만든 데이터가 있으면
+  마이그레이션을 다시 실행한 뒤 새 계정을 만든다.
 
 ## 롤백: 서버 먼저
 

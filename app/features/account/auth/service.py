@@ -131,11 +131,14 @@ def _parse_bearer(authorization: str) -> str:
     return token
 
 
-def authenticate_access_token(conn: Connection, authorization: str) -> Account:
+def authenticate_access_token(
+    conn: Connection, authorization: str, *, allow_expired: bool = False
+) -> Account:
     """Authorization 헤더의 JWT로 계정을 찾는다.
 
     서명·형식·발급자가 틀리거나 세션이 폐기·없음·sub 불일치·탈퇴 계정이면 INVALID.
     서명이 맞고 세션도 살아 있는데 exp만 지났으면 EXPIRED(앱이 리프레시한다).
+    `allow_expired`는 로그아웃 경로 전용이다: 나머지 검사는 같고 exp만 지난 토큰을 받는다.
     """
     token = _parse_bearer(authorization)
     try:
@@ -150,7 +153,7 @@ def authenticate_access_token(conn: Connection, authorization: str) -> Account:
         or row["status"] == "deleted"
     ):
         raise AuthTokenInvalidError()
-    if claims.expired:
+    if claims.expired and not allow_expired:
         raise AuthTokenExpiredError("액세스 토큰을 리프레시 토큰으로 갱신하세요.")
     if row["stale"]:
         # 쓰기를 줄이려고 1분 이상 지났을 때만 갱신한다.

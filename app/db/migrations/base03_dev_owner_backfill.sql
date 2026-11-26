@@ -51,16 +51,30 @@ SELECT owner_id, 'active', clock_timestamp() FROM base03_owner_ids
 ORDER BY 1
 ON CONFLICT (id) DO NOTHING;
 
+-- 이메일·비밀번호 계정에는 dev 로그인 키를 붙이지 않는다(키 "1000"으로 남의 계정에 들어가는 것을 막음).
 INSERT INTO public.user_identities (user_id, provider, provider_user_id)
-SELECT owner_id, 'dev', owner_id::text FROM base03_owner_ids
+SELECT o.owner_id, 'dev', o.owner_id::text FROM base03_owner_ids o
+WHERE NOT EXISTS (
+    SELECT 1 FROM public.user_password_credentials c WHERE c.user_id = o.owner_id
+)
 ORDER BY 1
 ON CONFLICT (provider, provider_user_id) DO NOTHING;
 
--- 새 계정이 옮긴 id와 겹치지 않도록 identity 시퀀스를 최댓값 다음으로 맞춘다.
-SELECT setval(
-    pg_get_serial_sequence('public.users', 'id'),
-    COALESCE((SELECT max(id) FROM public.users), 0) + 1,
-    false
-);
+-- 새 계정이 옮긴 id와 겹치지 않도록 identity 시퀀스를 최댓값 다음으로 맞춘다. 앞으로만 옮긴다:
+-- base03_accounts.sql이 정한 값(1000 이상 등)보다 뒤로 가지 않는다.
+DO $base03_backfill_seq$
+DECLARE
+    seq text := pg_get_serial_sequence('public.users', 'id');
+    next_id bigint;
+    wanted bigint;
+BEGIN
+    EXECUTE format('SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM %s', seq)
+        INTO next_id;
+    SELECT COALESCE(max(id), 0) + 1 INTO wanted FROM public.users;
+    IF wanted > next_id THEN
+        PERFORM setval(seq, wanted, false);
+    END IF;
+END;
+$base03_backfill_seq$;
 
 COMMIT;

@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Response
 
-from app.api.deps import CurrentAccount, DbConn
+from app.api.deps import DbConn, LogoutAccount
 from app.features.account.auth import service
 from app.features.account.auth.schemas import (
     DevTokenRequest,
@@ -38,6 +38,7 @@ def create_tokens(request: Annotated[TokenRequest, Body()], conn: DbConn) -> Tok
 
 
 @router.delete("/sessions/current", status_code=204)
-def delete_current_session(account: CurrentAccount, conn: DbConn) -> Response:
+def delete_current_session(account: LogoutAccount, conn: DbConn) -> Response:
+    # 만료된 액세스 토큰도 받는다(서명·클레임·살아 있는 세션은 그대로 확인).
     service.logout(conn, account)
     return Response(status_code=204)

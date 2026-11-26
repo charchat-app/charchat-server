@@ -57,7 +57,7 @@ def get_image_file(
         headers={
             "Cache-Control": PUBLIC_CACHE if found.is_public else PRIVATE_CACHE,
             # 같은 주소라도 사용자에 따라 응답이 달라질 수 있음을 캐시에 알린다.
-            "Vary": "X-User-Id",
+            "Vary": "Authorization, X-User-Id",
         },
     )
 

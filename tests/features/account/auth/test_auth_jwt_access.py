@@ -231,8 +231,11 @@ def test_requests_overlapping_rotation_use_old_jwt_until_session_ends_BASE_03(
     assert db.execute("SELECT count(*) AS n FROM stories").fetchone()["n"] == 1
 
 
-def test_jwt_secret_change_invalidates_existing_tokens_BASE_03(client, alice, monkeypatch):
-    """서버 재시작으로 임시 키가 바뀌면 기존 JWT는 INVALID, 리프레시로 회복한다."""
+def test_jwt_secret_change_makes_access_token_invalid_but_refresh_token_still_works_BASE_03(
+    client, alice, monkeypatch
+):
+    """서버 재시작으로 임시 키가 바뀌면 기존 JWT는 AUTH_TOKEN_INVALID다(EXPIRED가 아니므로 앱은
+    리프레시하지 않고 로그아웃한다). 서버 쪽 리프레시 토큰 자체는 키와 무관해 계속 쓸 수 있다."""
     monkeypatch.setattr(settings, "auth_jwt_secret", SecretStr("rotated-secret-" + "y" * 32))
     assert_invalid(client, alice["access_token"])
     renewed = refresh(client, alice["refresh_token"]).json()

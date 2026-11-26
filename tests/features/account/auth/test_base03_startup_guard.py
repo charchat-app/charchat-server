@@ -1,6 +1,6 @@
-"""BASE-03 시작 가드: production에서 개발용 인증 설정이 켜져 있거나, staging·production에서
-JWT 서명 키(AUTH_JWT_SECRET)가 없거나 32바이트 미만이거나 약관·개인정보 버전이 draft-로
-시작하면 앱을 만들지 않는다."""
+"""BASE-03 시작 가드: staging·production에서 개발용 인증 설정이 켜져 있거나, JWT 서명 키
+(AUTH_JWT_SECRET)가 없거나 32바이트 미만이거나 약관·개인정보 버전이 draft-로 시작하면 앱을
+만들지 않는다."""
 
 import pytest
 from pydantic import SecretStr
@@ -9,27 +9,30 @@ from app.core.config import Settings, settings
 from app.main import create_app
 
 
+@pytest.mark.parametrize("env", ["staging", "production"])
 @pytest.mark.parametrize(
     ("header", "login"),
     [(True, False), (False, True), (True, True)],
 )
-def test_production_refuses_dev_auth_flags_BASE_03(monkeypatch, header, login):
-    monkeypatch.setattr(settings, "app_env", "production")
+def test_staging_and_production_refuse_dev_auth_flags_BASE_03(monkeypatch, env, header, login):
+    """staging(공용 서버)도 거부한다: X-User-Id만으로 이메일 가입 계정 행세를 할 수 없게."""
+    monkeypatch.setattr(settings, "app_env", env)
     monkeypatch.setattr(settings, "auth_dev_header_enabled", header)
     monkeypatch.setattr(settings, "auth_dev_login_enabled", login)
-    with pytest.raises(RuntimeError, match="AUTH_DEV_"):
+    with pytest.raises(RuntimeError, match=f"APP_ENV={env}.*AUTH_DEV_"):
         create_app()
 
 
-def test_production_starts_without_dev_flags_BASE_03(monkeypatch):
-    monkeypatch.setattr(settings, "app_env", "production")
+@pytest.mark.parametrize("env", ["staging", "production"])
+def test_staging_and_production_start_without_dev_flags_BASE_03(monkeypatch, env):
+    monkeypatch.setattr(settings, "app_env", env)
     monkeypatch.setattr(settings, "auth_dev_header_enabled", False)
     monkeypatch.setattr(settings, "auth_dev_login_enabled", False)
     assert create_app() is not None
 
 
-@pytest.mark.parametrize("env", ["local", "test", "staging"])
-def test_non_production_allows_dev_flags_BASE_03(monkeypatch, env):
+@pytest.mark.parametrize("env", ["local", "test"])
+def test_local_and_test_allow_dev_flags_BASE_03(monkeypatch, env):
     monkeypatch.setattr(settings, "app_env", env)
     monkeypatch.setattr(settings, "auth_dev_header_enabled", True)
     monkeypatch.setattr(settings, "auth_dev_login_enabled", True)

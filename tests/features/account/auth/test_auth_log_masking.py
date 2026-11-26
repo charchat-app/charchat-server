@@ -3,7 +3,15 @@
 import json
 import logging
 
-from app.features.account.auth.log_masking import SecretMaskingFilter, mask_secrets
+import jwt
+import pytest
+
+from app.features.account.auth.log_masking import (
+    SecretMaskingFilter,
+    install_log_masking,
+    is_log_masking_installed,
+    mask_secrets,
+)
 from tests.features.account.account_helpers import (
     CURRENT_SESSION,
     ME,
@@ -31,9 +39,9 @@ def test_mask_secrets_hides_tokens_and_query_codes_BASE_03():
 
 
 def test_access_log_args_are_masked_after_create_app_BASE_03(client, caplog):
-    """create_app이 uvicorn 접근 로그에 필터를 붙인다. 접근 로그는 args로 형식을 만든다."""
+    """create_app이 로그 기록 마스킹을 설치한다. uvicorn 접근 로그는 args로 형식을 만든다."""
     access = logging.getLogger("uvicorn.access")
-    assert any(isinstance(f, SecretMaskingFilter) for f in access.filters)
+    assert is_log_masking_installed()
     with caplog.at_level(logging.INFO, logger="uvicorn.access"):
         access.info(
             '%s - "%s %s HTTP/%s" %d',
@@ -118,3 +126,47 @@ def test_email_auth_flow_logs_contain_no_password_or_jwt_BASE_03(client, caplog)
     ]
     for secret in secrets_seen:
         assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "logger_name",
+    [
+        "app.features.conversation.messaging.service",
+        "app.features.creation.images.service",
+        "uvicorn.protocols.http.h11_impl",
+        "some_library.client",
+    ],
+)
+def test_child_logger_records_are_masked_BASE_03(client, caplog, logger_name):
+    """필터를 \"app\" 로거에만 붙이면 app.features.* 같은 하위 로거 기록은 가려지지 않는다.
+    create_app 뒤에는 어느 로거에서 만든 기록이든 토큰·비밀번호가 가려진다."""
+    fake_jwt = jwt.encode({"sub": "1", "sid": "2"}, "k" * 32, algorithm="HS256")
+    fake_refresh = "ccr_" + "R7" * 21 + "x"
+    password = "ChildSecret55"
+    child = logging.getLogger(logger_name)
+    with caplog.at_level(logging.INFO):
+        child.warning("token=%s refresh=%s", fake_jwt, fake_refresh)
+        child.warning('body {"email": "a@example.com", "password": "%s"}' % password)
+        child.info("args %(auth)s", {"auth": f"Bearer {fake_jwt}"})
+    assert len(caplog.records) == 3
+    for secret in (fake_jwt, fake_jwt.split(".")[-1], fake_refresh, fake_refresh[4:], password):
+        assert secret not in caplog.text
+    assert "a@example.com" in caplog.text and "ccr_***" in caplog.text
+
+
+def test_install_log_masking_wraps_factory_once_and_filter_still_masks_BASE_03(client):
+    factory = logging.getLogRecordFactory()
+    install_log_masking()
+    assert logging.getLogRecordFactory() is factory  # 두 번 감싸지 않는다
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "t=%s", (REFRESH,), None)
+    SecretMaskingFilter().filter(record)
+    assert REFRESH not in record.getMessage()
+
+
+def test_masking_placeholder_value_keeps_record_formattable_BASE_03(client, caplog):
+    """`password=%s`처럼 가릴 자리에 자리표시자가 있어도 기록이 깨지지 않고 값이 가려진다
+    (팩토리가 모든 로거에 적용되므로 외부 라이브러리 로그도 여기에 걸릴 수 있다)."""
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("some_library.db").warning("login password=%s user=%s", "Pw12345", "bob")
+    assert "Pw12345" not in caplog.text
+    assert "password=*** user=bob" in caplog.text

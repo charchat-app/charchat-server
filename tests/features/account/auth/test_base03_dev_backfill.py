@@ -17,6 +17,7 @@ from tests.features.account.account_helpers import (
     bearer,
     dev_login,
     seed_conversation_session,
+    signup,
 )
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -70,6 +71,16 @@ def test_backfill_creates_active_dev_accounts_for_existing_owners_BASE_03(db, cl
     assert newcomer["user"]["status"] == "pending"
 
 
+def test_backfill_after_migration_keeps_users_sequence_forward_BASE_03(db, client):
+    """문서 순서(마이그레이션 → 이관)대로 돌리면 이관이 시퀀스를 1000 아래로 되돌리지 않는다."""
+    seed_owner_data(db)
+    db.execute(MIGRATION.read_text(encoding="utf-8"))  # 기존 owner_id가 있어도 1000부터
+    db.execute(BACKFILL.read_text(encoding="utf-8"))
+    newcomer = dev_login(client, "brand-new")
+    assert newcomer["user"]["user_id"] == 1000
+    assert dev_login(client, "1")["user"]["user_id"] == 1  # 이관 계정은 그대로
+
+
 def test_backfill_keeps_existing_accounts_BASE_03(db, client):
     taken = dev_login(client, "someone")  # id 1, pending
     seed_owner_data(db)
@@ -80,6 +91,21 @@ def test_backfill_keeps_existing_accounts_BASE_03(db, client):
         "SELECT provider_user_id FROM user_identities WHERE user_id = 1 ORDER BY 1"
     ).fetchall()
     assert [p["provider_user_id"] for p in providers] == ["1", "someone"]
+
+
+def test_backfill_gives_no_dev_key_to_email_accounts_BASE_03(db, client):
+    """이메일 계정의 데이터가 있어도 이관이 그 계정에 dev 로그인 키를 붙이지 않는다."""
+    member = signup(client, "member@example.com").json()
+    member_id = member["user"]["user_id"]
+    db.execute("INSERT INTO stories (owner_id, title) VALUES (%s, 'mine')", (member_id,))
+    seed_owner_data(db)
+    db.execute(BACKFILL.read_text(encoding="utf-8"))
+    rows = db.execute(
+        "SELECT provider_user_id FROM user_identities WHERE user_id = %s", (member_id,)
+    ).fetchall()
+    assert rows == []
+    other = dev_login(client, str(member_id))
+    assert other["user"]["user_id"] != member_id
 
 
 @pytest.fixture

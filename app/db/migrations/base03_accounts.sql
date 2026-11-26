@@ -3,7 +3,8 @@
 --
 -- 새 표 6개(users, user_identities, user_consents, user_password_credentials, auth_sessions,
 -- auth_login_attempts)만 만든다.
--- 기존 표와 owner_id 컬럼은 건드리지 않는다(FK 연결은 후속 작업).
+-- 기존 표와 owner_id 컬럼은 건드리지 않는다(FK 연결은 후속 작업). 대신 users.id 시퀀스를 기존
+-- owner_id 최댓값 다음(최소 1000)으로 옮겨 새 계정이 기존 데이터를 물려받지 않게 한다(1-1).
 -- 결과는 app/db/schema.sql과 같은 정의다. 이미 있는 표가 기대 정의와 다르면 예외로 전체를
 -- 되돌린다. 다시 실행해도 데이터와 정의가 바뀌지 않는다.
 BEGIN;
@@ -72,6 +73,42 @@ col deleted_at timestamp with time zone
 con users_pkey PRIMARY KEY (id)
 con users_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'deleted'::text])))
 con users_status_times CHECK ((((status = 'pending'::text) AND (onboarded_at IS NULL) AND (deleted_at IS NULL)) OR ((status = 'active'::text) AND (onboarded_at IS NOT NULL) AND (deleted_at IS NULL)) OR ((status = 'deleted'::text) AND (deleted_at IS NOT NULL))))$exp$);
+
+-- 1-1. 새 계정 id가 기존 owner_id 데이터와 겹치지 않게 users.id 시퀀스를 앞으로 옮긴다.
+-- 기존 기능은 owner_id = users.id로 권한을 정하므로, 계정 없이 쌓인 owner_id(예전 X-User-Id)와
+-- 같은 id의 새 계정은 그 데이터를 물려받는다. owner_id 컬럼이 있는 모든 public 표(나중에 추가된
+-- 표 포함)와 users의 최댓값 + 1, 그리고 1000(공용 DB에서 손으로 쓰는 개발용 X-User-Id 1~999 보호)
+-- 중 큰 값으로 맞춘다. 앞으로만 옮기며 재실행해도 뒤로 가지 않는다.
+DO $base03_seq$
+DECLARE
+    seq text := pg_get_serial_sequence('public.users', 'id');
+    next_id bigint;
+    floor_id bigint := 1000;
+    found bigint;
+    owner_table record;
+BEGIN
+    EXECUTE format('SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM %s', seq)
+        INTO next_id;
+    FOR owner_table IN
+        SELECT n.nspname, c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+          AND a.attname = 'owner_id' AND a.attnum > 0 AND NOT a.attisdropped
+          AND a.atttypid IN ('smallint'::regtype, 'integer'::regtype, 'bigint'::regtype)
+    LOOP
+        EXECUTE format('SELECT max(owner_id)::bigint FROM %I.%I', owner_table.nspname,
+                       owner_table.relname)
+            INTO found;
+        floor_id := GREATEST(floor_id, COALESCE(found, 0) + 1);
+    END LOOP;
+    SELECT GREATEST(floor_id, COALESCE(max(id), 0) + 1) INTO floor_id FROM public.users;
+    IF floor_id > next_id THEN
+        PERFORM setval(seq, floor_id, false);
+    END IF;
+END;
+$base03_seq$;
 
 -- 2. 외부 로그인 연결
 -- 인덱스가 있는 표는 표가 없을 때만 표와 인덱스를 함께 만든다(다른 정의의 표에 인덱스를 붙이지 않음).

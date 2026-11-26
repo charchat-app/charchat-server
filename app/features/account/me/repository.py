@@ -6,7 +6,8 @@ from psycopg import Connection
 def get_user(conn: Connection, user_id: int, *, lock: bool = False):
     query = "SELECT id, status FROM users WHERE id = %s AND status <> 'deleted'"
     if lock:
-        query += " FOR UPDATE"
+        # FK 삽입(auth_sessions·user_consents)의 FOR KEY SHARE와 충돌하지 않는 잠금.
+        query += " FOR NO KEY UPDATE"
     return conn.execute(query, (user_id,)).fetchone()
 
 

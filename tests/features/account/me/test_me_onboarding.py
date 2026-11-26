@@ -4,9 +4,12 @@
 모두 있어야 active가 된다. 기본 플레이 이름은 기존 user_play_settings에 저장한다.
 """
 
+import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from app.core.config import settings
+from app.features.account.me import repository as me_repository
 from tests.features.account.account_helpers import (
     ME,
     STORIES,
@@ -181,3 +184,22 @@ def test_me_with_dev_header_for_missing_account_is_404_BASE_03(client, dev_user_
     response = client.get(ME, headers={"X-User-Id": "424242"})
     assert response.status_code == 404
     assert response.json()["code"] == "ACCOUNT_NOT_FOUND"
+
+
+def test_me_update_lock_does_not_block_login_session_insert_BASE_03(client, db, db_url, pending):
+    """PATCH /me가 잡는 users 행 잠금(FOR NO KEY UPDATE)은 같은 계정의 로그인(auth_sessions FK
+    삽입이 잡는 FOR KEY SHARE)을 막지 않는다."""
+    user_id = pending["user"]["user_id"]
+    with psycopg.connect(db_url, row_factory=dict_row) as holder:
+        # holder는 autocommit이 아니라 트랜잭션 안에서 잠금을 쥔다.
+        assert me_repository.get_user(holder, user_id, lock=True) is not None
+        db.execute("SET lock_timeout = '1s'")
+        try:
+            db.execute(
+                "INSERT INTO auth_sessions (user_id, client_platform, refresh_token_hash, "
+                "refresh_expires_at) VALUES (%s, 'web', '\\x01', clock_timestamp())",
+                (user_id,),
+            )
+        finally:
+            db.execute("RESET lock_timeout")
+        holder.rollback()

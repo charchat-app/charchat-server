@@ -28,7 +28,11 @@ def private_image(image_api):
 def test_owner_bearer_sees_private_image_others_do_not_BASE_03(image_api, private_image):
     owner, url = private_image
     other = active_login(image_api, "other")
-    assert image_api.get(url, headers=bearer(owner["access_token"])).status_code == 200
+    seen = image_api.get(url, headers=bearer(owner["access_token"]))
+    assert seen.status_code == 200
+    # 응답이 Authorization(과 개발용 X-User-Id)에 따라 달라짐을 캐시에 알린다.
+    vary = [part.strip() for part in seen.headers["Vary"].split(",")]
+    assert vary[:2] == ["Authorization", "X-User-Id"]  # CORS가 뒤에 Origin을 덧붙인다
     assert image_api.get(url, headers=bearer(other["access_token"])).status_code == 404
     assert image_api.get(url).status_code == 404
 

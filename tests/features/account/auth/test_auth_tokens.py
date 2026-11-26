@@ -6,7 +6,10 @@ POST /auth/tokens, DELETE /auth/sessions/current.
 """
 
 import hashlib
+import threading
+import time
 
+import psycopg
 import pytest
 
 from app.core.config import settings
@@ -21,6 +24,7 @@ from tests.features.account.account_helpers import (
     dev_login,
     expired_access_token,
     jwt_claims,
+    mint_access_token,
     refresh,
 )
 
@@ -212,3 +216,78 @@ def test_logout_without_bearer_is_401_BASE_03(client):
     response = client.delete(CURRENT_SESSION, headers={"X-User-Id": "1"})
     assert response.status_code == 401
     assert response.json()["code"] == "UNAUTHENTICATED"
+
+
+def test_logout_with_expired_access_token_revokes_session_BASE_03(client, db):
+    """앱을 30분 넘게 켜 둔 뒤 로그아웃해도(액세스 토큰 만료) 서버 세션이 폐기된다."""
+    first = active_login(client, "alice")
+    expired = expired_access_token(first["access_token"])
+    # 다른 경로에서는 그대로 EXPIRED다(로그아웃 경로만 만료를 허용).
+    assert client.get(ME, headers=bearer(expired)).json()["code"] == "AUTH_TOKEN_EXPIRED"
+
+    response = client.delete(CURRENT_SESSION, headers=bearer(expired))
+    assert response.status_code == 204
+    row = session_row(db, first["user"]["user_id"])
+    assert row["revoked_at"] is not None
+    assert row["revoke_reason"] == "logout"
+    assert refresh(client, first["refresh_token"]).status_code == 401
+    # 이미 폐기된 세션의 만료 토큰으로 다시 로그아웃하면 INVALID.
+    again = client.delete(CURRENT_SESSION, headers=bearer(expired))
+    assert again.status_code == 401
+    assert again.json()["code"] == "AUTH_TOKEN_INVALID"
+
+
+def test_logout_with_expired_but_forged_token_is_401_invalid_BASE_03(client, db):
+    first = active_login(client, "alice")
+    claims = jwt_claims(first["access_token"])
+    old = int(time.time()) - 3600
+    other_secret = mint_access_token(
+        claims["sub"], claims["sid"], secret="other-" + "z" * 40, issued_at=old, ttl=1800
+    )
+    wrong_issuer = mint_access_token(
+        claims["sub"], claims["sid"], issued_at=old, ttl=1800, iss="someone-else"
+    )
+    wrong_sub = mint_access_token(int(claims["sub"]) + 1, claims["sid"], issued_at=old, ttl=1800)
+    expired = expired_access_token(first["access_token"])
+    head, body, signature = expired.split(".")
+    tampered = f"{head}.{body}.{signature[:-2]}{'AA' if signature[-2:] != 'AA' else 'BB'}"
+    for token in (other_secret, wrong_issuer, wrong_sub, tampered):
+        response = client.delete(CURRENT_SESSION, headers=bearer(token))
+        assert response.status_code == 401, response.text
+        assert response.json()["code"] == "AUTH_TOKEN_INVALID"
+    assert session_row(db, first["user"]["user_id"])["revoked_at"] is None
+
+
+def test_concurrent_refresh_with_same_token_gives_one_201_and_one_409_BASE_03(client, db, db_url):
+    """같은 리프레시 토큰으로 두 요청이 동시에 오면(행 잠금에서 함께 기다리게 만든 뒤 풀어 줌)
+    하나만 회전에 성공(201)하고 다른 하나는 409다. 세션은 폐기되지 않는다."""
+    first = active_login(client, "alice")
+    user_id = first["user"]["user_id"]
+    results: list[int] = []
+
+    def send() -> None:
+        results.append(refresh(client, first["refresh_token"]).status_code)
+
+    with psycopg.connect(db_url) as holder:
+        holder.execute("SELECT id FROM auth_sessions WHERE user_id = %s FOR UPDATE", (user_id,))
+        threads = [threading.Thread(target=send) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            waiting = db.execute(
+                "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() "
+                "AND wait_event_type = 'Lock' AND query LIKE '%%FOR UPDATE OF s%%'"
+            ).fetchone()["n"]
+            if waiting == 2:
+                break
+            time.sleep(0.05)
+        assert waiting == 2, "두 요청이 같은 세션 행 잠금에서 함께 기다려야 한다"
+        holder.rollback()  # 잠금을 풀어 두 요청을 동시에 진행시킨다
+        for thread in threads:
+            thread.join(timeout=10)
+
+    assert sorted(results) == [201, 409]
+    row = session_row(db, user_id)
+    assert row["revoked_at"] is None
+    assert row["previous_refresh_hash"] == sha256(first["refresh_token"])

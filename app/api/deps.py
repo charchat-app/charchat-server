@@ -32,10 +32,12 @@ DevUserHeader = Annotated[str | None, Header(alias="X-User-Id")]
 _borrow_conn = contextmanager(get_conn)
 
 
-def _resolve_account(authorization: str | None, x_user_id: str | None) -> Account | None:
+def _resolve_account(
+    authorization: str | None, x_user_id: str | None, *, allow_expired: bool = False
+) -> Account | None:
     if authorization is not None:
         with _borrow_conn() as conn:
-            return authenticate_access_token(conn, authorization)
+            return authenticate_access_token(conn, authorization, allow_expired=allow_expired)
     if settings.auth_dev_header_enabled and x_user_id is not None:
         return dev_header_account(x_user_id)
     return None
@@ -53,6 +55,21 @@ def get_current_account(
 
 
 CurrentAccount = Annotated[Account, Depends(get_current_account)]
+
+
+def get_logout_account(
+    authorization: AuthorizationHeader = None,
+    x_user_id: DevUserHeader = None,
+) -> Account:
+    """로그아웃(DELETE /auth/sessions/current) 전용. 서명·발급자·클레임이 맞고 세션이 살아 있으면
+    exp가 지난 액세스 토큰도 받는다(앱을 오래 켜 둔 뒤 로그아웃해도 서버 세션을 끊기 위해)."""
+    account = _resolve_account(authorization, x_user_id, allow_expired=True)
+    if account is None:
+        raise UnauthenticatedError("Authorization: Bearer <액세스 토큰>을 보내세요.")
+    return account
+
+
+LogoutAccount = Annotated[Account, Depends(get_logout_account)]
 
 
 def get_current_user_id(account: CurrentAccount) -> int:

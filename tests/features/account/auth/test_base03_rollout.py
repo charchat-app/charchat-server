@@ -7,7 +7,14 @@ import psycopg
 import pytest
 from psycopg.pq import TransactionStatus
 
-from tests.features.account.account_helpers import ME, active_login, bearer
+from tests.features.account.account_helpers import (
+    ME,
+    STORIES,
+    active_login,
+    bearer,
+    onboard,
+    signup,
+)
 
 ROOT = Path(__file__).resolve().parents[4]
 MIGRATION = ROOT / "app/db/migrations/base03_accounts.sql"
@@ -100,6 +107,67 @@ def test_migration_on_pre_base03_db_matches_schema_and_is_idempotent_BASE_03(db,
     assert db.execute("SELECT owner_id, title FROM stories").fetchall() == [
         {"owner_id": 7, "title": "기존 스토리"}
     ]
+
+
+def users_next_id(db) -> int:
+    """users.id identity 시퀀스가 다음에 줄 값(시퀀스를 소비하지 않고 읽는다)."""
+    row = db.execute("SELECT pg_get_serial_sequence('public.users', 'id') AS seq").fetchone()
+    state = db.execute(f"SELECT last_value, is_called FROM {row['seq']}").fetchone()
+    return state["last_value"] + 1 if state["is_called"] else state["last_value"]
+
+
+def test_new_signup_on_db_with_existing_owner_data_gets_isolated_account_BASE_03(
+    db, client, migration
+):
+    """공용 DB처럼 users 없이 owner_id=1 데이터가 이미 있는 DB에 배포해도, 첫 이메일 가입 계정이
+    owner 1의 비공개 데이터(스토리·기본 플레이 이름)를 물려받지 않는다."""
+    db.execute("INSERT INTO stories (owner_id, title) VALUES (1, '남의 비공개 스토리')")
+    db.execute("INSERT INTO user_play_settings (owner_id, default_play_name) VALUES (1, '원주인')")
+    drop_base03_tables(db)
+    db.execute(migration)
+
+    created = signup(client, "first@example.com")
+    assert created.status_code == 201, created.text
+    tokens = created.json()
+    assert tokens["user"]["default_play_name"] is None  # owner 1의 기본 플레이 이름이 아니다
+    onboard(client, tokens["access_token"], name="새사람")
+
+    headers = bearer(tokens["access_token"])
+    assert client.get(STORIES, headers=headers).json() == []
+    assert client.get(ME, headers=headers).json()["default_play_name"] == "새사람"
+    original = db.execute("SELECT default_play_name FROM user_play_settings WHERE owner_id = 1")
+    assert original.fetchone() == {"default_play_name": "원주인"}
+    # 개발용 X-User-Id(1~999)·기존 owner_id와 겹치지 않는 id다.
+    assert tokens["user"]["user_id"] >= 1000
+
+
+def test_migration_moves_users_sequence_past_every_owner_id_column_BASE_03(db, migration):
+    """owner_id 컬럼이 있는 모든 public 표(나중에 추가된 표 포함)의 최댓값 다음으로 맞춘다."""
+    db.execute("CREATE TABLE teammate_feature (id bigint PRIMARY KEY, owner_id bigint NOT NULL)")
+    try:
+        db.execute("INSERT INTO stories (owner_id, title) VALUES (1500, 's')")
+        db.execute("INSERT INTO teammate_feature VALUES (1, 4321)")
+        drop_base03_tables(db)
+        db.execute(migration)
+        assert users_next_id(db) == 4322
+    finally:
+        db.execute("DROP TABLE teammate_feature")
+
+
+def test_migration_rerun_never_moves_users_sequence_backwards_BASE_03(db, client, migration):
+    drop_base03_tables(db)
+    db.execute(migration)
+    assert users_next_id(db) == 1000  # 기존 데이터가 없어도 1000부터
+    first = signup(client, "a@example.com").json()["user"]["user_id"]
+    assert first == 1000
+    db.execute("SELECT setval(pg_get_serial_sequence('public.users', 'id'), 5000, true)")
+    db.execute(migration)  # 재실행해도 앞으로만 간다
+    assert users_next_id(db) == 5001
+    db.execute("INSERT INTO stories (owner_id, title) VALUES (7000, 's')")
+    db.execute(migration)
+    assert users_next_id(db) == 7001
+    db.execute(migration)
+    assert users_next_id(db) == 7001
 
 
 def test_migration_rerun_keeps_accounts_and_sessions_BASE_03(db, client, migration):

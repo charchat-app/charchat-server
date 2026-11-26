@@ -44,7 +44,8 @@ class Settings(BaseSettings):
     # fake 공급자의 조각 사이 지연(밀리초)과 강제 실패(before: 내용 없이, after: 일부 후).
     chat_fake_chunk_delay_ms: int = 30
     chat_fake_fail_mode: Literal["none", "before", "after"] = "none"
-    # BASE-03 로그인. production에서 아래 개발용 플래그가 하나라도 켜져 있으면 시작하지 않는다.
+    # BASE-03 로그인. staging·production에서 아래 개발용 플래그가 하나라도 켜져 있으면
+    # 시작하지 않는다.
     app_env: Literal["local", "test", "staging", "production"] = "local"
     # 켜면 Authorization 헤더가 없을 때만 예전 개발용 X-User-Id 헤더로 사용자를 정한다.
     auth_dev_header_enabled: bool = False
@@ -60,7 +61,9 @@ class Settings(BaseSettings):
     # 이메일·비밀번호 회원가입과 로그인(POST /auth/signup, grant_type=password).
     auth_password_login_enabled: bool = True
     # 액세스 토큰(JWT HS256) 서명 키. staging·production은 32바이트 이상이 아니면 시작하지 않는다.
-    # local·test에서 비워 두면 프로세스 시작 때 임시 키를 만든다(재시작하면 이전 액세스 토큰 무효).
+    # local·test에서 비워 두면 프로세스 시작 때 임시 키를 만든다. 재시작(--reload 포함)하면
+    # 이전 액세스 토큰이 AUTH_TOKEN_INVALID가 되고 앱은 리프레시 없이 로그아웃한다.
+    # 로컬도 .env에 고정 키를 넣기를 권장한다.
     auth_jwt_secret: SecretStr = SecretStr("")
     auth_jwt_issuer: str = Field(default="charchat", min_length=1)
 
@@ -71,8 +74,8 @@ class Settings(BaseSettings):
         return self
 
     def assert_safe_for_startup(self) -> None:
-        """production에서 개발용 인증 경로가 켜져 있거나, staging·production에서 JWT 서명 키가
-        없거나 32바이트 미만이거나 약관·개인정보 버전이 draft-로 시작하면 시작을 거부한다."""
+        """staging·production에서 개발용 인증 경로가 켜져 있거나, JWT 서명 키가 없거나 32바이트
+        미만이거나 약관·개인정보 버전이 draft-로 시작하면 시작을 거부한다."""
         secret_bytes = len(self.auth_jwt_secret.get_secret_value().encode("utf-8"))
         if self.app_env in ("staging", "production") and secret_bytes < JWT_SECRET_MIN_BYTES:
             raise RuntimeError(
@@ -92,7 +95,7 @@ class Settings(BaseSettings):
                 f"APP_ENV={self.app_env}에서는 확정된 약관·개인정보 버전이 필요합니다"
                 f"(draft-로 시작하는 값 불가): {', '.join(drafts)}"
             )
-        if self.app_env != "production":
+        if self.app_env not in ("staging", "production"):
             return
         enabled = [
             name
@@ -104,7 +107,8 @@ class Settings(BaseSettings):
         ]
         if enabled:
             raise RuntimeError(
-                f"APP_ENV=production에서는 개발용 인증 설정을 켤 수 없습니다: {', '.join(enabled)}"
+                f"APP_ENV={self.app_env}에서는 개발용 인증 설정을 켤 수 없습니다: "
+                f"{', '.join(enabled)}"
             )
 
 
