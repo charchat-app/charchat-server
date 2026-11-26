@@ -32,6 +32,19 @@ def _ensure_database(url: str) -> None:
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(dbname)))
 
 
+@pytest.fixture(autouse=True)
+def dev_user_header_enabled():
+    """BASE-03: 기존 테스트는 개발용 X-User-Id 헤더로 사용자를 정한다(코드 기본값은 꺼짐).
+
+    테스트 안의 monkeypatch.undo()에 풀리지 않도록 monkeypatch를 쓰지 않는다.
+    헤더를 끈 동작은 tests/features/account에서 각 테스트가 따로 확인한다.
+    """
+    previous = settings.auth_dev_header_enabled
+    settings.auth_dev_header_enabled = True
+    yield
+    settings.auth_dev_header_enabled = previous
+
+
 @pytest.fixture(scope="session")
 def db_url() -> str:
     url = settings.test_database_url

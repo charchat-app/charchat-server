@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app.features.account.router import router as account_router
 from app.features.conversation.messaging.router import router as messaging_router
 from app.features.conversation.resume.router import router as resume_router
 from app.features.conversation.starter.router import router as conversation_router
@@ -12,3 +13,4 @@ api_router.include_router(creation_router)
 api_router.include_router(conversation_router)
 api_router.include_router(messaging_router)
 api_router.include_router(resume_router)
+api_router.include_router(account_router)

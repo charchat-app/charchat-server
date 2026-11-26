@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,35 @@ class Settings(BaseSettings):
     # fake 공급자의 조각 사이 지연(밀리초)과 강제 실패(before: 내용 없이, after: 일부 후).
     chat_fake_chunk_delay_ms: int = 30
     chat_fake_fail_mode: Literal["none", "before", "after"] = "none"
+    # BASE-03 로그인. production에서 아래 개발용 플래그가 하나라도 켜져 있으면 시작하지 않는다.
+    app_env: Literal["local", "test", "staging", "production"] = "local"
+    # 켜면 Authorization 헤더가 없을 때만 예전 개발용 X-User-Id 헤더로 사용자를 정한다.
+    auth_dev_header_enabled: bool = False
+    # 켜면 dev 제공자(POST /auth/tokens grant_type=dev)로 키만으로 로그인할 수 있다.
+    auth_dev_login_enabled: bool = False
+    # 액세스 토큰 수명(초)과 리프레시 토큰 수명(일). 리프레시는 회전할 때마다 다시 연장된다.
+    auth_access_ttl_seconds: int = Field(default=1800, gt=0)
+    auth_refresh_ttl_days: int = Field(default=60, gt=0)
+    # 온보딩 필수 동의 버전(약관·개인정보). 만 14세 이상 자기 확인은 'self-v1'로 고정한다.
+    auth_terms_version: str = Field(default="draft-v1", min_length=1)
+    auth_privacy_version: str = Field(default="draft-v1", min_length=1)
+
+    def assert_safe_for_startup(self) -> None:
+        """production에서 개발용 인증 경로가 켜져 있으면 시작을 거부한다."""
+        if self.app_env != "production":
+            return
+        enabled = [
+            name
+            for name, on in (
+                ("AUTH_DEV_HEADER_ENABLED", self.auth_dev_header_enabled),
+                ("AUTH_DEV_LOGIN_ENABLED", self.auth_dev_login_enabled),
+            )
+            if on
+        ]
+        if enabled:
+            raise RuntimeError(
+                f"APP_ENV=production에서는 개발용 인증 설정을 켤 수 없습니다: {', '.join(enabled)}"
+            )
 
 
 settings = Settings()

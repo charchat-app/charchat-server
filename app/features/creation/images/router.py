@@ -2,10 +2,10 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Header, Path, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from app.api.deps import get_current_user_id
+from app.api.deps import get_optional_user_id
 from app.features.creation.images import service
 from app.features.creation.images.schemas import (
     MAX_IMAGE_BYTES,
@@ -34,18 +34,7 @@ def upload_image(
     return service.upload_image(connection, storage, user_id, target, data)
 
 
-def get_optional_user_id(
-    x_user_id: Annotated[str | None, Header(alias="X-User-Id")] = None,
-) -> int | None:
-    """공개 이미지는 로그인 없이 볼 수 있어 사용자 헤더를 선택으로 받는다.
-
-    헤더를 보냈는데 형식이 틀리면 공통 인증과 같게 401로 거절한다.
-    """
-    if x_user_id is None:
-        return None
-    return get_current_user_id(x_user_id)
-
-
+# 공개 이미지는 로그인 없이 볼 수 있어 사용자를 선택으로 받는다(공통 인증 규칙, BASE-03).
 Viewer = Annotated[int | None, Depends(get_optional_user_id)]
 
 # 공개 이미지: 저장 키는 내용이 바뀌지 않으므로(교체는 새 파일) 오래 캐시해도 된다.
