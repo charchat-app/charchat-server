@@ -91,7 +91,8 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
     }
     # 롱 폴링도 기다리기 전에 주인을 확인한다(5초를 기다리지 않고 바로 거절).
     started = monotonic()
-    client.get(f"{GENERATIONS}/{generation['id']}", params={"wait": 5}, headers=intruder)
+    timed = client.get(f"{GENERATIONS}/{generation['id']}", params={"wait": 5}, headers=intruder)
+    assert timed.status_code == 404
     assert monotonic() - started < 2
     statuses = {name: response.status_code for name, response in refused.items()}
     assert statuses == dict.fromkeys(refused, 404)
