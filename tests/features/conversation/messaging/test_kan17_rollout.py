@@ -1,5 +1,8 @@
 """CHAT-US-02 배포 SQL: 팀 DDL이 없는 KAN-16 DB와 팀 DDL이 이미 적용된 공용 DB 모두에서
-schema.sql과 같은 정의가 되고, 다시 실행해도 같으며, 정의가 다르면 전체를 되돌린다."""
+schema.sql과 같은 정의가 되고, 다시 실행해도 같으며, 정의가 다르면 전체를 되돌린다.
+
+schema.sql에는 이후 배포분(CHAT-US-13 kan23_model_change.sql)도 들어 있으므로, 실제 적용 순서대로
+KAN-17 → KAN-17 재실행 → KAN-23 → KAN-23 재실행한 결과를 schema.sql과 비교한다."""
 
 from pathlib import Path
 
@@ -10,6 +13,8 @@ from psycopg.pq import TransactionStatus
 
 ROOT = Path(__file__).resolve().parents[4]
 MIGRATION = ROOT / "app/db/migrations/kan17_conversation_messaging.sql"
+# KAN-17 뒤에 적용하는 배포분(CHAT-US-13). kan17 파일 자체는 바꾸지 않는다.
+LATER_MIGRATIONS = (ROOT / "app/db/migrations/kan23_model_change.sql",)
 TEAM_DDL = Path(__file__).with_name("team_ddl_20261120.sql")
 KAN17_TABLES = (
     "models",
@@ -66,6 +71,14 @@ def drop_kan17_objects(db):
         db.execute("DROP TABLE IF EXISTS models")
 
 
+def apply_later_migrations(db):
+    """KAN-17 뒤 배포분을 실제 순서대로 적용하고 다시 실행해도 같은지 함께 거친다."""
+    for path in LATER_MIGRATIONS:
+        later = path.read_text(encoding="utf-8")
+        db.execute(later)
+        db.execute(later)
+
+
 @pytest.fixture
 def migration(db):
     """마이그레이션 SQL. 테스트가 중간에 실패해도 다음 테스트가 쓸 스키마로 되돌린다."""
@@ -76,6 +89,8 @@ def migration(db):
     if db.execute("SELECT to_regclass('conversation_generations') AS t").fetchone()["t"] is None:
         drop_kan17_objects(db)
         db.execute(sql)
+    # KAN-17만 적용된 상태로 남지 않게 이후 배포분까지 맞춘다(멱등).
+    apply_later_migrations(db)
 
 
 def test_chat_us_02_migration_on_kan16_db_backfills_rooms_and_matches_schema(
@@ -88,6 +103,7 @@ def test_chat_us_02_migration_on_kan16_db_backfills_rooms_and_matches_schema(
 
     db.execute(migration)
     db.execute(migration)  # 재실행해도 같은 결과
+    apply_later_migrations(db)
 
     assert schema_snapshot(db) == expected
     assert models(db) == [("루나", "openai", "gpt-6-luna"), ("테라", "openai", "gpt-6.1-terra")]
@@ -118,6 +134,7 @@ def test_chat_us_02_migration_on_remote_team_ddl_db_seeds_models_and_matches_sch
 
     db.execute(migration)
     db.execute(migration)
+    apply_later_migrations(db)
 
     assert schema_snapshot(db) == expected
     assert models(db) == [("루나", "openai", "gpt-6-luna"), ("테라", "openai", "gpt-6.1-terra")]

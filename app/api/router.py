@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.features.conversation.messaging.router import router as messaging_router
+from app.features.conversation.model_change.router import router as model_change_router
 from app.features.conversation.resume.router import router as resume_router
 from app.features.conversation.starter.router import router as conversation_router
 from app.features.creation.router import router as creation_router
@@ -12,3 +13,4 @@ api_router.include_router(creation_router)
 api_router.include_router(conversation_router)
 api_router.include_router(messaging_router)
 api_router.include_router(resume_router)
+api_router.include_router(model_change_router)
