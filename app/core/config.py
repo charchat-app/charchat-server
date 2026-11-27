@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     # 둘 다 비어 있으면 실행기가 시작하지 않는다. API 서버에는 연결하지 않는다.
     category_openrouter_model: str | None = None
     category_openrouter_api_key: SecretStr | None = None
+    # CREATE-US-08-AC02 등급 검토. 기본 꺼짐. 켜면 「저장」 뒤 UNSAFE 등급 검토(Jev Decisions)를
+    # 백그라운드로 돌리고 결과를 DB에 쓴다. 시작할 때 DATABASE_URL과 JEV_OPENROUTER_API_KEY가
+    # 있어야 한다(없거나 형식이 틀리면 시작하지 않는다).
+    rating_review_enabled: bool = False
+    # 등급 검토가 쓰는 Jev(OpenRouter) 키. 값은 .env나 배포 환경변수에만 둔다.
+    jev_openrouter_api_key: SecretStr | None = None
 
     @model_validator(mode="after")
     def _ephemeral_jwt_secret_for_local(self) -> "Settings":

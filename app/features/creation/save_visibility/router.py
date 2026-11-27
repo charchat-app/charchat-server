@@ -17,7 +17,8 @@ router = APIRouter(tags=["creation:save_visibility"])
 
 
 def get_rating_review(request: Request) -> RatingReviewCoordinator | None:
-    """CREATE-US-08-AC02 등급 검토 조정기. `create_app(rating_review=...)`로 줄 때만 켜진다."""
+    """CREATE-US-08-AC02 등급 검토 조정기. `create_app(rating_review=...)`로 주거나
+    `RATING_REVIEW_ENABLED`를 켰을 때만 있다."""
     return getattr(request.app.state, "rating_review", None)
 
 

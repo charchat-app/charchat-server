@@ -1140,6 +1140,19 @@ def _save_creation(
         handoff = None
         if review_coordinator is not None and not temporary and target != "draft":
             handoff = rating_review.prepare_final_save(connection, story_id, review_coordinator)
+        elif not temporary and target != "draft" and rating == "SAFE":
+            # CREATE-US-08-AC02: 조정기가 없어도(설정 꺼짐·종료 중) 이번 확정 저장이 SAFE 선택(보낸
+            # 값 또는 반영한 임시 저장 선택)을 썼고, 저장본이 앞선 UNSAFE 적용 등급이거나 검토
+            # 중이면 같은 트랜잭션에서 SAFE·not_reviewed로 둔다. 앞선 UNSAFE 승인이 남아 SAFE 선택
+            # 스토리가 UNSAFE로 노출되거나 대기 중인 검토가 뒤늦게 결과를 쓰지 않게 한다.
+            # 이미 SAFE인 completed·failed·not_reviewed 메타데이터는 그대로 둔다(AC13). 선택이
+            # 없거나 UNSAFE면 기존처럼 적용 등급·검토 상태를 건드리지 않는다.
+            current_rating = repository.read_rating(connection, story_id)
+            if (
+                current_rating["effective_rating"] == "UNSAFE"
+                or current_rating["rating_review_status"] == "reviewing"
+            ):
+                repository.mark_rating_safe(connection, story_id)
         result = response(
             connection, story, owner_id, groups, people, request_id, intros, relations, affinities
         )

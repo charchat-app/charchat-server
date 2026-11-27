@@ -10,10 +10,11 @@
   아직 최신인지 확인한다. 평가 중에는 어떤 잠금도 쥐지 않는다.
 - 단일 프로세스 전제다. 여러 프로세스·서버 사이의 순서는 보장하지 않는다.
 - 평가기는 주입한다. 마지막 통과 기록은 이 프로세스 메모리에만 두며(재시작하면 사라진다)
-  조정기 잠금 안에서 읽고 쓴다. 실제 공급자·영속 보관·지연·실패·재시도 정책은
-  미정(상세 문서 2326529)이므로 운영 앱은 조정기 없이 만들어 넘기지 않는다.
+  조정기 잠금 안에서 읽고 쓴다. 지연·실패·재시도 정책은 미정(상세 문서 2326529)이다. 기본 앱은
+  `RATING_REVIEW_ENABLED`를 켰을 때만 Jev 평가기로 조정기를 만든다(`runtime`, 기본 꺼짐).
 - 결과 보관소(`results`)를 주지 않으면 DB에 검토 결과를 쓰지 않고 적용 등급·검토 상태도 바꾸지
-  않는다(기존 동작). 보관소는 테스트·수동 주입에서만 준다(아래 「검토 결과 저장」).
+  않는다(기존 동작). 보관소는 테스트·수동 주입과 설정으로 켠 기본 앱 조정기에서만 준다
+  (아래 「검토 결과 저장」).
 - 스토리 원문을 로그에 남기지 않는다(스토리 ID·세대·예외 종류만).
 
 검토 결과 저장(CREATE-US-08-AC02·AC03·AC09~AC11, `results`를 줄 때만):
@@ -47,7 +48,9 @@
   `completed` 상태가 다른 프로세스의 대기·평가 중 결과를 막고(DB 울타리), 조정기는 그 스토리의 최신
   내용을 검토 대상 아님으로 알려 이 프로세스의 대기 검토도 평가하지 않게 한다(프로세스 울타리).
   임시 저장본은 읽지 않으며 메모리 값은 판단 근거로 쓰지 않는다.
-- 남은 한계: 재시작·`close()`로 대기·평가 중 검토가 사라지면 그 스토리는 다음 확정 저장까지
+- 종료: 앱이 소유한 조정기는 `drain()`으로 대기열·평가 중 검토를 모두 끝낸 뒤 닫는다(취소하지
+  않음, 전체 대기 상한 없음). 주입한 조정기와 기존 호출자는 `close()`(즉시, 대기열 취소)를 쓴다.
+- 남은 한계: `close()`·강제 종료로 검토가 사라지면 그 스토리는 다음 확정 저장까지
   `reviewing`(앞선 적용 등급 유지)으로 남는다. 다른 경로로 정본이 바뀌어 내용이 어긋난 결과도
   쓰지 않으므로 같은 상태로 남는다. 재시도·복구 작업(영속 대기열)은 미정이다.
 """
@@ -56,6 +59,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -504,18 +508,61 @@ class ReviewResults(Protocol):
         """
 
 
-class DatabaseReviewResults:
-    """요청과 독립된 새 DB 연결로 결과를 쓴다. 접속 정보는 주입받는다(환경변수를 읽지 않는다)."""
+def _positive(name: str, value: float | None) -> float | None:
+    if value is not None and not value > 0:
+        raise ValueError(f"{name}는 0보다 커야 합니다.")
+    return value
 
-    def __init__(self, conninfo: str):
+
+class DatabaseReviewResults:
+    """요청과 독립된 새 DB 연결로 결과를 쓴다. 접속 정보는 주입받는다(환경변수를 읽지 않는다).
+
+    시간 제한(초)은 주었을 때만 이 결과 쓰기 연결에만 건다(기본 None은 기존처럼 제한 없음).
+    - `connect_timeout`: 이 연결의 접속 대기(libpq, 정수 초로 올림·최소 2초).
+    - `lock_timeout`·`statement_timeout`: 결과 쓰기 트랜잭션 안에서만 `set_config(..., true)`로
+      건다(트랜잭션이 끝나면 사라지며 DB·역할·풀 설정은 바꾸지 않는다).
+    시간 초과는 예외로 끝나 결과를 쓰지 않는다(조정기가 로그만 남기고, 그 스토리는 다음 확정
+    저장까지 `reviewing`으로 남는다). 결과 한 건의 상한일 뿐 접속 뒤 네트워크 정지 등 모든 경우의
+    절대 상한은 아니다.
+    """
+
+    def __init__(
+        self,
+        conninfo: str,
+        *,
+        connect_timeout: float | None = None,
+        lock_timeout: float | None = None,
+        statement_timeout: float | None = None,
+    ):
         self._conninfo = conninfo
+        self._connect_timeout = _positive("connect_timeout", connect_timeout)
+        self._lock_timeout = _positive("lock_timeout", lock_timeout)
+        self._statement_timeout = _positive("statement_timeout", statement_timeout)
 
     def __repr__(self):
         return "DatabaseReviewResults(...)"  # 접속 정보를 싣지 않는다.
 
+    def _connect(self):
+        options = {}
+        if self._connect_timeout is not None:
+            options["connect_timeout"] = max(2, math.ceil(self._connect_timeout))
+        return psycopg.connect(self._conninfo, autocommit=True, row_factory=dict_row, **options)
+
+    def _bound_transaction(self, connection) -> None:
+        """결과 쓰기 트랜잭션 안에서만 유효한 잠금·문장 시간 제한(밀리초)."""
+        for name, seconds in (
+            ("lock_timeout", self._lock_timeout),
+            ("statement_timeout", self._statement_timeout),
+        ):
+            if seconds is not None:
+                connection.execute(
+                    "SELECT set_config(%s, %s, true)", (name, f"{math.ceil(seconds * 1000)}ms")
+                )
+
     def apply(self, story_id, snapshot, ticket, result, namespace=None) -> bool:
-        with psycopg.connect(self._conninfo, autocommit=True, row_factory=dict_row) as connection:
+        with self._connect() as connection:
             with connection.transaction():
+                self._bound_transaction(connection)
                 row = repository.lock_review_target(connection, story_id)
                 if (
                     row is None
@@ -848,8 +895,21 @@ class RatingReviewCoordinator:
             return self._cond.wait_for(lambda: not self._futures, timeout=timeout)
 
     def close(self) -> None:
-        """대기 중인 검토는 취소하고, 평가 중인 검토는 기다리지 않는다."""
+        """대기 중인 검토는 취소하고, 평가 중인 검토는 기다리지 않는다.
+
+        주입한 쪽이 소유한 조정기·기존 호출자용 즉시 종료다(동작 그대로).
+        """
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def drain(self) -> None:
+        """새 검토를 받지 않고, 대기열의 검토와 평가 중인 검토가 모두 끝날 때까지 기다린다.
+
+        앱이 소유한 조정기의 정상 종료용이다. 대기열 검토를 취소하지 않는다. 막히는 호출이므로
+        이벤트 루프에서는 별도 스레드로 부른다. 전체 대기 시간에는 상한이 없다(검토 하나는 평가기
+        마감·울타리 대기·결과 DB 시간 제한으로 끝나지만, 대기열 길이만큼 늘어난다). 종료 뒤 넘김은
+        실패(`failed`)로 돌아온다.
+        """
+        self._executor.shutdown(wait=True, cancel_futures=False)
 
 
 def capture(connection, story_id) -> ReviewSnapshot | None:
