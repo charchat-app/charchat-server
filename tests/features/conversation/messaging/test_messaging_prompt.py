@@ -367,7 +367,8 @@ def test_chat_us_06_ac01_ac03_ac04_ac05_guardrail_rules():
     assert "상대마다 맞는 호칭·어조·거리감·태도로 말한다" in guide
 
 
-def test_chat_us_06_ac06_user_written_character_lines_are_not_repeated():
+def test_chat_us_06_pm_request_user_written_character_lines_are_not_repeated():
+    # AC 표에는 없는 나래님 요청(11/27, 제타의 유저 발언권 문제)이다.
     """이용자가 캐릭터·나레이터 줄을 대신 쓰면 이미 일어난 전개로 보고 되풀이하지 않는다."""
     messages = build_messages(
         minimal_context(
@@ -403,3 +404,27 @@ def test_chat_us_06_guides_pin_the_design_meaning_literally():
     assert "기존 갈등이나 인물 성격을 지우지는 않는다" in styles
     assert "대사로 장면을 이끌고 행동·상황 서술은 보조한다" in system_for(composition="dialogue")
     assert "행동·표정·움직임·장면 변화로 장면을 이끌고" in system_for(composition="action")
+
+
+@pytest.mark.parametrize(
+    "code, phrase",
+    [
+        (
+            "dynamic",
+            "힘 있는 동사와 빠른 문장 호흡, 속도감 있는 표현으로 생동감과 박진감을 살린다.",
+        ),
+        ("lyrical", "비유와 감각적인 어휘, 리듬 있는 문장으로 장면과 감정의 여운을 살린다."),
+        ("tense", "정보를 조금씩 드러내고, 침묵과 문장의 완급으로 긴박함과 묘한 긴장감을 살린다."),
+        ("humorous", "진지한 상황에 억지로 농담을 넣지는 않는다."),
+        ("plain", "감정을 없애거나 무조건 짧게 쓰지는 않는다."),
+        ("delicate", "감정을 단정하기보다 미묘한 변화를 드러낸다."),
+        ("romantic", "읽는 사람이 두근거리는 로맨스풍 문체를 만든다."),
+        ("warm", "일상의 감각 묘사로 다정함과 온기를 살린다."),
+    ],
+)
+def test_chat_us_06_ac08_every_style_guide_matches_design_doc(code, phrase):
+    assert phrase in system_for(style_mode="preset", preset_styles=[code])
+
+
+def test_chat_us_06_ac11_balanced_guide_literal():
+    assert "장면에 맞게 대사와 행동·상황 서술을 고르게 쓴다" in system_for(composition="balanced")
