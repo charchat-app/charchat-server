@@ -8,6 +8,7 @@ from psycopg import Connection
 from app.core import common_safety
 from app.core.common_safety import CommonSafetyGuard
 from app.core.exceptions import AppError
+from app.features.creation.category_classification import service as category_classification
 from app.features.creation.common.names import has_surrounding_space, name_compare_key
 from app.features.creation.story_basic import repository as repo
 from app.features.creation.story_basic.schemas import (
@@ -372,11 +373,14 @@ def apply_basic(conn: Connection, story_id: int, req: StoryUpdateRequest) -> rep
     해시태그는 표기를 정리(strip_tag_mark)해 저장한다. 완성 조건 검사·거절은 호출 측 책임이다.
     CREATE-US-07 공통 저장(save_visibility)이 다른 기능의 repository를 직접 쓰지 않도록 연다.
     """
+    prior = category_classification.committed_inputs(conn, story_id)
     row = repo.update_story_basic(conn, story_id, req.title, req.subtitle, req.world_description)
     if req.tags is not None:
         repo.replace_story_tags(conn, story_id, _dedupe(req.tags))
     if req.characters is not None:
         _sync_characters(conn, story_id, req.characters)
+    if row["save_state"] != DRAFT:
+        category_classification.mark_after_basic_change(conn, story_id, prior)
     return row
 
 

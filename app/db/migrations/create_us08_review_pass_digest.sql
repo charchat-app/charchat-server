@@ -104,7 +104,16 @@ BEGIN
            IS DISTINCT FROM 'v1' THEN
         NEW := jsonb_populate_record(NEW, '{"rating_pass_digest": null}'::jsonb);
     END IF;
-    IF to_jsonb(NEW) - review_keys = to_jsonb(OLD) - review_keys
+    -- saved_at 보존 예외는 아래 순서로 판정한다(위 지문 정리 뒤의 NEW 기준). 각 예외는 그 UPDATE가
+    -- 해당 컬럼만 바꿨을 때만 적용하며, 두 종류가 한 UPDATE에 섞이면 saved_at을 새로 쓴다.
+    -- 1) CREATE-US-09: 카테고리 분류 대상 표시(category_classification_needed)만 바뀐 UPDATE.
+    -- 2) CREATE-US-08: 검토 메타데이터(review_keys)만 실제로 바뀐 UPDATE.
+    IF (to_jsonb(NEW) -> 'category_classification_needed')
+           IS DISTINCT FROM (to_jsonb(OLD) -> 'category_classification_needed')
+       AND (to_jsonb(NEW) - 'category_classification_needed')
+           IS NOT DISTINCT FROM (to_jsonb(OLD) - 'category_classification_needed') THEN
+        NEW.saved_at := OLD.saved_at;
+    ELSIF to_jsonb(NEW) - review_keys = to_jsonb(OLD) - review_keys
        AND to_jsonb(NEW) - 'saved_at' IS DISTINCT FROM to_jsonb(OLD) - 'saved_at' THEN
         NEW.saved_at := OLD.saved_at;
     ELSE
