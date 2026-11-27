@@ -260,8 +260,8 @@ def _expression(ctx: PromptContext) -> str:
         "아래 설정은 참고 예시보다 우선한다.",
         f"시점: {_choice(POINT_OF_VIEW, POINT_OF_VIEW_GUIDE, exp['point_of_view'])}",
         *(
-            [f"  지문에서는 '{ctx.play_name}'라는 이름 대신 '너' 또는 '당신'으로 부른다."]
-            if exp["point_of_view"] == "second_person"
+            [f"  지문에서는 이용자 캐릭터 이름({ctx.play_name}) 대신 '너' 또는 '당신'으로 부른다."]
+            if exp["point_of_view"] == "second_person" and ctx.play_name
             else []
         ),
         f"  {POINT_OF_VIEW_COMMON}",

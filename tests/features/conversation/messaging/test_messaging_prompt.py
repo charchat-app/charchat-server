@@ -236,10 +236,14 @@ def test_chat_us_06_ac06_point_of_view_sends_meaning_for_all_characters(code, la
 def test_chat_us_06_ac06_second_person_does_not_decide_user_actions():
     system = system_for(point_of_view="second_person")
     assert "이용자 캐릭터를 가리킬 때는 이름 대신 '너' 또는 '당신'으로 쓰며" in system
-    assert "지문에서는 '민서'라는 이름 대신 '너' 또는 '당신'으로 부른다." in system
+    assert "지문에서는 이용자 캐릭터 이름(민서) 대신 '너' 또는 '당신'으로 부른다." in system
     # 출력 형식 예시도 2인칭 지문으로 보여 준다.
     assert "*그가 창밖을 보다가 너를 돌아보았다.*" in system
-    assert "'민서'라는 이름 대신" not in system_for(point_of_view="third_person")
+    assert "이름(민서) 대신" not in system_for(point_of_view="third_person")
+    no_name = build_messages(
+        minimal_context(play_name="", expression={"point_of_view": "second_person"})
+    )[0]["content"]
+    assert "이름() 대신" not in no_name
     assert "이용자 캐릭터의 행동·감정을 정하지 않는다" in system
 
 
