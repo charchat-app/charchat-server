@@ -43,11 +43,54 @@ class MessagePartResponse(BaseModel):
     body: str
 
 
+class SceneInfoDateResponse(BaseModel):
+    """CHAT-US-08 info의 날짜. mode(세션 날짜 방식)에 해당하는 칸만 채운다.
+
+    calendar: year·month·day / world: era·year·month·day /
+    elapsed: elapsed_day와 reference_event(info에 기준 사건을 쓰지 않았으면 null).
+    """
+
+    mode: Literal["calendar", "world", "elapsed"]
+    era: str | None
+    year: int | None
+    month: int | None
+    day: int | None
+    reference_event: str | None
+    elapsed_day: int | None
+
+
+class SceneInfoTimeResponse(BaseModel):
+    hour: int  # 0~23
+    minute: int | None  # 분을 모르면(`19시`) null
+
+
+class SceneInfoCharacterResponse(BaseModel):
+    name: str  # 세션 캐릭터 이름
+    clothing: str | None
+    inner_thought: str | None
+
+
+class SceneInfoResponse(BaseModel):
+    """CHAT-US-08 AI 응답 맨 끝 ```info 블록. text는 원문(줄바꿈은 \n), 나머지는 읽은 값.
+
+    읽지 못했거나 적지 않은 항목은 null(characters는 읽은 캐릭터만). 규칙은 messaging/info.py.
+    """
+
+    text: str
+    date: SceneInfoDateResponse | None
+    time: SceneInfoTimeResponse | None
+    place: str | None
+    characters: list[SceneInfoCharacterResponse]
+
+
 class ChatMessageResponse(BaseModel):
     id: int
     role: Literal["user", "assistant"]
     parts: list[MessagePartResponse]
     created_at: datetime
+    # CHAT-US-08: assistant 응답 맨 끝 info 블록(현재 장면). 이용자 메시지·info 없는 응답은 null.
+    # parts에는 info가 없다. 표시 ON/OFF와 관계없이 다음 요청의 현재 장면에 쓰인다.
+    info: SceneInfoResponse | None = None
 
 
 class GenerationResponse(BaseModel):
@@ -57,6 +100,7 @@ class GenerationResponse(BaseModel):
     user_message_id: int
     assistant_message: ChatMessageResponse | None
     # offset 이후 누적 원문과 전체 길이(유니코드 코드 포인트).
+    # CHAT-US-08: 원문 그대로라 맨 끝 ```info 블록도 들어 있다. 앱은 info.py 규칙으로 숨긴다.
     text: str
     next_offset: int
     error_code: str | None

@@ -226,6 +226,23 @@ def list_messages(conn: Connection, session_id: int, before_position: int | None
     ).fetchall()
 
 
+def list_completed_texts(conn: Connection, session_id: int, before_position: int | None = None):
+    """CHAT-US-08: 정상 완료된 생성의 assistant 메시지 ID와 생성 원문(맨 끝 info 포함), 순서대로.
+
+    실패·일부 실패·진행 중 생성의 원문은 넣지 않는다. before_position이 있으면 그 앞 메시지만.
+    """
+    return conn.execute(
+        """SELECT m.id AS message_id, m.position, g.text
+           FROM conversation_generations g
+           JOIN conversation_messages m
+             ON m.session_id = g.session_id AND m.id = g.assistant_message_id
+           WHERE g.session_id = %s AND g.status = 'completed'
+             AND (%s::bigint IS NULL OR m.position < %s)
+           ORDER BY m.position""",
+        (session_id, before_position, before_position),
+    ).fetchall()
+
+
 def list_parts(conn: Connection, session_id: int, message_ids: list[int]) -> dict[int, list]:
     """메시지 ID → 부분 목록(작성 순서). 키 character_id는 세션 캐릭터 ID다."""
     parts: dict[int, list] = {message_id: [] for message_id in message_ids}
@@ -388,25 +405,6 @@ def get_scene(conn: Connection, session_id: int):
     ).fetchone()
 
 
-def scene_user_edited(conn: Connection, session_id: int, generation_id: int | None) -> bool:
-    """CHAT-US-08: 마지막 장면 변경이 이용자 직접 수정이고, 이번 생성을 뺀 마지막 완료 턴 뒤인지.
-
-    완료된 생성의 updated_at은 완료 저장 뒤 다시 바뀌지 않는다는 전제다(완료 시각으로 쓴다).
-    완료 행을 나중에 고치는 기능(응답 수정 11번 등)이 생기면 별도 완료 시각 열로 바꾼다.
-    """
-    row = conn.execute(
-        """SELECT c.source = 'user_edit' AND c.created_at > COALESCE(
-                      (SELECT max(g.updated_at) FROM conversation_generations g
-                       WHERE g.session_id = %(session)s AND g.status = 'completed'
-                         AND g.id IS DISTINCT FROM %(generation)s),
-                      '-infinity'::timestamptz) AS edited
-           FROM conversation_scene_changes c WHERE c.session_id = %(session)s
-           ORDER BY c.id DESC LIMIT 1""",
-        {"session": session_id, "generation": generation_id},
-    ).fetchone()
-    return bool(row and row["edited"])
-
-
 def list_affinities(conn: Connection, session_id: int):
     return conn.execute(
         """SELECT src.name_snapshot AS source, a.target_kind, dst.name_snapshot AS target,
@@ -433,12 +431,3 @@ def list_relationships(conn: Connection, session_id: int):
            WHERE r.session_id = %s ORDER BY r.id""",
         (session_id,),
     ).fetchall()
-
-
-def touch_generation(conn: Connection, generation_id: int) -> None:
-    """진행 중 생성의 갱신 시각만 새로 한다(CHAT-US-08 장면 판단 동안 중단으로 오인하지 않게)."""
-    conn.execute(
-        """UPDATE conversation_generations SET updated_at = clock_timestamp()
-           WHERE id = %s AND status = 'streaming'""",
-        (generation_id,),
-    )

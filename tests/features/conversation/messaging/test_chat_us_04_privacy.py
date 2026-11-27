@@ -34,8 +34,7 @@ def snapshot(db, session_id):
              {rows("conversation_scene_states")} AS scene,
              {rows("conversation_character_states")} AS characters,
              {rows("conversation_relationships")} AS relationships,
-             {rows("conversation_affinities")} AS affinities,
-             {rows("conversation_scene_changes")} AS scene_changes""",
+             {rows("conversation_affinities")} AS affinities""",
         {"s": session_id},
     ).fetchone()
 
@@ -89,25 +88,6 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
         "모델 변경": client.put(
             f"{SESSIONS}/{session}/model", json={"model_id": new_model}, headers=intruder
         ),
-        # CHAT-US-08: 현재 장면 조회·직접 수정(형식이 올바른 요청도 주인이 아니면 거절).
-        "장면 조회": client.get(f"{SESSIONS}/{session}/scene", headers=intruder),
-        "장면 수정": client.put(
-            f"{SESSIONS}/{session}/scene",
-            json={
-                "version": 0,
-                "era": None,
-                "year": 2026,
-                "month": 1,
-                "day": 1,
-                "reference_event": None,
-                "elapsed_day": None,
-                "hour": 0,
-                "minute": 0,
-                "place": "침입자 장소",
-                "characters": [],
-            },
-            headers=intruder,
-        ),
     }
     # 롱 폴링도 기다리기 전에 주인을 확인한다(5초를 기다리지 않고 바로 거절).
     started = monotonic()
@@ -119,7 +99,6 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
     # 거절 응답에 주인의 대화 내용이 섞여 나오지 않는다.
     for response in refused.values():
         assert "내 이야기" not in response.text
-        assert "경찰서 옥상" not in response.text  # 현재 장면 값도 섞이지 않는다
 
     # AC01: 목록에도 남의 대화가 보이지 않는다(제작자도 예외 없음).
     listed = client.get(SESSIONS, headers=intruder)

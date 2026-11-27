@@ -1,293 +1,260 @@
-"""CHAT-US-08 장면 유지·변화: 정상 완료 턴의 판단 → 장면 저장 → 다음 요청 반영(KAN-22)."""
+"""CHAT-US-08 장면 유지·변화: 응답 맨 끝 ```info 블록 → 다음 요청 [현재 장면](KAN-22).
 
-import pytest
+장면 상태는 따로 저장하지 않는다. 응답 원문(생성 원문)에 남은 info를 다음 요청 때 다시 읽는다.
+세션 시작 값(conversation_scene_states·character_states)은 첫 대화에만 쓰고 바꾸지 않는다.
+"""
+
 from messaging_helpers import (
+    AUTHOR,
     GENERATIONS,
     PLAYER,
+    SESSIONS,
     send,
-    session_characters,
     start_session,
     user_part,
 )
 
+from app.features.conversation.messaging import providers, service
+from app.features.conversation.messaging.prompt import build_messages
 from app.features.conversation.messaging.providers import ProviderError
-from app.features.conversation.scene import judge as scene_judge
-from app.features.conversation.scene import repository as scene_repository
 
-PARK = (
-    '{"changed": true, "place": "공원 벤치", "days_passed": 1, '
-    '"time": {"hour": 12, "minute": null}, '
-    '"evidence": "다음 날 점심, 공원 벤치", "evidence_from": "user"}'
+START_SCENE = (
+    "[현재 장면]\n"
+    "날짜: 2026년 11월 22일\n"
+    "시간: 21:05\n"
+    "장소: 경찰서 옥상\n"
+    "[도경] 착장: 젖은 코트 | 속마음: 피곤하다\n"
+    "[Bea] 착장: - | 속마음: -"
 )
+SAME_INFO = (
+    "날짜: 2026년 11월 22일\n시간: 21:05\n장소: 경찰서 옥상\n"
+    "[도경] 착장: 젖은 코트 | 속마음: 피곤하다\n[Bea] 착장: - | 속마음: -"
+)
+PARK_INFO = (
+    "날짜: 2026년 11월 23일\n시간: 12시\n장소: 공원 벤치\n"
+    "[도경] 착장: 회색 셔츠 | 속마음: -\n[Bea] 착장: 노란 우비 | 속마음: 배고프다\n"
+    "[민서] 착장: 교복 | 속마음: 신난다"
+)
+PARK_SCENE = (
+    "[현재 장면]\n"
+    "날짜: 2026년 11월 23일\n"
+    "시간: 12시\n"
+    "장소: 공원 벤치\n"
+    "[도경] 착장: 회색 셔츠 | 속마음: 피곤하다\n"
+    "[Bea] 착장: 노란 우비 | 속마음: 배고프다"
+)
+BODY = "@도경: *고개를 끄덕인다.*\n\n가자.\n@나레이터: *비가 그친다.*"
 
 
-class ScriptedJudge:
-    """판단 호출을 기록하고 정해진 판단 원문을 돌려준다."""
-
-    def __init__(self, answers=None, error=None):
-        self.answers = list(answers or [])
-        self.error = error
-        self.requests = []
-
-    def stream(self, request):
-        self.requests.append(request)
-        if self.error is not None:
-            raise self.error
-        yield self.answers.pop(0) if self.answers else '{"changed": false}'
+def reply(info: str | None, body: str = BODY) -> list[str]:
+    """응답 조각. info가 있으면 본문 뒤 맨 끝에 info 블록을 붙인다."""
+    text = body if info is None else f"{body}\n\n```info\n{info}\n```"
+    return [text[:10], text[10:]]
 
 
-@pytest.fixture
-def judge():
-    original = scene_judge.get_judge_provider
-    provider = ScriptedJudge()
-    scene_judge.get_judge_provider = lambda: provider
-    yield provider
-    scene_judge.get_judge_provider = original
+def turn(client, session, recorder, info, text, request_id, headers=PLAYER):
+    recorder.chunks = reply(info)
+    response = send(client, session, [user_part(text)], request_id=request_id, headers=headers)
+    assert response.status_code == 202, response.text
+    return response.json()
 
 
-def scene_row(db, session_id):
-    return db.execute(
-        """SELECT date_mode, year, month, day, hour, minute, place, reference_event, elapsed_day
-           FROM conversation_scene_states WHERE session_id = %s""",
+def scene_block(request) -> str:
+    """요청 마지막 user 메시지의 [현재 장면] 블록."""
+    content = request.messages[-1]["content"]
+    return content.split("\n\n[이용자 입력]")[0].split("\n\n")[-1]
+
+
+def start_rows(db, session_id):
+    scene = db.execute(
+        "SELECT * FROM conversation_scene_states WHERE session_id = %s", (session_id,)
+    ).fetchone()
+    characters = db.execute(
+        "SELECT * FROM conversation_character_states WHERE session_id = %s ORDER BY id",
         (session_id,),
-    ).fetchone()
-
-
-def changes(db, session_id):
-    return db.execute(
-        "SELECT * FROM conversation_scene_changes WHERE session_id = %s ORDER BY id", (session_id,)
     ).fetchall()
+    return scene, characters
 
 
-def generation_status(client, response):
-    return client.get(f"{GENERATIONS}/{response.json()['id']}", headers=PLAYER).json()["status"]
+def test_chat_us_08_first_turn_uses_session_start_scene(client, db, session, recorder):
+    turn(client, session, recorder, None, "안녕.", "turn-0001")
+    (request,) = recorder.requests
+    assert scene_block(request) == START_SCENE
+    assert request.messages[-1]["content"].endswith(f"{START_SCENE}\n\n[이용자 입력]\n[민서] 안녕.")
 
 
-def test_chat_us_08_ac01_no_change_keeps_scene_and_records_nothing(client, db, session, judge):
-    before = scene_row(db, session)
-    response = send(client, session, [user_part("여기 바람이 차네요.")])
-    assert generation_status(client, response) == "completed"
-    assert len(judge.requests) == 1
-    assert scene_row(db, session) == before
-    assert changes(db, session) == []
+def test_chat_us_08_ac01_same_scene_info_keeps_current_scene(client, db, session, recorder):
+    before = start_rows(db, session)
+    turn(client, session, recorder, SAME_INFO, "여기 바람이 차네요.", "turn-0001")
+    turn(client, session, recorder, SAME_INFO, "조금 더 있을까요?", "turn-0002")
+    turn(client, session, recorder, None, "그래요.", "turn-0003")
+    assert [scene_block(r) for r in recorder.requests] == [START_SCENE] * 3
+    # 세션 시작 값 행은 그대로다(첫 대화용 사본).
+    assert start_rows(db, session) == before
 
 
-def test_chat_us_08_ac02_explicit_move_is_saved_with_evidence_and_used_next_turn(
-    client, db, session, judge, recorder
+def test_chat_us_08_ac02_changed_info_is_next_scene_and_kept_when_reply_has_no_info(
+    client, db, session, recorder
 ):
-    judge.answers = [PARK]
-    parts = [
-        user_part("가자."),
-        {"speaker_kind": "narrator", "character_id": None, "body": "*다음 날 점심, 공원 벤치.*"},
-    ]
-    first = send(client, session, parts, request_id="turn-0001")
-    assert generation_status(client, first) == "completed"
-    # 판단 요청은 저장된 장면, 이번 턴 입력(나레이터 포함), 이번 응답을 본다.
-    (judge_request,) = judge.requests
-    content = judge_request.messages[1]["content"]
-    for expected in (
-        "장소: 경찰서 옥상",
-        "[나레이터] *다음 날 점심, 공원 벤치.*",
-        "@도경: 응답 1번",
-    ):
-        assert expected in content
-    assert judge_request.model == "gpt-6-luna"
+    before = start_rows(db, session)
+    turn(client, session, recorder, PARK_INFO, "다음 날 점심에 공원에서 봐요.", "turn-0001")
+    turn(client, session, recorder, None, "배고프다.", "turn-0002")
+    turn(client, session, recorder, None, "뭐 먹을까?", "turn-0003")
+    first, second, third = recorder.requests
+    assert scene_block(first) == START_SCENE
+    # 응답 info의 값만 바뀌고, info에 '-'로 둔 속마음은 앞 값(피곤하다)을 잇는다. 이용자 줄은 무시.
+    assert scene_block(second) == PARK_SCENE
+    # info 없는 응답 다음에도 앞 info 값을 그대로 잇는다.
+    assert scene_block(third) == PARK_SCENE
+    # [현재 장면]은 최신 입력 앞 한 곳에만 있다. 첫 블록·이력에는 없다.
+    contents = [m["content"] for m in third.messages[1:]]
+    assert sum("[현재 장면]" in content for content in contents) == 1
+    assert all("```info" not in content and "공원 벤치" not in content for content in contents[:-1])
+    assert start_rows(db, session) == before
 
-    row = scene_row(db, session)
-    assert (row["month"], row["day"], row["hour"], row["minute"], row["place"]) == (
-        11,
-        23,
-        12,
-        None,
-        "공원 벤치",
-    )
-    (change,) = changes(db, session)
-    generation = db.execute(
-        "SELECT user_message_id, assistant_message_id FROM conversation_generations WHERE id = %s",
-        (first.json()["id"],),
+
+def test_chat_us_08_ac03_scene_survives_reopen_and_model_change(client, db, session, recorder):
+    turn(client, session, recorder, PARK_INFO, "다음 날 점심에 공원에서 봐요.", "turn-0001")
+    pending = send(client, session, [user_part("계속.")], request_id="turn-0002").json()
+    assert scene_block(recorder.requests[-1]) == PARK_SCENE
+    # 다시 열기: 세션·대화 기록을 새로 읽어도 같은 장면이 된다(저장된 응답 원문에서 다시 읽는다).
+    assert client.get(f"{SESSIONS}/{session}", headers=PLAYER).status_code == 200
+    assert client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).status_code == 200
+    claimed = db.execute(
+        """SELECT g.session_id, g.user_message_id, cs.owner_id FROM conversation_generations g
+           JOIN conversation_sessions cs ON cs.id = g.session_id WHERE g.id = %s""",
+        (pending["id"],),
     ).fetchone()
-    assert change["evidence_from"] == "user"
-    assert change["evidence_message_id"] == generation["user_message_id"]
-    assert change["assistant_message_id"] == generation["assistant_message_id"]
-    assert change["evidence"] == "다음 날 점심, 공원 벤치"
-    assert change["before_state"]["scene"]["place"] == "경찰서 옥상"
-    assert change["after_state"]["scene"]["place"] == "공원 벤치"
 
-    # 다음 요청: 장소 언급이 없어도 현재 장면은 공원이고, 최신 입력 바로 앞에 붙는다.
-    second = send(client, session, [user_part("배고프다.")], request_id="turn-0002")
-    assert generation_status(client, second) == "completed"
-    messages = recorder.requests[-1].messages
-    assert "[현재 장면]" not in messages[1]["content"]
-    assert messages[-1]["content"].startswith(
-        "[현재 장면]\n장소: 공원 벤치\n날짜: 2026년 11월 23일"
-    )
-    assert "시각: 12시" in messages[-1]["content"]
-    assert messages[-1]["content"].endswith("[이용자 입력]\n[민서] 배고프다.")
+    def messages():
+        return build_messages(service.load_prompt_context(db, claimed))
 
-
-def test_chat_us_08_ac03_saved_scene_survives_reopen(client, db, session, judge, recorder):
-    judge.answers = [PARK]
-    send(client, session, [user_part("다음 날 점심, 공원 벤치로 가요.")], request_id="turn-0001")
-    # 다시 열기: 세션·대화 기록을 새로 읽어도 서버에 저장된 현재 장면을 쓴다.
-    assert client.get(f"/api/v1/conversation/sessions/{session}", headers=PLAYER).status_code == 200
-    send(client, session, [user_part("계속.")], request_id="turn-0002")
-    assert "장소: 공원 벤치" in recorder.requests[-1].messages[-1]["content"]
-    assert "경찰서 옥상" not in recorder.requests[-1].messages[-1]["content"]
+    before = messages()
+    assert before == recorder.requests[-1].messages
+    other = db.execute(
+        """SELECT id FROM models WHERE id <> (SELECT selected_model_id FROM conversation_sessions
+           WHERE id = %s) ORDER BY id LIMIT 1""",
+        (session,),
+    ).fetchone()["id"]
+    changed = client.put(f"{SESSIONS}/{session}/model", json={"model_id": other}, headers=PLAYER)
+    assert changed.status_code == 200, changed.text
+    assert messages() == before
+    turn(client, session, recorder, None, "모델을 바꿨어요.", "turn-0003")
+    assert recorder.requests[-1].model != recorder.requests[0].model
+    assert scene_block(recorder.requests[-1]) == PARK_SCENE
 
 
-def test_chat_us_08_failed_turn_does_not_judge_or_change_scene(
-    client, db, session, judge, recorder
-):
-    recorder.chunks = ["@도경: 일부만", " 보였다"]
-    recorder.error = ProviderError("STREAM_INTERRUPTED")
-    recorder.error_after = 1
-    judge.answers = [PARK]
-    before = scene_row(db, session)
-    response = send(client, session, [user_part("다음 날 공원으로.")])
-    assert generation_status(client, response) == "failed_partial"
-    assert judge.requests == []
-    assert scene_row(db, session) == before
-    assert changes(db, session) == []
-
-
-def test_chat_us_08_judge_failure_keeps_reply_and_scene(client, db, session, judge):
-    judge.error = RuntimeError("판단 호출 실패")
-    before = scene_row(db, session)
-    response = send(client, session, [user_part("다음 날 공원으로.")])
-    assert generation_status(client, response) == "completed"
-    assert scene_row(db, session) == before
-
-
-def test_chat_us_08_apply_error_keeps_reply(client, db, session, judge, monkeypatch):
-    """장면을 이미 쓴 뒤 SQL 오류가 나도 세이브포인트로 장면만 되돌리고 응답은 완료된다."""
-    judge.answers = [PARK]
-
-    def broken_insert(conn, **kwargs):
-        conn.execute("SELECT 1 / 0")
-
-    monkeypatch.setattr(scene_repository, "insert_change", broken_insert)
-    before = scene_row(db, session)
-    response = send(client, session, [user_part("다음 날 점심, 공원 벤치로 가요.")])
-    assert generation_status(client, response) == "completed"
-    assert scene_row(db, session) == before
-    assert changes(db, session) == []
-    parts = db.execute(
-        """SELECT count(*) AS n FROM conversation_message_parts p
-           JOIN conversation_generations g ON g.assistant_message_id = p.message_id
-           WHERE g.id = %s""",
-        (response.json()["id"],),
-    ).fetchone()["n"]
-    assert parts > 0
-
-
-def test_chat_us_08_malformed_judgement_keeps_reply(client, db, session, judge):
-    judge.answers = [
-        (
-            '{"changed": true, "characters": [{"name": ["도경"], "clothing": "x"}], '
-            '"evidence": "같이 가자"}'
-        ),
-        '{"changed": true, "x": ' + "[" * 50000 + "]" * 50000 + "}",  # RecursionError
-    ]
-    before = scene_row(db, session)
-    for index in range(2):
-        response = send(client, session, [user_part("같이 가자.")], request_id=f"bad-000{index}")
-        assert generation_status(client, response) == "completed"
-    assert scene_row(db, session) == before
-    assert changes(db, session) == []
-
-
-def test_chat_us_08_change_without_evidence_in_turn_is_ignored(client, db, session, judge):
-    judge.answers = [
-        '{"changed": true, "place": "바닷가", "evidence": "둘은 바닷가로 갔다", '
-        '"evidence_from": "assistant"}'
-    ]
-    send(client, session, [user_part("배고프다.")])
-    assert scene_row(db, session)["place"] == "경찰서 옥상"
-    assert changes(db, session) == []
-
-
-def test_chat_us_08_judge_disabled_skips_call(client, db, session, judge, monkeypatch):
-    from app.core.config import settings
-
-    monkeypatch.setattr(settings, "chat_scene_judge_enabled", False)
-    judge.answers = [PARK]
-    send(client, session, [user_part("다음 날 공원으로.")])
-    assert judge.requests == []
-    assert scene_row(db, session)["place"] == "경찰서 옥상"
-
-
-def test_chat_us_08_character_outfit_changes_only_that_character(client, db, session, judge):
-    judge.answers = [
-        '{"changed": true, "characters": [{"name": "도경", "clothing": "회색 셔츠", '
-        '"inner_thought": null}], "evidence": "도경이 코트를 벗었다"}'
-    ]
-    send(
-        client,
-        session,
-        [
-            user_part("코트 좀 벗어요."),
-            {"speaker_kind": "narrator", "character_id": None, "body": "*도경이 코트를 벗었다.*"},
+def test_chat_us_08_bubbles_have_no_info_and_turns_api_returns_info(client, db, session, recorder):
+    generation = turn(client, session, recorder, PARK_INFO, "공원으로.", "turn-0001")
+    raw = "".join(reply(PARK_INFO))
+    # 원문 전체는 생성 원문에 그대로 남는다(응답 자체에 저장).
+    stored = db.execute(
+        "SELECT text FROM conversation_generations WHERE id = %s", (generation["id"],)
+    ).fetchone()["text"]
+    assert stored == raw
+    expected_info = {
+        "text": PARK_INFO,
+        "date": {
+            "mode": "calendar",
+            "era": None,
+            "year": 2026,
+            "month": 11,
+            "day": 23,
+            "reference_event": None,
+            "elapsed_day": None,
+        },
+        "time": {"hour": 12, "minute": None},
+        "place": "공원 벤치",
+        "characters": [
+            {"name": "도경", "clothing": "회색 셔츠", "inner_thought": None},
+            {"name": "Bea", "clothing": "노란 우비", "inner_thought": "배고프다"},
         ],
-    )
-    rows = {
-        row["name_snapshot"]: row
-        for row in db.execute(
-            """SELECT name_snapshot, clothing, inner_thought FROM conversation_character_states
-               WHERE session_id = %s""",
-            (session,),
-        ).fetchall()
     }
-    assert (rows["도경"]["clothing"], rows["도경"]["inner_thought"]) == ("회색 셔츠", "피곤하다")
-    assert rows["Bea"]["clothing"] is None
-    (change,) = changes(db, session)
-    assert change["evidence_from"] == "user"  # 이용자가 쓴 나레이터 줄에서 찾은 근거
-    assert scene_row(db, session)["place"] == "경찰서 옥상"
-
-
-def test_chat_us_08_scene_change_stays_in_its_session(client, db, saved_story, session, judge):
-    story, intro, _ = saved_story
-    other = start_session(client, story, intro, headers={"X-User-Id": "1"})
-    judge.answers = [PARK]
-    send(client, session, [user_part("다음 날 점심, 공원 벤치로.")])
-    assert scene_row(db, session)["place"] == "공원 벤치"
-    assert scene_row(db, other)["place"] == "경찰서 옥상"
-    assert changes(db, other) == []
-
-
-def test_chat_us_08_retry_after_failure_applies_change_once(client, db, session, judge, recorder):
-    recorder.error = ProviderError("PROVIDER_ERROR")
-    failed = send(client, session, [user_part("다음 날 점심, 공원 벤치로 가요.")])
-    assert generation_status(client, failed) == "failed"
-    recorder.error = None
-    judge.answers = [PARK]
-    retried = client.post(
-        f"{GENERATIONS}/{failed.json()['id']}/retry",
-        headers=PLAYER,
-        json={"request_id": "retry-0001"},
-    )
-    assert retried.status_code == 202, retried.text
-    assert generation_status(client, retried) == "completed"
-    assert len(changes(db, session)) == 1
-    assert scene_row(db, session)["day"] == 23
-
-
-def test_chat_us_08_judge_sees_session_character_names(client, db, session, judge):
-    chars = session_characters(client, session)
-    assert set(chars) == {"도경", "Bea"}
-    send(client, session, [user_part("안녕.")])
-    assert judge.requests[0].character_names == ["도경", "Bea"]
-
-
-def test_chat_us_08_evidence_source_is_where_it_was_found(client, db, session, judge):
-    # 판단이 "user"라고 해도 근거가 응답에만 있으면 응답 메시지를 근거로 남긴다.
-    judge.answers = [
-        '{"changed": true, "place": "옥상 계단", "evidence": "응답입니다", "evidence_from": "user"}'
+    room = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    user_message, assistant = room["messages"]
+    assert user_message["info"] is None
+    assert [(p["speaker_name"], p["body"]) for p in assistant["parts"]] == [
+        ("도경", "*고개를 끄덕인다.*\n\n가자."),
+        (None, "*비가 그친다.*"),
     ]
-    response = send(client, session, [user_part("배고프다.")])
-    (change,) = changes(db, session)
-    generation = db.execute(
-        "SELECT assistant_message_id FROM conversation_generations WHERE id = %s",
-        (response.json()["id"],),
+    assert "```" not in str(assistant["parts"]) and "공원 벤치" not in str(assistant["parts"])
+    assert assistant["info"] == expected_info
+    # 생성 상태 응답의 완료 메시지에도 같은 info가 있고, text는 원문 그대로다(앱이 숨긴다).
+    polled = client.get(f"{GENERATIONS}/{generation['id']}", headers=PLAYER).json()
+    assert polled["assistant_message"]["info"] == expected_info
+    assert polled["text"] == raw
+    # info 없는 응답은 info가 null이다.
+    turn(client, session, recorder, None, "응.", "turn-0002")
+    room = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert [m["info"] is None for m in room["messages"]] == [True, False, True, True]
+
+
+def test_chat_us_08_failed_reply_info_is_ignored(client, db, session, recorder):
+    # info까지 다 받은 뒤 연결이 끊겼다: 원문에는 info가 있지만 실패(일부) 응답이다.
+    recorder.chunks = [*reply(PARK_INFO), "never"]
+    recorder.error = ProviderError("STREAM_INTERRUPTED")
+    recorder.error_after = 2
+    partial = send(client, session, [user_part("공원으로.")], request_id="turn-0001").json()
+    recorder.error = recorder.error_after = None
+    polled = client.get(f"{GENERATIONS}/{partial['id']}", headers=PLAYER).json()
+    assert polled["status"] == "failed_partial"
+    assert polled["text"] == "".join(reply(PARK_INFO))
+    assert polled["assistant_message"] is None
+    turn(client, session, recorder, None, "다시.", "turn-0002")
+    assert scene_block(recorder.requests[-1]) == START_SCENE
+    room = client.get(f"{SESSIONS}/{session}/turns", headers=PLAYER).json()
+    assert all(m["info"] is None for m in room["messages"])
+
+
+def test_chat_us_08_info_only_reply_is_empty_not_billed_and_retryable(
+    client, db, session, recorder
+):
+    recorder.chunks = ["\n```info\n", PARK_INFO, "\n```\n"]
+    generation = send(client, session, [user_part("공원으로.")]).json()
+    row = db.execute(
+        "SELECT status, billable, error_code FROM conversation_generations WHERE id = %s",
+        (generation["id"],),
     ).fetchone()
-    assert change["evidence_from"] == "assistant"
-    assert change["evidence_message_id"] == generation["assistant_message_id"]
+    assert (row["status"], row["billable"], row["error_code"]) == (
+        "failed",
+        False,
+        "EMPTY_RESPONSE",
+    )
+    assert client.get(f"{GENERATIONS}/{generation['id']}", headers=PLAYER).json()["retryable"]
+
+
+def test_chat_us_08_output_limit_with_only_info_is_not_billed(client, db, session, recorder):
+    recorder.chunks = ["```info\n장소: 공원 벤치\n", "never"]
+    recorder.error = ProviderError(providers.MODEL_OUTPUT_LIMIT)
+    recorder.error_after = 1
+    generation = send(client, session, [user_part("공원으로.")]).json()
+    row = db.execute(
+        "SELECT status, billable FROM conversation_generations WHERE id = %s",
+        (generation["id"],),
+    ).fetchone()
+    assert (row["status"], row["billable"]) == ("failed", False)
+
+
+def test_chat_us_08_output_limit_inside_info_bills_visible_body(client, db, session, recorder):
+    # 본문 뒤 info를 쓰다가 한도에 걸렸다: 본문은 보였으므로 청구 대상이다.
+    recorder.chunks = [f"{BODY}\n```info\n장소: 공", "never"]
+    recorder.error = ProviderError(providers.MODEL_OUTPUT_LIMIT)
+    recorder.error_after = 1
+    generation = send(client, session, [user_part("공원으로.")]).json()
+    row = db.execute(
+        "SELECT status, billable FROM conversation_generations WHERE id = %s",
+        (generation["id"],),
+    ).fetchone()
+    assert (row["status"], row["billable"]) == ("failed_partial", True)
+
+
+def test_chat_us_08_info_stays_in_its_session(client, db, saved_story, session, recorder):
+    story, intro, _ = saved_story
+    other = start_session(client, story, intro, headers=AUTHOR)
+    turn(client, session, recorder, PARK_INFO, "공원으로.", "turn-0001")
+    turn(client, other, recorder, None, "다른 방.", "turn-0002", headers=AUTHOR)
+    turn(client, session, recorder, None, "계속.", "turn-0003")
+    assert scene_block(recorder.requests[1]) == START_SCENE
+    assert scene_block(recorder.requests[2]) == PARK_SCENE
+    room = client.get(f"{SESSIONS}/{other}/turns", headers=AUTHOR).json()
+    assert all(m["info"] is None for m in room["messages"])

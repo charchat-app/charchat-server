@@ -6,9 +6,12 @@
 순서
 - system: 지침 → 기본 정보(제목·한 줄 소개·세계관·해시태그·캐릭터별 이름·상세)
   → 표현 설정(시점·시제·대화 구성·문체·응답 길이와 그 뜻)
-  → 선택한 유저 프로필(세션 적용 이름·상세) → 호감도·관계(세션 현재값) → 출력 형식.
-- 첫 user: 퓨샷(참고 예시로 표시) → 선택 인트로의 실제 이력 → 세션 현재 장면 → 이용자 첫 입력.
-- 이후: 저장된 이력(user/assistant 번갈아) → 새 입력. 이력은 아직 자르지 않는다(AC11 예산 미정).
+  → 선택한 유저 프로필(세션 적용 이름·상세) → 호감도·관계(세션 현재값) → 출력 형식
+  → 장면 정보(응답 맨 끝 info 블록 형식, CHAT-US-08).
+- 첫 user: 퓨샷(참고 예시로 표시) → 선택 인트로의 실제 이력 → 현재 장면 → 이용자 첫 입력.
+- 이후: 저장된 이력(user/assistant 번갈아) → 현재 장면 → 새 입력. 이력은 아직 자르지 않는다
+  (AC11 예산 미정). 이력의 assistant 본문은 info를 뗀 말풍선 부분이다.
+- 현재 장면: 세션 시작 값에 완료된 응답의 info를 차례로 덮어쓴 값(CHAT-US-08, info.py).
 
 CHAT-US-06: 설정 이름만이 아니라 그 뜻(가이드)을 함께 보낸다.
 문구는 상세 문서(대화 6번)의 확정 동작을 옮긴 것이며, 실제 모델 시험 결과에 따라 바꿀 수 있다.
@@ -16,6 +19,15 @@ CHAT-US-06: 설정 이름만이 아니라 그 뜻(가이드)을 함께 보낸다
 
 from dataclasses import dataclass, field
 
+from app.features.conversation.messaging.info import (
+    CLOTHING_MAX_LENGTH,
+    INFO_CLOSE,
+    INFO_OPEN,
+    INNER_THOUGHT_MAX_LENGTH,
+    PLACE_MAX_LENGTH,
+    REFERENCE_EVENT_MAX_LENGTH,
+    format_info_lines,
+)
 from app.features.conversation.messaging.parser import NARRATOR_TAG
 
 USER_PLACEHOLDER = "{{user}}"
@@ -103,6 +115,8 @@ RESPONSE_LENGTH_COMMON = (
     "되풀이하지 말고 행동·반응·장면을 더 전개한다. 분량 때문에 문장이나 대사를 중간에 끊지 말고 "
     "자연스럽게 마무리한다."
 )
+# CHAT-US-08: 응답 끝 info 블록(장면 정보)은 분량 목표에 넣지 않는다.
+RESPONSE_LENGTH_INFO = "맨 끝 info 블록은 분량에 포함하지 않는다."
 STYLE = {
     "dynamic": "역동적인",
     "lyrical": "서정적인",
@@ -182,15 +196,6 @@ class PromptContext:
     session_character_names: list[str]
     history: list[PromptHistoryMessage] = field(default_factory=list)
     current: list[PromptPart] = field(default_factory=list)
-    # CHAT-US-08: 지난 완료 턴 뒤에 이용자가 장면을 직접 고쳤다(이번 요청에만 알린다).
-    scene_user_edited: bool = False
-
-
-# 이용자가 장면을 직접 고친 뒤 첫 요청에서만 [현재 장면] 끝에 붙인다. 앞 대화와 장면이 달라도
-# 이 장면을 따르게 한다(판단이 놓친 이동까지 되돌리지 않도록 늘 붙이지는 않는다).
-SCENE_USER_EDITED_NOTE = (
-    "※ 이용자가 방금 이 장면을 직접 고쳤다. 앞 대화와 달라도 이 장면에서 이어 간다."
-)
 
 
 def _replace_user(text: str, play_name: str) -> str:
@@ -211,11 +216,6 @@ def _label(part: PromptPart, play_name: str, replace_user: bool) -> str:
 def _labeled(parts: list[PromptPart], play_name: str, replace_user: bool = False) -> str:
     # {{user}} 치환은 제작 원문(퓨샷)에만 한다. 인트로는 시작 때 치환됐고 이용자 입력은 그대로 둔다.
     return "\n".join(_label(part, play_name, replace_user) for part in parts)
-
-
-def label_parts(parts: list[PromptPart], play_name: str) -> str:
-    """이용자 입력을 모델 요청과 같은 `[이름] 본문` 줄로 쓴다(장면 판단에서도 같은 모양을 쓴다)."""
-    return _labeled(parts, play_name)
 
 
 def _assistant_text(parts: list[PromptPart]) -> str:
@@ -293,6 +293,7 @@ def _expression(ctx: PromptContext) -> str:
         *_style_lines(exp),
         length_line,
         f"  {RESPONSE_LENGTH_COMMON}",
+        f"  {RESPONSE_LENGTH_INFO}",
     ]
     return "\n".join(lines)
 
@@ -365,6 +366,56 @@ def _output_format(ctx: PromptContext) -> str:
     )
 
 
+# CHAT-US-08: info 블록 형식 예시의 날짜 줄(세션 날짜 방식에 맞춘다. 방식이 없으면 날짜 줄이 없다).
+INFO_DATE_TEMPLATE = {
+    "calendar": ("날짜: <연>년 <월>월 <일>일", "날짜는 달력 날짜(2026년 11월 27일 모양)로 쓴다."),
+    "world": (
+        "날짜: <연호> <연>년 <월>월 <일>일",
+        "날짜는 세계관 연호와 연월일(<연호> 1898년 3월 2일 모양)로 쓴다.",
+    ),
+    "elapsed": (
+        "날짜: <기준 사건> <N>일째",
+        "날짜는 기준 사건 뒤 며칠째인지(<기준 사건> 3일째 모양)로 쓴다.",
+    ),
+}
+
+
+def _info_format(ctx: PromptContext) -> str:
+    """응답 맨 끝 info 블록(장면 정보) 형식과 규칙(CHAT-US-08)."""
+    names = ", ".join(ctx.session_character_names) or "없음"
+    mode = (ctx.scene or {}).get("date_mode")
+    date_template, date_rule = INFO_DATE_TEMPLATE.get(mode, (None, "날짜 줄은 쓰지 않는다."))
+    if date_template:
+        date_rule += " 날짜를 쓰는 방식은 바꾸지 않는다."
+    example = [
+        INFO_OPEN,
+        *([date_template] if date_template else []),
+        "시간: <시>:<분>",
+        "장소: <장소>",
+        *(f"[{name}] 착장: <착장> | 속마음: <속마음>" for name in ctx.session_character_names),
+        INFO_CLOSE,
+    ]
+    return "\n".join(
+        [
+            "## 장면 정보(info)",
+            "매 응답의 맨 마지막에 아래 형식의 info 블록을 한 번 쓴다. info 블록 뒤에는 아무것도 "
+            "쓰지 않는다. 발화자 블록(@이름:)에는 info 내용을 쓰지 않는다.",
+            "info는 이번 응답이 끝난 시점의 장면이다. 이번 응답에서 실제로 바뀐 것만 바꾸고, "
+            "나머지는 [현재 장면] 값을 그대로 옮긴다. 계획·가정·회상은 장면을 바꾸지 않는다.",
+            f"장면은 이용자 캐릭터({ctx.play_name}) 기준이다. 다른 캐릭터만 자리를 떠나면 장소는 "
+            "그대로다.",
+            f"캐릭터 줄은 등장 캐릭터({names})마다 한 줄씩 [이름]으로 쓰고, 값이 없는 항목은 -로 "
+            f"쓴다. 이용자 캐릭터({ctx.play_name})의 줄은 쓰지 않는다.",
+            "시간은 24시간제(19:30)로 쓰고, 분을 모르면 19시처럼 쓴다. "
+            "[현재 장면]에 없는(미지정) 줄은 이야기에서 분명히 정해질 때만 채운다.",
+            date_rule,
+            f"글자 수: 장소 {PLACE_MAX_LENGTH}자, 기준 사건 {REFERENCE_EVENT_MAX_LENGTH}자, "
+            f"착장 {CLOTHING_MAX_LENGTH}자, 속마음 {INNER_THOUGHT_MAX_LENGTH}자 이내.",
+            "형식:\n" + "\n".join(example),
+        ]
+    )
+
+
 def build_system(ctx: PromptContext) -> str:
     return "\n\n".join(
         [
@@ -374,42 +425,15 @@ def build_system(ctx: PromptContext) -> str:
             _profile(ctx),
             _bonds(ctx),
             _output_format(ctx),
+            _info_format(ctx),
         ]
     )
 
 
 def _scene(ctx: PromptContext) -> str:
-    scene = ctx.scene or {}
-    lines = []
-    if scene.get("place"):
-        lines.append(f"장소: {scene['place']}")
-    mode = scene.get("date_mode")
-    ymd = " ".join(
-        f"{scene[key]}{unit}"
-        for key, unit in (("year", "년"), ("month", "월"), ("day", "일"))
-        if scene.get(key) is not None
-    )
-    if mode == "calendar" and ymd:
-        lines.append(f"날짜: {ymd}")
-    elif mode == "world" and (scene.get("era") or ymd):
-        lines.append(f"날짜: {' '.join(x for x in (scene.get('era'), ymd) if x)}")
-    elif mode == "elapsed" and scene.get("elapsed_day") is not None:
-        # 기준 사건이 비어 있으면 임의 이름('시작')을 붙이지 않는다.
-        event = scene.get("reference_event")
-        day = scene["elapsed_day"]
-        lines.append(f"날짜: {event} 이후 {day}일째" if event else f"날짜: {day}일째")
-    if scene.get("hour") is not None:
-        # 분이 미지정이면 0분으로 채우지 않는다.
-        minute = scene.get("minute")
-        hour = scene["hour"]
-        lines.append(f"시각: {hour:02d}:{minute:02d}" if minute is not None else f"시각: {hour}시")
-    for state in ctx.character_states:
-        if state.get("clothing"):
-            lines.append(f"{state['name']} 착장: {state['clothing']}")
-        if state.get("inner_thought"):
-            lines.append(f"{state['name']} 속마음: {state['inner_thought']}")
-    text = "\n".join(lines) if lines else "지정 없음"
-    return f"{text}\n{SCENE_USER_EDITED_NOTE}" if ctx.scene_user_edited else text
+    """CHAT-US-08: 현재 장면을 응답 끝 info 블록과 같은 줄 형식으로 쓴다(그대로 옮겨 고치게)."""
+    lines = format_info_lines(ctx.scene, ctx.character_states)
+    return "\n".join(lines) if lines else "지정 없음"
 
 
 def build_first_block(ctx: PromptContext, include_scene: bool = True) -> str:

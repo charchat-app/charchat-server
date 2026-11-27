@@ -9,6 +9,7 @@ from psycopg.errors import UniqueViolation
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.messaging import providers, repository, worker
+from app.features.conversation.messaging.info import apply_info, parse_info, split_info
 from app.features.conversation.messaging.parser import JS_TRIM_CHARS, parse_assistant_text
 from app.features.conversation.messaging.prompt import (
     PromptContext,
@@ -23,11 +24,9 @@ from app.features.conversation.messaging.schemas import (
     MessagePartRequest,
     MessagePartResponse,
     MessageSendRequest,
+    SceneInfoResponse,
     TurnsResponse,
 )
-from app.features.conversation.scene import judge as scene_judge
-from app.features.conversation.scene import service as scene_service
-from app.features.conversation.scene.rules import ScenePatch
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,10 @@ class GenerationNotRetryableError(AppError):
 
 
 class _Names:
-    """응답의 speaker_name: 유저는 세션 적용 이름, 캐릭터는 세션 캐릭터 이름."""
+    """응답의 speaker_name: 유저는 세션 적용 이름, 캐릭터는 세션 캐릭터 이름.
+
+    CHAT-US-08: info를 읽을 때 쓰는 세션 날짜 방식도 함께 둔다.
+    """
 
     def __init__(self, conn: Connection, session_id: int) -> None:
         self.play_name = repository.get_play_name(conn, session_id)
@@ -96,6 +98,8 @@ class _Names:
             row["id"]: row["name"] or ""
             for row in repository.list_session_characters(conn, session_id)
         }
+        scene = repository.get_scene(conn, session_id)
+        self.date_mode = scene["date_mode"] if scene else None
 
     def of(self, part: dict) -> str | None:
         if part["speaker_kind"] == "user":
@@ -105,7 +109,19 @@ class _Names:
         return None
 
 
-def _chat_message(row, parts: list, names: _Names) -> ChatMessageResponse:
+def _info_response(text: str | None, names: _Names) -> SceneInfoResponse | None:
+    """CHAT-US-08: 응답 원문 끝 info 블록(원문과 읽은 값). info가 없으면 None."""
+    if text is None:
+        return None
+    _, info = split_info(text)
+    if info is None:
+        return None
+    parsed = parse_info(info, names.date_mode, list(names.characters.values()))
+    return SceneInfoResponse(text=info, **parsed)
+
+
+def _chat_message(row, parts: list, names: _Names, text: str | None = None) -> ChatMessageResponse:
+    """text는 assistant 메시지의 생성 원문이다(info를 읽는다). 이용자 메시지는 None."""
     return ChatMessageResponse(
         id=row["id"],
         role=row["role"],
@@ -119,13 +135,16 @@ def _chat_message(row, parts: list, names: _Names) -> ChatMessageResponse:
             for part in parts
         ],
         created_at=row["created_at"],
+        info=_info_response(text, names),
     )
 
 
-def _load_message(conn: Connection, session_id: int, message_id: int, names: _Names):
+def _load_message(
+    conn: Connection, session_id: int, message_id: int, names: _Names, text: str | None = None
+):
     row = repository.get_message(conn, session_id, message_id)
     parts = repository.list_parts(conn, session_id, [message_id])[message_id]
-    return _chat_message(row, parts, names)
+    return _chat_message(row, parts, names, text)
 
 
 def _generation_response(
@@ -136,7 +155,13 @@ def _generation_response(
     assistant = None
     # 저장까지 끝난(completed) 응답만 메시지로 보여 준다. 진행·실패 중에는 text로만 전달한다.
     if row["status"] == "completed":
-        assistant = _load_message(conn, row["session_id"], row["assistant_message_id"], names)
+        assistant = _load_message(
+            conn,
+            row["session_id"],
+            row["assistant_message_id"],
+            names,
+            repository.get_full_text(conn, row["id"]),
+        )
     retryable = False
     if row["status"] == "failed":
         if latest_id is None:
@@ -325,7 +350,13 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
         names = _Names(conn, session_id)
         rows = repository.list_messages(conn, session_id)
         parts = repository.list_parts(conn, session_id, [row["id"] for row in rows])
-        messages = [_chat_message(row, parts[row["id"]], names) for row in rows]
+        texts = {
+            row["message_id"]: row["text"]
+            for row in repository.list_completed_texts(conn, session_id)
+        }
+        messages = [
+            _chat_message(row, parts[row["id"]], names, texts.get(row["id"])) for row in rows
+        ]
         latest = repository.get_latest_generation(conn, session_id)
         latest_id = latest["id"] if latest else None
         active = None
@@ -361,6 +392,34 @@ def _prompt_part(part: dict, names: _Names) -> PromptPart:
     )
 
 
+def _current_scene(
+    conn: Connection, session_id: int, session_characters, before_position: int
+) -> tuple[dict | None, list[dict]]:
+    """CHAT-US-08 현재 장면과 캐릭터별 착장·속마음.
+
+    세션 시작 값(conversation_scene_states·character_states, 첫 대화용)에서 출발해 이번 이용자
+    입력 앞의 정상 완료된 응답 info를 오래된 것부터 덮어쓴다. info에 없는 항목은 앞 값을 잇는다.
+    세션 시작 값 행은 바꾸지 않는다.
+    """
+    row = repository.get_scene(conn, session_id)
+    scene = dict(row) if row else None
+    states = [
+        {
+            "name": row["name"] or "",
+            "clothing": row["clothing"],
+            "inner_thought": row["inner_thought"],
+        }
+        for row in session_characters
+    ]
+    date_mode = scene["date_mode"] if scene else None
+    names = [state["name"] for state in states]
+    for row in repository.list_completed_texts(conn, session_id, before_position):
+        _, info = split_info(row["text"])
+        if info is not None:
+            scene, states = apply_info(scene, states, parse_info(info, date_mode, names))
+    return scene, states
+
+
 def load_prompt_context(conn: Connection, generation) -> PromptContext:
     """생성 때마다 최신 저장 설정과 세션 현재값을 다시 읽는다(KAN-16 AC29).
 
@@ -391,6 +450,9 @@ def load_prompt_context(conn: Connection, generation) -> PromptContext:
         for row in rows
     ]
     expression = repository.get_expression(conn, story_id)
+    scene, character_states = _current_scene(
+        conn, session_id, session_characters, user_message["position"]
+    )
     return PromptContext(
         title=story["title"] or "",
         subtitle=story["subtitle"] or "",
@@ -408,15 +470,8 @@ def load_prompt_context(conn: Connection, generation) -> PromptContext:
         ],
         play_name=play_name,
         profile_description=(profile["description"] if profile else None) or "",
-        scene=dict(scene) if (scene := repository.get_scene(conn, session_id)) else None,
-        character_states=[
-            {
-                "name": row["name"] or "",
-                "clothing": row["clothing"],
-                "inner_thought": row["inner_thought"],
-            }
-            for row in session_characters
-        ],
+        scene=scene,
+        character_states=character_states,
         affinities=[
             {
                 "source": row["source"] or "",
@@ -436,8 +491,6 @@ def load_prompt_context(conn: Connection, generation) -> PromptContext:
         session_character_names=[row["name"] or "" for row in session_characters],
         history=history,
         current=[_prompt_part(part, names) for part in parts[user_message["id"]]],
-        # 생성 작업의 claimed 행에는 id가 있다. 없으면(직접 구성한 행) 모든 완료 턴과 비교한다.
-        scene_user_edited=repository.scene_user_edited(conn, session_id, generation.get("id")),
     )
 
 
@@ -466,9 +519,10 @@ def _finish_output_limit(
     generation_id: int, session_character_names: list[str], reported_model: str | None
 ) -> None:
     with worker.connect() as conn, conn.transaction():
-        text = repository.get_full_text(conn, generation_id)
+        # CHAT-US-08: 맨 끝 info 블록은 보이는 글이 아니다(info만 있으면 청구하지 않는다).
+        body, _ = split_info(repository.get_full_text(conn, generation_id))
         visible = bool(
-            parse_assistant_text(text, session_character_names, trim_chars=JS_TRIM_CHARS)
+            parse_assistant_text(body, session_character_names, trim_chars=JS_TRIM_CHARS)
         )
         repository.finish_generation(
             conn,
@@ -480,17 +534,16 @@ def _finish_output_limit(
         )
 
 
-def _save_completed(
-    generation_id: int, claimed, reported_model: str | None, scene_patch: ScenePatch | None = None
-) -> None:
+def _save_completed(generation_id: int, claimed, reported_model: str | None) -> None:
     """파싱한 발화자별 부분을 assistant 메시지에 저장하고 생성·메시지를 completed로 바꾼다.
 
-    CHAT-US-08: 같은 트랜잭션에서 장면 변화를 적용한다. 완료로 바뀌지 않으면 장면도 그대로다.
+    CHAT-US-08: 말풍선 부분에는 맨 끝 info 블록을 뗀 본문만 넣는다. 원문 전체(info 포함)는
+    생성 원문에 그대로 남고, 다음 요청의 현재 장면과 이력 조회의 info는 그 원문에서 읽는다.
     """
     session_id = claimed["session_id"]
     with worker.connect() as conn, conn.transaction():
         repository.lock_session_by_id(conn, session_id)
-        text = repository.get_full_text(conn, generation_id)
+        text, _ = split_info(repository.get_full_text(conn, generation_id))
         ids = _speaker_ids(conn, session_id)
         parts = [
             {
@@ -506,14 +559,6 @@ def _save_completed(
         ):
             # 그 사이 중단 정리된 생성이면 응답 저장도 되돌린다.
             raise RuntimeError("생성이 더 이상 진행 중이 아닙니다.")
-        scene_service.apply_turn_change(
-            conn,
-            session_id=session_id,
-            generation_id=generation_id,
-            user_message_id=claimed["user_message_id"],
-            assistant_message_id=claimed["assistant_message_id"],
-            patch=scene_patch,
-        )
 
 
 def _stream(generation_id: int, claimed) -> None:
@@ -573,15 +618,12 @@ def _stream(generation_id: int, claimed) -> None:
         return
     with worker.connect() as conn:
         text = repository.get_full_text(conn, generation_id)
-    if not text.strip():
+    # CHAT-US-08: info 블록만 있는 응답도 빈 응답이다(완료·청구하지 않는다).
+    if not split_info(text)[0].strip():
         _fail(generation_id, 0, "EMPTY_RESPONSE", request.reported_model)
         return
-    # CHAT-US-08: 응답이 정상으로 끝난 뒤에만 장면 변화를 묻는다. 판단이 실패해도 응답은 저장한다.
-    with worker.connect() as conn:
-        repository.touch_generation(conn, generation_id)
-    scene_patch = scene_judge.judge_turn(context, text, request.model, request.provider)
     try:
-        _save_completed(generation_id, claimed, request.reported_model, scene_patch)
+        _save_completed(generation_id, claimed, request.reported_model)
     except Exception:
         logger.exception("응답 저장 실패: generation=%s", generation_id)
         with worker.connect() as conn:

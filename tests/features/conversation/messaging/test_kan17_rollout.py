@@ -1,9 +1,8 @@
 """CHAT-US-02 배포 SQL: 팀 DDL이 없는 KAN-16 DB와 팀 DDL이 이미 적용된 공용 DB 모두에서
 schema.sql과 같은 정의가 되고, 다시 실행해도 같으며, 정의가 다르면 전체를 되돌린다.
 
-schema.sql에는 이후 배포분(CHAT-US-13 kan23_model_change.sql, CHAT-US-08 kan22_scene_changes.sql)도
-들어 있으므로, 실제 적용 순서대로 KAN-17 → 재실행 → KAN-23 → 재실행 → KAN-22 → 재실행한 결과를
-schema.sql과 비교한다."""
+schema.sql에는 이후 배포분(CHAT-US-13 kan23_model_change.sql)도 들어 있으므로, 실제 적용 순서대로
+KAN-17 → KAN-17 재실행 → KAN-23 → KAN-23 재실행한 결과를 schema.sql과 비교한다."""
 
 from pathlib import Path
 
@@ -15,10 +14,7 @@ from psycopg.pq import TransactionStatus
 ROOT = Path(__file__).resolve().parents[4]
 MIGRATION = ROOT / "app/db/migrations/kan17_conversation_messaging.sql"
 # KAN-17 뒤에 적용하는 배포분(CHAT-US-13). kan17 파일 자체는 바꾸지 않는다.
-LATER_MIGRATIONS = (
-    ROOT / "app/db/migrations/kan23_model_change.sql",
-    ROOT / "app/db/migrations/kan22_scene_changes.sql",
-)
+LATER_MIGRATIONS = (ROOT / "app/db/migrations/kan23_model_change.sql",)
 TEAM_DDL = Path(__file__).with_name("team_ddl_20261120.sql")
 KAN17_TABLES = (
     "models",
@@ -66,8 +62,6 @@ def models(db):
 def drop_kan17_objects(db):
     """KAN-17 객체를 지워 origin/dev(KAN-16) 스키마 상태로 되돌린다."""
     with db.transaction():
-        # 이후 배포분(CHAT-US-08)의 장면 변경 기록은 생성 표를 참조하므로 먼저 지운다.
-        db.execute("DROP TABLE IF EXISTS conversation_scene_changes")
         db.execute(
             """DROP TABLE IF EXISTS conversation_generations, conversation_message_parts,
                                     conversation_messages"""
