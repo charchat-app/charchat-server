@@ -8,9 +8,10 @@
   → 표현 설정(시점·시제·대화 구성·문체·응답 길이와 그 뜻)
   → 선택한 유저 프로필(세션 적용 이름·상세) → 호감도·관계(세션 현재값) → 출력 형식
   → 장면 정보(응답 맨 끝 info 블록 형식, CHAT-US-08).
-- 첫 user: 퓨샷(참고 예시로 표시) → 선택 인트로의 실제 이력 → 현재 장면 → 이용자 첫 입력.
-- 이후: 저장된 이력(user/assistant 번갈아) → 현재 장면 → 새 입력. 이력은 아직 자르지 않는다
-  (AC11 예산 미정). 이력의 assistant 본문은 info를 뗀 말풍선 부분이다.
+- 첫 user: 퓨샷(참고 예시로 표시) → 선택 인트로의 실제 이력 → 현재 장면 → info 알림
+  → 이용자 첫 입력.
+- 이후: 저장된 이력(user/assistant 번갈아) → 현재 장면 → info 알림 → 새 입력.
+  이력은 아직 자르지 않는다(AC11 예산 미정). 이력의 assistant 본문은 info를 뗀 말풍선 부분이다.
 - 현재 장면: 세션 시작 값에 완료된 응답의 info를 차례로 덮어쓴 값(CHAT-US-08, info.py).
 
 CHAT-US-06: 설정 이름만이 아니라 그 뜻(가이드)을 함께 보낸다.
@@ -368,6 +369,22 @@ def _output_format(ctx: PromptContext) -> str:
     )
 
 
+# CHAT-US-08(실제 모델 시험): 응답 중간에 info 블록을 한 번 더 쓴 경우가 있었다.
+INFO_ONCE_AT_END = (
+    "info 블록은 응답 전체에서 정확히 한 번, 맨 끝에만 쓴다. 응답 중간(발화자 블록 사이)에는 "
+    "info 블록을 쓰지 않는다."
+)
+# CHAT-US-08(실제 모델 시험): 장소·시간이 정해지지 않은 이야기에서 캐릭터 설명의 가게 이름을 첫
+# 응답 장소로 채웠다.
+INFO_UNSPECIFIED_FROM_DESCRIPTION = (
+    "세계관이나 캐릭터 설명에 나오는 장소·시간은, 이야기에서 지금 그곳·그 시간이라고 정해지기 "
+    "전에는 미지정 줄을 채우지 않는다."
+)
+# CHAT-US-08(실제 모델 시험): 긴 대화에서 info 블록을 빠뜨리는 턴이 이어졌다. 최신 입력 바로 앞
+# [현재 장면] 뒤에 한 줄로 다시 알린다.
+INFO_REMINDER = "※ 이번 응답의 맨 끝에도 info 블록을 한 번 쓴다."
+
+
 # CHAT-US-08: info 블록 형식 예시의 날짜 줄(세션 날짜 방식에 맞춘다. 방식이 없으면 날짜 줄이 없다).
 INFO_DATE_TEMPLATE = {
     "calendar": (
@@ -377,8 +394,9 @@ INFO_DATE_TEMPLATE = {
     ),
     "world": (
         "날짜: <연호> <연>년 <월>월 <일>일",
-        "날짜는 세계관 연호와 연월일(<연호> 1898년 3월 2일 모양)로 쓴다. 날이 바뀌면 그만큼 "
-        "넘긴다(2월은 28일까지, 윤년 없음).",
+        "날짜는 [현재 장면] 날짜 줄과 똑같은 모양으로 연호, 그 연호의 연도, 월, 일만 쓴다"
+        "(광무 2년 3월 3일 모양). 서기 연도 같은 다른 연도를 따로 덧붙이지 않는다. 날이 바뀌면 "
+        "그만큼 넘긴다(2월은 28일까지, 윤년 없음).",
     ),
     "elapsed": (
         "날짜: <기준 사건> <N>일째",
@@ -410,6 +428,7 @@ def _info_format(ctx: PromptContext) -> str:
             "매 응답의 맨 마지막에 아래 형식의 info 블록을 한 번 쓴다. info 블록 뒤에는 아무것도 "
             "쓰지 않는다. 발화자 블록(@이름:)에는 info 내용을 쓰지 않는다. 여는 줄 ```info는 "
             "발화자 블록이 끝난 뒤 새 줄에 따로 쓴다.",
+            INFO_ONCE_AT_END,
             "대화 이력의 앞 응답들은 info 블록을 뗀 채로 보이지만, 이번 응답을 포함해 모든 응답 "
             "끝에 info 블록을 빠짐없이 쓴다.",
             "info는 이번 응답이 끝난 시점의 장면이다. 이번 응답에서 실제로 바뀐 것만 바꾸고, "
@@ -424,6 +443,7 @@ def _info_format(ctx: PromptContext) -> str:
             f"쓴다. 이용자 캐릭터({ctx.play_name})의 줄은 쓰지 않는다.",
             "시간은 24시간제(19:30)로 쓰고, 분을 모르면 19시처럼 쓴다. "
             "[현재 장면]에 없는(미지정) 줄은 이야기에서 분명히 정해질 때만 채운다.",
+            INFO_UNSPECIFIED_FROM_DESCRIPTION,
             "모르는 날짜·시간·장소 줄은 쓰지 않고 뺀다. 미정·모름·없음 같은 말이나 <...> 자리 "
             "표시를 값으로 쓰지 않는다.",
             date_rule,
@@ -455,6 +475,11 @@ def _scene(ctx: PromptContext) -> str:
     return "\n".join(lines) if lines else "지정 없음"
 
 
+def _scene_section(ctx: PromptContext) -> str:
+    """최신 이용자 입력 바로 앞에 두는 [현재 장면] 블록과 그 뒤 info 알림 한 줄(CHAT-US-08)."""
+    return f"[현재 장면]\n{_scene(ctx)}\n\n{INFO_REMINDER}"
+
+
 def build_first_block(ctx: PromptContext, include_scene: bool = True) -> str:
     sections = []
     if ctx.fewshots:
@@ -470,7 +495,7 @@ def build_first_block(ctx: PromptContext, include_scene: bool = True) -> str:
     if ctx.intro:
         sections.append("[지금까지의 이야기]\n" + _labeled(ctx.intro, ctx.play_name))
     if include_scene:
-        sections.append("[현재 장면]\n" + _scene(ctx))
+        sections.append(_scene_section(ctx))
     return "\n\n".join(sections)
 
 
@@ -490,7 +515,7 @@ def build_messages(ctx: PromptContext) -> list[dict]:
             continue
         content = _labeled(turn.parts, ctx.play_name)
         if index == last and index != 0:
-            content = f"[현재 장면]\n{_scene(ctx)}\n\n[이용자 입력]\n{content}"
+            content = f"{_scene_section(ctx)}\n\n[이용자 입력]\n{content}"
         if index == 0:
             content = (
                 f"{first_block}\n\n[이용자 입력]\n{content}"

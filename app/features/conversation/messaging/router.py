@@ -10,6 +10,8 @@ from app.features.conversation.messaging.schemas import (
     GenerationResponse,
     GenerationRetryRequest,
     MessageSendRequest,
+    SceneInfoUpdateRequest,
+    SceneInfoUpdateResponse,
     TurnsResponse,
 )
 
@@ -26,6 +28,19 @@ def send_message(
     session_id: int, request: MessageSendRequest, owner_id: CurrentUserId, conn: DbConn
 ) -> GenerationResponse:
     return service.send_message(conn, owner_id, session_id, request)
+
+
+@router.put("/sessions/{session_id}/messages/{message_id}/info")
+def update_message_info(
+    session_id: int,
+    message_id: int,
+    request: SceneInfoUpdateRequest,
+    owner_id: CurrentUserId,
+    conn: DbConn,
+) -> SceneInfoUpdateResponse:
+    # CHAT-US-08(KAN-40 결정 C): 마지막 AI 응답의 장면 정보(info)를 이용자가 고친다.
+    # message_id는 턴 API messages[].id(assistant 메시지 ID)다.
+    return service.update_reply_info(conn, owner_id, session_id, message_id, request)
 
 
 @router.get("/generations/{generation_id}")

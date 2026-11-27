@@ -5,6 +5,7 @@ from messaging_helpers import send, session_characters, user_part
 
 from app.features.conversation.messaging.prompt import (
     COMPOSITION_GUIDE,
+    INFO_REMINDER,
     POINT_OF_VIEW_GUIDE,
     STYLE_GUIDE,
     TENSE_GUIDE,
@@ -77,7 +78,9 @@ def test_chat_us_02_ac11_pure_later_turn_history_then_new_input():
     assert messages[2]["content"] == "@도경: 답\n@나레이터: 서술"
     # CHAT-US-08: 이후 턴에는 현재 장면이 첫 블록이 아니라 새 입력 바로 앞에 붙는다.
     assert "[현재 장면]" not in messages[1]["content"]
-    assert messages[3]["content"] == "[현재 장면]\n장소: 옥상\n\n[이용자 입력]\n[민서] 지금 입력"
+    assert messages[3]["content"] == (
+        f"[현재 장면]\n장소: 옥상\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
+    )
     # 이용자 입력의 {{user}}는 바꾸지 않는다.
     later = build_messages(minimal_context(current=[PromptPart("user", "민서", "{{user}}")]))
     assert later[1]["content"].endswith("[민서] {{user}}")
@@ -497,6 +500,7 @@ def test_chat_us_08_scene_block_uses_info_line_format_for_every_character():
         "[도경] 착장: 젖은 코트 | 속마음: 피곤하다\n"
         "[Bea] 착장: 노란 우비 | 속마음: -\n"
         "[하린] 착장: - | 속마음: -\n\n"
+        f"{INFO_REMINDER}\n\n"
         "[이용자 입력]\n[민서] 지금 입력"
     )
 
@@ -617,3 +621,55 @@ def test_chat_us_08_info_date_rule_advances_days_and_switches_reference_event():
     assert "기준 사건을 그 사건으로 바꾸고 1일째로 쓴다(탈출 1일째)." in elapsed
     calendar = info_section(scene={"date_mode": "calendar", "year": 2026, "month": 11, "day": 27})
     assert "날이 바뀌면 그만큼 넘긴다(2월은 28일까지, 윤년 없음)." in calendar
+
+
+# ---- 실제 모델 65턴 실행 뒤 고친 문구(11-27) ----
+
+
+def test_chat_us_08_info_reminder_sits_right_after_latest_scene_block():
+    # 긴 대화에서 info 블록을 빠뜨리는 턴이 이어졌다.
+    # 최신 입력 바로 앞 [현재 장면] 뒤에 한 줄 알린다.
+    assert INFO_REMINDER == "※ 이번 응답의 맨 끝에도 info 블록을 한 번 쓴다."
+    history = [
+        PromptHistoryMessage("user", [PromptPart("user", "민서", "앞 입력")]),
+        PromptHistoryMessage("assistant", [PromptPart("narrator", None, "앞 응답")]),
+    ]
+    for messages in (
+        build_messages(minimal_context()),
+        build_messages(minimal_context(history=history)),
+    ):
+        last = messages[-1]["content"]
+        assert last.endswith(
+            f"[현재 장면]\n장소: 옥상\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
+        )
+        # 알림은 최신 입력 앞 한 곳에만 있다(이력·시스템에는 없다).
+        assert sum(m["content"].count(INFO_REMINDER) for m in messages) == 1
+
+
+def test_chat_us_08_world_date_rule_has_no_ad_year():
+    # 실제 모델이 '광무 2년 1898년 3월 3일'처럼 서기 연도를 덧붙여 날짜를 읽지 못했다.
+    section = info_section(scene={"date_mode": "world", "era": "광무", "year": 2, "month": 3})
+    assert (
+        "날짜는 [현재 장면] 날짜 줄과 똑같은 모양으로 연호, 그 연호의 연도, 월, 일만 쓴다"
+        "(광무 2년 3월 3일 모양). 서기 연도 같은 다른 연도를 따로 덧붙이지 않는다."
+    ) in section
+    assert "1898" not in section
+
+
+def test_chat_us_08_info_block_is_written_once_only_at_the_end():
+    # 실제 모델이 응답 중간에 info 블록을 한 번 더 썼다.
+    assert (
+        "info 블록은 응답 전체에서 정확히 한 번, 맨 끝에만 쓴다. 응답 중간(발화자 블록 사이)에는 "
+        "info 블록을 쓰지 않는다."
+    ) in info_section()
+
+
+def test_chat_us_08_descriptions_do_not_fill_unspecified_scene_lines():
+    # 장소·시간 미지정 이야기에서 첫 응답이 캐릭터 설명의 가게 이름을 장소로 채웠다.
+    section = info_section()
+    rule = (
+        "세계관이나 캐릭터 설명에 나오는 장소·시간은, 이야기에서 지금 그곳·그 시간이라고 정해지기 "
+        "전에는 미지정 줄을 채우지 않는다."
+    )
+    assert rule in section
+    assert section.index("[현재 장면]에 없는(미지정) 줄은") < section.index(rule)

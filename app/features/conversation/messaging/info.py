@@ -15,10 +15,13 @@ AI는 매 응답 맨 끝에 그 응답이 끝난 시점의 장면(날짜·시간
 2. 여는 줄: 앞뒤의 공백(U+0020)·탭(U+0009)만 무시했을 때 정확히 ```info 인 줄.
    대소문자 구분(소문자만). 다른 문자(BOM·NBSP 등)가 붙으면 여는 줄이 아니다.
 3. 닫는 줄: 여는 줄 뒤에서 처음 나오는, 앞뒤 공백·탭만 무시했을 때 정확히 ``` 인 줄.
-4. 여는 줄이 여러 개면 마지막 여는 줄만 쓴다.
-5. 블록 = 마지막 여는 줄부터 그 닫는 줄까지(포함). 닫는 줄이 없으면 여는 줄부터 원문 끝까지.
-6. 본문 = 블록 앞의 줄들 + 닫는 줄 뒤의 줄들을 `\\n`으로 이은 것. info 원문 = 두 펜스 사이의 줄들을
-   `\\n`으로 이은 것(닫는 줄이 없으면 여는 줄 뒤 전부). 여는 줄이 없으면 본문 = 원문 그대로,
+4. (11-27 개정) 블록 찾기: 위에서부터 여는 줄을 찾는다. 여는 줄을 만나면 그 뒤 처음 나오는
+   닫는 줄까지가 한 블록이다(닫는 줄이 없으면 원문 끝까지). 블록이 끝난 다음 줄부터 다시 여는 줄을
+   찾는다. 블록 안의 줄(다른 여는 줄 포함)은 여는 줄로 보지 않는다.
+5. (11-27 개정) 모든 블록을 본문에서 뺀다. info 원문 = 마지막 블록의 두 펜스 사이 줄들을 `\\n`으로
+   이은 것(닫는 줄이 없으면 여는 줄 뒤 전부). 실제 모델이 응답 중간에 info 블록을 한 번 더 쓴 경우가
+   있었다(앞 블록이 말풍선에 샘).
+6. 본문 = 어느 블록에도 속하지 않은 줄들을 `\\n`으로 이은 것. 여는 줄이 없으면 본문 = 원문 그대로,
    info = 없음.
 7. 스트리밍 중(아직 완료 전 원문)에만 추가: 원문의 마지막 줄(뒤에 줄바꿈이 아직 없는 줄)이 앞쪽
    공백·탭을 뺀 뒤 ```info 의 비어 있지 않은 앞부분(`, ``, ```, ```i, …, ```info)이면 그 줄은
@@ -102,27 +105,49 @@ def _trim(value: str) -> str:
     return value.strip(JS_TRIM_CHARS)
 
 
+def _is_fence(line: str, fence: str) -> bool:
+    return line.strip(FENCE_PADDING) == fence
+
+
 def split_info(text: str) -> tuple[str, str | None]:
-    """응답 원문 → (본문, info 원문 또는 None). 규칙 1~6(규칙 7은 앱 스트리밍 전용)."""
+    """응답 원문 → (본문, info 원문 또는 None). 규칙 1~6(규칙 7은 앱 스트리밍 전용).
+
+    모든 info 블록을 본문에서 빼고, info는 마지막 블록의 안쪽 줄이다.
+    """
     lines = text.splitlines()
-    opening = None
-    for index, line in enumerate(lines):
-        if line.strip(FENCE_PADDING) == INFO_OPEN:
-            opening = index
-    if opening is None:
+    body: list[str] = []
+    info = None
+    index = 0
+    while index < len(lines):
+        if not _is_fence(lines[index], INFO_OPEN):
+            body.append(lines[index])
+            index += 1
+            continue
+        # 규칙 4: 여는 줄 뒤 처음 닫는 줄까지(없으면 끝까지)가 블록이다.
+        # 블록 안의 줄은 여는 줄로 보지 않는다.
+        closing = next(
+            (end for end in range(index + 1, len(lines)) if _is_fence(lines[end], INFO_CLOSE)),
+            len(lines),
+        )
+        info = "\n".join(lines[index + 1 : closing])
+        index = closing + 1
+    if info is None:
         return text, None
-    closing = next(
-        (
-            index
-            for index in range(opening + 1, len(lines))
-            if lines[index].strip(FENCE_PADDING) == INFO_CLOSE
-        ),
-        None,
-    )
-    if closing is None:
-        return "\n".join(lines[:opening]), "\n".join(lines[opening + 1 :])
-    body = "\n".join(lines[:opening] + lines[closing + 1 :])
-    return body, "\n".join(lines[opening + 1 : closing])
+    return "\n".join(body), info
+
+
+def replace_info(text: str, info_lines: list[str]) -> str:
+    """응답 원문의 info 블록을 모두 빼고 새 블록 하나를 맨 끝에 쓴다(KAN-40 이용자 수정).
+
+    새 원문 = split_info 본문 + 줄바꿈 + 새 블록. 그래서 split_info(새 원문)의 info는 새 줄을
+    \\n으로 이은 것이고, 본문은 블록이 있던 응답이면 바꾸기 전과 글자 단위로 같다(본문 끝 빈 줄도
+    줄바꿈 하나를 더 두어 남긴다). 블록이 없던 응답은 원문 뒤에 붙인다. 이때 split_info 본문은
+    규칙 6대로 줄바꿈이 \\n으로 맞춰질 수 있지만(원문이 \\r\\n 등을 쓸 때) 줄은 같아 말풍선
+    나누기 결과는 같다. 블록이 있던 응답의 원문 줄바꿈도 \\n으로 맞춰진다(본문 줄은 그대로).
+    줄에 줄바꿈이 들어 있으면 안 된다(호출자가 검사한다).
+    """
+    body, _ = split_info(text)
+    return "\n".join([body, INFO_OPEN, *info_lines, INFO_CLOSE])
 
 
 def is_value(value: str) -> bool:

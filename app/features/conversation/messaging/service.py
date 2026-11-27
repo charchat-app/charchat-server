@@ -10,8 +10,11 @@ from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.messaging import providers, repository, worker
 from app.features.conversation.messaging.info import (
+    DATE_FIELDS,
     apply_info,
+    format_info_lines,
     parse_info,
+    replace_info,
     scene_view,
     split_info,
 )
@@ -31,6 +34,8 @@ from app.features.conversation.messaging.schemas import (
     MessagePartResponse,
     MessageSendRequest,
     SceneInfoResponse,
+    SceneInfoUpdateRequest,
+    SceneInfoUpdateResponse,
     TurnsResponse,
 )
 
@@ -87,6 +92,51 @@ class GenerationNotRetryableError(AppError):
     status = 409
     code = "GENERATION_NOT_RETRYABLE"
     title = "이 응답은 다시 시도할 수 없습니다"
+
+
+# CHAT-US-08 info 이용자 수정(KAN-40 결정 C)
+
+
+class MessageNotFoundError(AppError):
+    status = 404
+    code = "CONVERSATION_MESSAGE_NOT_FOUND"
+    title = "대화에서 메시지를 찾을 수 없습니다"
+
+
+class InfoNotAssistantMessageError(AppError):
+    status = 422
+    code = "SCENE_INFO_NOT_ASSISTANT_MESSAGE"
+    title = "AI 응답의 장면 정보만 고칠 수 있습니다"
+
+
+class InfoReplyNotCompletedError(AppError):
+    status = 409
+    code = "SCENE_INFO_REPLY_NOT_COMPLETED"
+    title = "정상 완료된 AI 응답의 장면 정보만 고칠 수 있습니다"
+
+
+class InfoNotLatestReplyError(AppError):
+    status = 409
+    code = "SCENE_INFO_NOT_LATEST_REPLY"
+    title = "마지막 AI 응답의 장면 정보만 고칠 수 있습니다"
+
+
+class InfoDateModeMismatchError(AppError):
+    status = 422
+    code = "SCENE_INFO_DATE_MODE_MISMATCH"
+    title = "이 대화의 날짜 방식은 바꿀 수 없습니다"
+
+
+class InfoUnknownCharacterError(AppError):
+    status = 422
+    code = "SCENE_INFO_UNKNOWN_CHARACTER"
+    title = "이 대화에 등장하는 캐릭터가 아닙니다"
+
+
+class InfoInvalidValueError(AppError):
+    status = 422
+    code = "SCENE_INFO_INVALID_VALUE"
+    title = "장면 정보 값이 올바르지 않습니다"
 
 
 # ---- 응답 변환 ----
@@ -428,6 +478,148 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
             # 세션의 현재 선택 모델(CHAT-US-13에서 바꿀 수 있음)의 표시 이름(models.name)과 id.
             model=session["model_name"],
             model_id=session["selected_model_id"],
+            current_scene=CurrentSceneResponse(**scene_view(scene, states)),
+        )
+
+
+# ---- CHAT-US-08 info 이용자 수정(KAN-40 결정 C) ----
+
+# 날짜 방식마다 쓰는 칸. 다른 방식의 칸에 값이 오면 거절한다.
+_DATE_MODE_FIELDS = {
+    "calendar": ("year", "month", "day"),
+    "world": ("era", "year", "month", "day"),
+    "elapsed": ("reference_event", "elapsed_day"),
+}
+
+
+def _reads_back(scene: dict | None, states: list[dict], date_mode, names: list[str]) -> dict:
+    """값을 info 줄로 써서(format_info_lines) parse_info로 다시 읽은 결과. 검증 기준은 이것 하나다.
+
+    모델이 쓴 info를 읽는 규칙(날짜 방식·범위·2월 28일·자리 표시 값·상한·줄바꿈·`|`)을 그대로 써서,
+    다시 읽어 같은 값이 나오는 값만 받는다. 그래서 저장된 info를 다음 요청이 그대로 읽는다.
+    """
+    return parse_info("\n".join(format_info_lines(scene, states)), date_mode, names)
+
+
+def _edited_scene(
+    scene: dict | None, states: list[dict], request: SceneInfoUpdateRequest
+) -> tuple[dict, list[dict]]:
+    """지금 장면(그 응답까지의 누적 값)에 요청 값을 덮어쓴 새 장면. 규칙에 맞지 않으면 422.
+
+    빼거나 null인 칸은 지금 값을 둔다. 값을 지우는 방법은 없다.
+    """
+    scene = dict(scene or {})
+    states = [dict(state) for state in states]
+    date_mode = scene.get("date_mode")
+    names = [state["name"] for state in states if state["name"]]
+    if (date := request.date) is not None:
+        if date_mode is None or (date.mode is not None and date.mode != date_mode):
+            raise InfoDateModeMismatchError(field="date.mode", date_mode=date_mode)
+        allowed = _DATE_MODE_FIELDS[date_mode]
+        values = date.model_dump(include=set(DATE_FIELDS))
+        for key in DATE_FIELDS:
+            if key not in allowed and values[key] is not None:
+                raise InfoInvalidValueError(
+                    f"{date_mode} 날짜에는 {key} 값을 쓰지 않습니다.", field=f"date.{key}"
+                )
+        if date_mode == "elapsed" and values["reference_event"] is None:
+            # info 규칙 11: 기준 사건을 쓰지 않으면 지금 기준 사건을 그대로 둔다.
+            values["reference_event"] = scene.get("reference_event")
+        wanted = {"mode": date_mode, **values}
+        if _reads_back({"date_mode": date_mode, **values}, [], date_mode, [])["date"] != wanted:
+            raise InfoInvalidValueError(
+                "날짜가 비었거나 날짜 방식에 맞지 않습니다(달은 1~12, 2월은 28일까지).",
+                field="date",
+            )
+        scene.update({key: values[key] for key in allowed})
+    if (time := request.time) is not None:
+        wanted = {"hour": time.hour, "minute": time.minute}
+        if _reads_back(wanted, [], None, [])["time"] != wanted:
+            raise InfoInvalidValueError("시는 0~23, 분은 0~59입니다.", field="time")
+        scene.update(wanted)
+    if request.place is not None:
+        if _reads_back({"place": request.place}, [], None, [])["place"] != request.place:
+            raise InfoInvalidValueError(
+                "장소가 비었거나 자리 표시 값이거나 너무 깁니다(30자, 줄바꿈·앞뒤 공백 없이).",
+                field="place",
+            )
+        scene["place"] = request.place
+    by_name = {state["name"]: state for state in states if state["name"]}
+    seen: set[str] = set()
+    for index, item in enumerate(request.characters):
+        if item.name not in by_name:
+            raise InfoUnknownCharacterError(field=f"characters[{index}].name", name=item.name)
+        if item.name in seen:
+            raise InfoInvalidValueError(
+                "같은 캐릭터를 두 번 보냈습니다.", field=f"characters[{index}].name"
+            )
+        seen.add(item.name)
+        for key in ("clothing", "inner_thought"):
+            if (value := getattr(item, key)) is None:
+                continue
+            read = _reads_back(None, [{"name": item.name, key: value}], None, names)["characters"]
+            if not read or read[0][key] != value:
+                raise InfoInvalidValueError(
+                    "값이 비었거나 자리 표시 값이거나 너무 깁니다"
+                    "(착장 300자·속마음 100자, 줄바꿈·앞뒤 공백 없이).",
+                    field=f"characters[{index}].{key}",
+                )
+            by_name[item.name][key] = value
+    return scene, states
+
+
+def update_reply_info(
+    conn: Connection,
+    owner_id: int,
+    session_id: int,
+    message_id: int,
+    request: SceneInfoUpdateRequest,
+) -> SceneInfoUpdateResponse:
+    """최신 완료 AI 응답의 info를 이용자가 고친다(KAN-40 결정 C: 크랙·제타처럼 상태 블록 수정).
+
+    그 응답의 생성 원문에서 info 블록만 새 블록으로 바꾼다(없으면 맨 끝에 붙인다).
+    말풍선(메시지 부분)·상태·청구·시각은 그대로다. 새 블록은 그 응답까지의 누적 장면에 수정 값을
+    덮어쓴 전체 장면을 format_info_lines로 쓴 것이다. 다음 요청의 [현재 장면]과 턴 API
+    current_scene은 같은 _current_scene이 이 원문을 다시 읽어 만든다(따로 저장하는 장면 값 없음).
+
+    가장 뒤 완료 응답만 고칠 수 있다. 그래서 폼을 연 뒤 새 응답이 끝났으면 옛 응답 수정은 409가
+    되고, 새 응답이 만든 장면을 옛 폼 값이 덮어쓰지 않는다. 진행 중 생성이 있으면 409다(그 요청이
+    쓰는 장면과 어긋나지 않게). 전송·재시도·응답 저장과 같은 세션 행 잠금으로 줄 세운다.
+    """
+    with conn.transaction():
+        session = repository.get_session(conn, session_id, owner_id, lock=True)
+        if session is None:
+            raise SessionNotFoundError()
+        if session["read_only"]:
+            raise ConversationReadOnlyError()
+        _expire_stale(conn, session_id)
+        active = repository.get_active_generation(conn, session_id)
+        if active is not None:
+            raise GenerationInProgressError(
+                "응답이 끝난 뒤에 장면 정보를 고칠 수 있습니다.", active_generation_id=active["id"]
+            )
+        reply = repository.get_reply(conn, session_id, message_id)
+        if reply is None:
+            raise MessageNotFoundError()
+        if reply["role"] != "assistant":
+            raise InfoNotAssistantMessageError()
+        if reply["generation_status"] != "completed":
+            raise InfoReplyNotCompletedError()
+        latest_id = repository.get_latest_completed_reply_id(conn, session_id)
+        if latest_id != message_id:
+            raise InfoNotLatestReplyError(latest_message_id=latest_id)
+        session_characters = repository.list_session_characters(conn, session_id)
+        # 이 응답이 가장 뒤 완료 응답이므로 그 응답까지의 누적 장면 = 지금 current_scene이다.
+        scene, states = _current_scene(conn, session_id, session_characters)
+        scene, states = _edited_scene(scene, states, request)
+        text = replace_info(reply["text"], format_info_lines(scene, states))
+        if not repository.update_completed_text(conn, reply["generation_id"], text):
+            raise InfoReplyNotCompletedError()
+        names = _Names(conn, session_id)
+        scene, states = _current_scene(conn, session_id, session_characters)
+        return SceneInfoUpdateResponse(
+            message_id=message_id,
+            info=_info_response(text, names),
             current_scene=CurrentSceneResponse(**scene_view(scene, states)),
         )
 

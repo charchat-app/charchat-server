@@ -14,7 +14,7 @@ STRANGER = {"X-User-Id": "3"}
 
 def snapshot(db, session_id):
     """거절 요청 전후로 바뀌면 안 되는 값: 메시지·생성 기록·청구 대상·세션 행(선택 모델 포함)과
-    세션의 장면·캐릭터 상태·관계·호감도."""
+    세션의 장면·캐릭터 상태·관계·호감도, 생성 원문(CHAT-US-08 info가 들어 있다)."""
 
     def rows(table):
         row = "row_to_json(t)::text"
@@ -34,7 +34,8 @@ def snapshot(db, session_id):
              {rows("conversation_scene_states")} AS scene,
              {rows("conversation_character_states")} AS characters,
              {rows("conversation_relationships")} AS relationships,
-             {rows("conversation_affinities")} AS affinities""",
+             {rows("conversation_affinities")} AS affinities,
+             {rows("conversation_generations")} AS generation_rows""",
         {"s": session_id},
     ).fetchone()
 
@@ -58,9 +59,9 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
     own_session = start_session(client, story, intro, headers=intruder)
     # 세션 주인이 한 번 대화해 둔다(완료된 응답 1건, 모델 호출 1번).
     generation = send(client, session, [user_part("내 이야기")], request_id="owner-0001").json()
-    assert client.get(f"{GENERATIONS}/{generation['id']}", headers=PLAYER).json()["status"] == (
-        "completed"
-    )
+    completed = client.get(f"{GENERATIONS}/{generation['id']}", headers=PLAYER).json()
+    assert completed["status"] == "completed"
+    reply_id = completed["assistant_message"]["id"]
     model_calls = len(recorder.requests)
     before = snapshot(db, session)
     new_model = other_model_id(db, session)
@@ -87,6 +88,13 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
         ),
         "모델 변경": client.put(
             f"{SESSIONS}/{session}/model", json={"model_id": new_model}, headers=intruder
+        ),
+        # CHAT-US-08(KAN-40): 마지막 응답 장면 정보 수정.
+        # 검증을 통과하는 본문이라야 주인 확인까지 간다.
+        "장면 정보 수정": client.put(
+            f"{SESSIONS}/{session}/messages/{reply_id}/info",
+            json={"place": "끼어든 장소"},
+            headers=intruder,
         ),
     }
     # 롱 폴링도 기다리기 전에 주인을 확인한다(5초를 기다리지 않고 바로 거절).

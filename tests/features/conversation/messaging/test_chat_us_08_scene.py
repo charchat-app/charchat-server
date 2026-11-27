@@ -17,7 +17,7 @@ from messaging_helpers import (
 
 from app.features.conversation.messaging import providers, service, worker
 from app.features.conversation.messaging.info import parse_info, scene_view
-from app.features.conversation.messaging.prompt import build_messages
+from app.features.conversation.messaging.prompt import INFO_REMINDER, build_messages
 from app.features.conversation.messaging.providers import ProviderError
 
 START_SCENE = (
@@ -76,7 +76,7 @@ def turn(client, session, recorder, info, text, request_id, headers=PLAYER):
 def scene_block(request) -> str:
     """요청 마지막 user 메시지의 [현재 장면] 블록."""
     content = request.messages[-1]["content"]
-    return content.split("\n\n[이용자 입력]")[0].split("\n\n")[-1]
+    return "[현재 장면]\n" + content.split("[현재 장면]\n")[-1].split("\n\n")[0]
 
 
 def start_rows(db, session_id):
@@ -94,7 +94,9 @@ def test_chat_us_08_first_turn_uses_session_start_scene(client, db, session, rec
     turn(client, session, recorder, None, "안녕.", "turn-0001")
     (request,) = recorder.requests
     assert scene_block(request) == START_SCENE
-    assert request.messages[-1]["content"].endswith(f"{START_SCENE}\n\n[이용자 입력]\n[민서] 안녕.")
+    assert request.messages[-1]["content"].endswith(
+        f"{START_SCENE}\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 안녕."
+    )
 
 
 def test_chat_us_08_ac01_same_scene_info_keeps_current_scene(client, db, session, recorder):
@@ -370,7 +372,7 @@ def test_chat_us_08_provider_error_after_only_info_is_failed_and_retry_keeps_sce
     assert (
         recorder.requests[-1]
         .messages[-1]["content"]
-        .endswith(f"{PARK_SCENE}\n\n[이용자 입력]\n[민서] 카페로.")
+        .endswith(f"{PARK_SCENE}\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 카페로.")
     )
     assert generation_row(db, retried.json()["id"])["status"] == "completed"
     assert current_scene(client, session) == park

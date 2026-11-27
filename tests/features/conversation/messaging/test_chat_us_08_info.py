@@ -90,7 +90,68 @@ def test_chat_us_08_split_info_uses_last_block_and_ignores_only_space_and_tab_on
     text = f"```info\n장소: 앞\n```\n{BODY}  ```info\t\n장소: 뒤\n \t```  "
     body, info = split_info(text)
     assert info == "장소: 뒤"
-    assert body == f"```info\n장소: 앞\n```\n{BODY_LINES}"  # 앞 블록은 본문에 남는다(규칙 4)
+    # 규칙 5(11-27 개정): 앞 블록도 본문에서 빠지고, info는 마지막 블록이다.
+    assert body == BODY_LINES
+
+
+# ---- 규칙 4~6 개정(11-27): 블록을 모두 빼고 마지막 블록을 info로 ----
+
+
+def test_chat_us_08_split_info_removes_every_complete_block():
+    text = f"{BODY}```info\n장소: 앞\n```\n@도경: 그리고.\n```info\n장소: 뒤\n```"
+    body, info = split_info(text)
+    assert info == "장소: 뒤"
+    assert body == f"{BODY_LINES}\n@도경: 그리고."
+    assert "```" not in body and "장소" not in body
+
+
+def test_chat_us_08_split_info_block_then_text_then_unclosed_block():
+    # 마지막 블록이 닫히지 않았다(끝까지가 블록). 앞 블록과 사이 본문은 본문 규칙대로.
+    text = f"{BODY}```info\n장소: 앞\n```\n@나레이터: *잠시 뒤.*\n```info\n장소: 뒤\n시간: 19"
+    assert split_info(text) == (f"{BODY_LINES}\n@나레이터: *잠시 뒤.*", "장소: 뒤\n시간: 19")
+
+
+def test_chat_us_08_split_info_opener_inside_block_is_not_an_opener():
+    # 블록 안의 ```info 줄은 여는 줄이 아니다. 블록은 처음 닫는 줄에서 끝나고, 그 뒤 글은 본문이다.
+    text = f"{BODY}```info\n장소: 앞\n```info\n장소: 안\n```\n@도경: 끝."
+    body, info = split_info(text)
+    assert info == "장소: 앞\n```info\n장소: 안"
+    assert body == f"{BODY_LINES}\n@도경: 끝."
+    # 닫는 줄 없이 블록 안에 여는 줄이 또 있어도 끝까지 한 블록이다.
+    assert split_info(f"{BODY}```info\n장소: 앞\n```info\n장소: 뒤") == (
+        BODY_LINES,
+        "장소: 앞\n```info\n장소: 뒤",
+    )
+
+
+def test_chat_us_08_split_info_real_mid_reply_block_does_not_leak_into_bubbles():
+    # 실제 모델 65턴 실행에서 나온 모양: 응답 중간 info → '...' → 발화자 블록 → 맨 끝 info.
+    text = (
+        "@나레이터: *도경이 문을 닫는다.*\n"
+        "@도경: 들어와.\n"
+        "```info\n"
+        "날짜: 2026년 11월 27일\n시간: 19:30\n장소: 헌책방 온새미\n"
+        "[도경] 착장: 젖은 트렌치코트 | 속마음: 사건 생각뿐이다\n"
+        "```\n"
+        "...\n"
+        "@하린: 늦었네요.\n"
+        "@나레이터: *빗소리가 커진다.*\n"
+        "\n"
+        "```info\n"
+        "날짜: 2026년 11월 27일\n시간: 19:40\n장소: 헌책방 온새미\n"
+        "[도경] 착장: 젖은 트렌치코트 | 속마음: 하린이 신경 쓰인다\n"
+        "```"
+    )
+    body, info = split_info(text)
+    assert info.splitlines()[1] == "시간: 19:40"
+    parts = parse_assistant_text(body, NAMES)
+    assert [(p.character_name, p.body) for p in parts] == [
+        (None, "*도경이 문을 닫는다.*"),
+        ("도경", "들어와.\n..."),
+        ("하린", "늦었네요."),
+        (None, "*빗소리가 커진다.*"),
+    ]
+    assert all("```" not in p.body and "날짜" not in p.body for p in parts)
 
 
 @pytest.mark.parametrize(
