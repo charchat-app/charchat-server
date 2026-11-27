@@ -259,6 +259,11 @@ def _expression(ctx: PromptContext) -> str:
         "## 표현 설정",
         "아래 설정은 참고 예시보다 우선한다.",
         f"시점: {_choice(POINT_OF_VIEW, POINT_OF_VIEW_GUIDE, exp['point_of_view'])}",
+        *(
+            [f"  지문에서는 '{ctx.play_name}'라는 이름 대신 '너' 또는 '당신'으로 부른다."]
+            if exp["point_of_view"] == "second_person"
+            else []
+        ),
         f"  {POINT_OF_VIEW_COMMON}",
         f"시제: {_choice(TENSE, TENSE_GUIDE, exp['tense'])}",
         f"  {TENSE_COMMON}",
@@ -293,13 +298,29 @@ def _bonds(ctx: PromptContext) -> str:
     return "\n".join(lines)
 
 
+# 출력 형식 예시의 지문. 고른 시점·시제와 어긋나지 않게 고른다(AC06·AC07·AC12).
+FORMAT_EXAMPLE_NARRATION = {
+    ("first_person", "past"): ("나는 창밖을 바라보았다.", "나는 우산을 집어 들었다."),
+    ("first_person", "present"): ("나는 창밖을 바라본다.", "나는 우산을 집어 든다."),
+    ("second_person", "past"): (
+        "그가 창밖을 보다가 너를 돌아보았다.",
+        "그는 우산을 너에게 내밀었다.",
+    ),
+    ("second_person", "present"): (
+        "그가 창밖을 보다가 너를 돌아본다.",
+        "그는 우산을 너에게 내민다.",
+    ),
+    ("third_person", "past"): ("그는 창밖을 바라보았다.", "그는 우산을 집어 들었다."),
+    ("third_person", "present"): ("그는 창밖을 바라본다.", "그는 우산을 집어 든다."),
+}
+
+
 def _format_example(ctx: PromptContext) -> str:
-    past = {**DEFAULT_EXPRESSION, **(ctx.expression or {})}["tense"] != "present"
-    look, take, rain = (
-        ("창밖을 바라보았다.", "우산을 집어 들었다.", "빗소리가 커졌다.")
-        if past
-        else ("창밖을 바라본다.", "우산을 집어 든다.", "빗소리가 커진다.")
-    )
+    exp = {**DEFAULT_EXPRESSION, **(ctx.expression or {})}
+    tense = "present" if exp["tense"] == "present" else "past"
+    pov = exp["point_of_view"] if exp["point_of_view"] in POINT_OF_VIEW else "third_person"
+    look, take = FORMAT_EXAMPLE_NARRATION[(pov, tense)]
+    rain = "빗소리가 커졌다." if tense == "past" else "빗소리가 커진다."
     return f"@캐릭터 이름: *{look}*\n\n오늘은 비가 오네.\n\n*{take}*\n@{NARRATOR_TAG}: *{rain}*"
 
 

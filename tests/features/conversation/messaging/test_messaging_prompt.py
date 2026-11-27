@@ -236,6 +236,10 @@ def test_chat_us_06_ac06_point_of_view_sends_meaning_for_all_characters(code, la
 def test_chat_us_06_ac06_second_person_does_not_decide_user_actions():
     system = system_for(point_of_view="second_person")
     assert "이용자 캐릭터를 가리킬 때는 이름 대신 '너' 또는 '당신'으로 쓰며" in system
+    assert "지문에서는 '민서'라는 이름 대신 '너' 또는 '당신'으로 부른다." in system
+    # 출력 형식 예시도 2인칭 지문으로 보여 준다.
+    assert "*그가 창밖을 보다가 너를 돌아보았다.*" in system
+    assert "'민서'라는 이름 대신" not in system_for(point_of_view="third_person")
     assert "이용자 캐릭터의 행동·감정을 정하지 않는다" in system
 
 
@@ -249,7 +253,7 @@ def test_chat_us_06_ac07_tense_sends_meaning_and_matching_format_example(code, l
     assert TENSE_GUIDE[other] not in system
     assert "대사는 말하는 내용에 맞는 시제를 쓰고 서술 시제에 맞춰 바꾸지 않는다" in system
     # 출력 형식 예시도 고른 시제로 쓴다(예시가 설정과 어긋나지 않게).
-    assert f"*창밖을 {narration}.*" in system
+    assert f"*그는 창밖을 {narration}.*" in system
 
 
 def test_chat_us_06_ac06_ac07_ac11_ac13_default_expression_is_third_person_past_balanced_normal():
@@ -321,7 +325,10 @@ def test_chat_us_06_ac12_output_format_blank_line_between_narration_and_dialogue
     assert "대사는 큰따옴표 없이 일반 글로 쓴다" in fmt
     assert "항상 줄바꿈 두 번으로 빈 줄 하나를 둔다" in fmt
     assert "한 줄에 서술과 대사를 섞지 않는다" in fmt
-    assert "@캐릭터 이름: *창밖을 바라보았다.*\n\n오늘은 비가 오네.\n\n*우산을 집어 들었다.*" in fmt
+    assert (
+        "@캐릭터 이름: *그는 창밖을 바라보았다.*\n\n오늘은 비가 오네.\n\n*그는 우산을 집어 들었다.*"
+        in fmt
+    )
     assert '"' not in fmt.split("예시:")[1]
 
 
@@ -428,3 +435,7 @@ def test_chat_us_06_ac08_every_style_guide_matches_design_doc(code, phrase):
 
 def test_chat_us_06_ac11_balanced_guide_literal():
     assert "장면에 맞게 대사와 행동·상황 서술을 고르게 쓴다" in system_for(composition="balanced")
+
+
+def test_chat_us_06_ac06_first_person_format_example_uses_na():
+    assert "*나는 창밖을 바라보았다.*" in system_for(point_of_view="first_person")
