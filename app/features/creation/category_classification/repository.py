@@ -37,16 +37,61 @@ def mark_needed(connection, story_id):
     )
 
 
-def pending_ids(connection):
+def pending_ids(connection, max_attempts):
     # 최초 유효 결과가 없는 스토리는 최초 분류 경로에서 처리한다.
+    # 이번 확정 변경의 시도 예산이 끝난(영구 실패·상한 도달 후 종료) 스토리는 고르지 않는다.
+    # 상한에서 실행 중으로 남은 기록은 골라 공급자 호출 없이 중단 종료로 정리한다.
     return [
         row[0]
         for row in connection.execute(
             f"""SELECT s.id FROM stories s WHERE {PENDING}
                 AND EXISTS (SELECT 1 FROM story_categories sc WHERE sc.story_id = s.id)
-                ORDER BY s.id"""
+                AND NOT EXISTS (
+                    SELECT 1 FROM story_category_reclassification_attempts r
+                    WHERE r.story_id = s.id AND (r.failure_reason = 'permanent'
+                          OR (r.attempts >= %s AND r.failure_reason IS NOT NULL)))
+                ORDER BY s.id""",
+            (max_attempts,),
         )
     ]
+
+
+def reclassification_attempt(connection, story_id):
+    """(시도 수, 예약 토큰, 실패 사유) 또는 None(이번 확정 변경에서 아직 시도 없음)."""
+    return connection.execute(
+        """SELECT attempts, attempt_token, failure_reason
+           FROM story_category_reclassification_attempts WHERE story_id=%s""",
+        (story_id,),
+    ).fetchone()
+
+
+def reserve_reclassification(connection, story_id, token):
+    """공급자 호출 전에 시도 하나를 센다. 새 예약 토큰을 쓰고 올린 시도 번호를 돌려준다."""
+    return connection.execute(
+        """INSERT INTO story_category_reclassification_attempts AS r
+               (story_id, attempts, attempt_token)
+           VALUES (%s, 1, %s)
+           ON CONFLICT (story_id) DO UPDATE
+           SET attempts = r.attempts + 1, attempt_token = EXCLUDED.attempt_token,
+               failure_reason = NULL, updated_at = clock_timestamp()
+           RETURNING attempts""",
+        (story_id, token),
+    ).fetchone()[0]
+
+
+def finish_reclassification(connection, story_id, reason):
+    connection.execute(
+        """UPDATE story_category_reclassification_attempts
+           SET failure_reason=%s, updated_at=clock_timestamp() WHERE story_id=%s""",
+        (reason, story_id),
+    )
+
+
+def reset_reclassification(connection, story_id):
+    """새 확정 변경 또는 성공 반영으로 이번 시도 기록을 지운다(다음 변경은 예산을 새로 쓴다)."""
+    connection.execute(
+        "DELETE FROM story_category_reclassification_attempts WHERE story_id=%s", (story_id,)
+    )
 
 
 def category_codes(connection):

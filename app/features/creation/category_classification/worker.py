@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from threading import Event
 from time import monotonic
 from typing import Literal
+from uuid import UUID, uuid4
 
 import psycopg
 
@@ -17,6 +18,8 @@ INTERVAL_SECONDS = 3600
 # 이 DB의 카테고리 배치만 직렬화한다. 스토리 행 잠금과는 별개다.
 CYCLE_LOCK = 0x43415409
 MAX_FIRST_ATTEMPTS = 3
+# 확정 변경 하나당 재분류 유료 시도 상한(재시작한 주기 포함 누적).
+MAX_RECLASSIFY_ATTEMPTS = 3
 
 
 class RetryableClassificationError(Exception):
@@ -72,16 +75,110 @@ def _infer(
         return None
 
 
-def _save_if_current(conn, story_id, snapshot, codes, *, first_only=False) -> bool:
-    """스토리 행을 잠근 뒤 입력이 추론 때와 같을 때만 결과를 통째로 바꾼다. 아니면 False."""
-    with conn.transaction():
-        if not repository.lock_pending(conn, story_id, first_only=first_only):
-            return False
-        # 모든 확정 기본 정보/캐릭터 쓰기가 같은 스토리 행을 먼저 잠근다.
-        if repository.read_inputs(conn, story_id, pending_only=True) != snapshot:
-            return False
-        repository.save_result(conn, story_id, codes)
-    return True
+ReclassifyOutcome = Literal["completed", "stale", "failed", "stopped"]
+
+
+@dataclass(frozen=True)
+class _Reservation:
+    attempt: int
+    token: UUID
+    snapshot: tuple
+
+
+def _reserve_reclassification(
+    conn, story_id, should_stop: StopCheck | None, previous: _Reservation | None
+):
+    """재분류 시도 하나를 기록한다. 끝난 결과(ReclassifyOutcome) 또는 _Reservation을 돌려준다.
+
+    확정 저장과 같은 스토리 행 잠금 안에서 시도 기록·입력을 함께 읽는다. previous가 있으면
+    즉시 재시도이며, 그 사이 기록(토큰)이나 입력이 바뀌었으면 옛 입력을 다시 보내지 않는다.
+    마지막 확인(should_stop)은 시도 기록 직후 같은 트랜잭션 안에서 하고, 멈추거나 예외가 나면
+    롤백으로 기록이 사라진다(_reserve_attempt와 같은 규약).
+    """
+    probe_error: Exception | None = None
+    try:
+        with conn.transaction():
+            if not repository.lock_pending(conn, story_id):
+                return "stale"
+            row = repository.reclassification_attempt(conn, story_id)
+            if previous is not None and (
+                row is None or row[1] != previous.token or row[2] != "temporary"
+            ):
+                return "stale"
+            if row is not None:
+                attempts, _, reason = row
+                if reason == "permanent":
+                    return "failed"
+                if attempts >= MAX_RECLASSIFY_ATTEMPTS:
+                    # 상한에서 실행 중으로 남은 시도(비정상 종료)는 호출 없이 종료로 정리한다.
+                    if reason is None:
+                        repository.finish_reclassification(conn, story_id, "interrupted")
+                    return "failed"
+                # 상한 전 실행 중 기록은 끝나지 못한 시도다. 이미 센 시도로 두고 다음 시도로 간다.
+            snapshot = repository.read_inputs(conn, story_id, pending_only=True)
+            if previous is not None and snapshot != previous.snapshot:
+                return "stale"
+            token = uuid4()
+            attempt = repository.reserve_reclassification(conn, story_id, token)
+            try:
+                if should_stop is not None and should_stop():
+                    raise _DispatchCancelled
+            except Exception as exc:
+                probe_error = exc
+                raise
+    except Exception as exc:
+        if probe_error is None:
+            raise
+        if isinstance(probe_error, _DispatchCancelled):
+            return "stopped"
+        if exc is probe_error:
+            raise
+        raise probe_error from None
+    return _Reservation(attempt, token, snapshot)
+
+
+def _reclassify(
+    conn, story_id, classify, known_codes, should_stop: StopCheck | None
+) -> ReclassifyOutcome:
+    """확정 변경 하나에 대해 최대 MAX_RECLASSIFY_ATTEMPTS번(재시작 포함 누적) 유료 시도를 한다.
+
+    RetryableClassificationError만 같은 주기 안에서 바로 재시도한다. 영구 실패·잘못된 출력은
+    종료로 기록해 이후 주기에서 건너뛴다. 실패해도 분류 필요 표시와 기존 연결은 그대로 둔다.
+    추론은 트랜잭션·행 잠금 밖에서 하고, 반영은 스토리 행을 잠근 뒤 입력과 예약 토큰이 모두
+    예약 때와 같을 때만 한다. 관련 확정 변경은 기록을 지우므로 토큰이 달라진다(ABA 포함).
+    """
+    reservation: _Reservation | None = None
+    while True:
+        if reservation is not None and should_stop is not None and should_stop():
+            return "stopped"
+        reserved = _reserve_reclassification(conn, story_id, should_stop, reservation)
+        if isinstance(reserved, str):
+            return reserved
+        reservation = reserved
+        try:
+            codes = _infer(classify, reservation.snapshot, known_codes, propagate_retryable=True)
+            reason = "permanent"
+        except RetryableClassificationError:
+            codes, reason = None, "temporary"
+
+        with conn.transaction():
+            pending = repository.lock_pending(conn, story_id)
+            row = repository.reclassification_attempt(conn, story_id)
+            ours = row is not None and row[1] == reservation.token
+            current = repository.read_inputs(conn, story_id, pending_only=True)
+            if not pending or not ours or current != reservation.snapshot:
+                # 관련 확정 변경이 기록을 지웠다면 새 변경은 다음 주기에 새 예산으로 처리한다.
+                # 서비스 밖 변경으로 입력만 달라졌다면 이 시도를 결과 없는 시도로 남긴다.
+                if ours:
+                    repository.finish_reclassification(conn, story_id, "interrupted")
+                return "stale"
+            if codes is not None:
+                repository.save_result(conn, story_id, codes)
+                repository.reset_reclassification(conn, story_id)
+                return "completed"
+            repository.finish_reclassification(conn, story_id, reason)
+            if reason == "permanent" or reservation.attempt >= MAX_RECLASSIFY_ATTEMPTS:
+                return "failed"
 
 
 def run_cycle(
@@ -89,35 +186,31 @@ def run_cycle(
 ) -> CycleReport:
     """한 주기의 대상을 한 번만 수집하고, 추론 동안 스토리 행 잠금을 잡지 않는다.
 
-    should_stop은 스토리마다 분류 전에 확인한다. True면 남은 스토리를 다음 주기로 넘긴다.
+    should_stop은 스토리마다, 그리고 즉시 재시도 전에 확인하며 시도 기록 직후 같은 트랜잭션
+    안에서 한 번 더 확인한다. True면 남은 스토리·시도를 다음 주기로 넘긴다(남은 예산 유지).
     """
     with psycopg.connect(database_url, autocommit=True) as conn:
         if not conn.execute("SELECT pg_try_advisory_lock(%s)", (CYCLE_LOCK,)).fetchone()[0]:
             return CycleReport(busy=True)
-        # 연결 종료 시 세션 잠금도 풀린다. 추론은 트랜잭션 밖에서 실행한다.
-        story_ids = repository.pending_ids(conn)
+        # 연결 종료 시 세션 잠금도 풀린다. 이 잠금 덕분에 주기 시작 시 실행 중으로 남은 재분류
+        # 기록은 끝나지 못한 시도다. 추론은 트랜잭션 밖에서 실행한다.
+        story_ids = repository.pending_ids(conn, MAX_RECLASSIFY_ATTEMPTS)
         known_codes = repository.category_codes(conn)
         report = CycleReport(selected=len(story_ids))
         for story_id in story_ids:
             if should_stop is not None and should_stop():
                 report.stopped = True
                 break
-            snapshot = repository.read_inputs(conn, story_id, pending_only=True)
-            if snapshot is None:
-                report.stale += 1
-                continue
-            # 입력을 읽는 동안 들어온 종료 요청은 공급자 호출 전에 다시 확인한다.
-            if should_stop is not None and should_stop():
+            outcome = _reclassify(conn, story_id, classify, known_codes, should_stop)
+            if outcome == "stopped":
                 report.stopped = True
                 break
-            codes = _infer(classify, snapshot, known_codes)
-            if codes is None:
-                report.failed += 1
-                continue
-            if _save_if_current(conn, story_id, snapshot, codes):
+            if outcome == "completed":
                 report.completed += 1
-            else:
+            elif outcome == "stale":
                 report.stale += 1
+            else:
+                report.failed += 1
         return report
 
 

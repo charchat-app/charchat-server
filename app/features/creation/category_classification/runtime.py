@@ -26,6 +26,9 @@ HOURLY_INTERVAL_SECONDS = worker.INTERVAL_SECONDS
 # CLI 종료 요청을 확인하는 최대 간격(초).
 STOP_POLL_SECONDS = 1.0
 JOBS_TABLE = "story_first_classification_jobs"
+RECLASSIFICATION_TABLE = "story_category_reclassification_attempts"
+# 시작 시 모두 있어야 하는 운영 기록 표. 각각 별도 마이그레이션으로 만든다.
+REQUIRED_TABLES = (JOBS_TABLE, RECLASSIFICATION_TABLE)
 # 리더 연결 작업의 상한. 연결이 끊기면 실행기는 종료한다.
 LEADER_CONNECT_KWARGS = {
     "autocommit": True,
@@ -88,7 +91,14 @@ class LeaderConnectionLost(RuntimeError):
 
 
 class MissingJobsTable(RuntimeError):
-    """최초 분류 작업 테이블이 없다. 마이그레이션 전 DB에서 계속 폴링하지 않고 종료한다."""
+    """최초 분류 작업 또는 재분류 시도 기록 테이블이 없다.
+
+    마이그레이션 전 DB에서 계속 폴링하지 않고 종료한다. table에 빠진 표 이름을 담는다.
+    """
+
+    def __init__(self, table: str) -> None:
+        super().__init__(f"{table} table is missing")
+        self.table = table
 
 
 def _next_deadline(deadline: float, interval: float, now: float) -> float:
@@ -124,9 +134,11 @@ def _stop_check(stop: StopSignal, leader: psycopg.Connection) -> worker.StopChec
 
 
 def _require_jobs_table(conn: psycopg.Connection) -> None:
-    row = conn.execute("SELECT to_regclass(%s)", (JOBS_TABLE,)).fetchone()
-    if row is None or row[0] is None:
-        raise MissingJobsTable(f"{JOBS_TABLE} table is missing")
+    """최초 작업 표와 재분류 시도 기록 표가 모두 있어야 시작한다."""
+    for table in REQUIRED_TABLES:
+        row = conn.execute("SELECT to_regclass(%s)", (table,)).fetchone()
+        if row is None or row[0] is None:
+            raise MissingJobsTable(table)
 
 
 def _recover(
@@ -258,8 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         if not run_worker(settings.database_url, classify, stop):
             logger.error("Another category scheduler already holds the lock for this database")
             return 2
-    except MissingJobsTable:
-        logger.error("Category scheduler requires the %s table; apply the migration", JOBS_TABLE)
+    except MissingJobsTable as exc:
+        logger.error("Category scheduler requires the %s table; apply the migration", exc.table)
         return 1
     except LeaderConnectionLost:
         logger.error("Category scheduler leader connection was lost; exiting")

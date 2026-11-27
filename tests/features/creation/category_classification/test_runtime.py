@@ -381,9 +381,11 @@ def test_leader_and_worker_sessions_lost_after_reservation_restores_attempt_CREA
     assert state(db, story) == {"pending": False, "categories": ["modern"]}
 
 
-def test_worker_rejects_unmigrated_target_CREATE_US_09_AC02(db_url):
+@pytest.mark.parametrize("table", runtime.REQUIRED_TABLES)
+def test_worker_rejects_unmigrated_target_CREATE_US_09_AC02(db_url, table):
     with psycopg.connect(db_url, row_factory=tuple_row) as conn:
         with conn.transaction(force_rollback=True):
-            conn.execute("DROP TABLE story_first_classification_jobs")
-            with pytest.raises(runtime.MissingJobsTable):
+            conn.execute(f"DROP TABLE {table}")
+            with pytest.raises(runtime.MissingJobsTable) as raised:
                 runtime._require_jobs_table(conn)
+    assert raised.value.table == table

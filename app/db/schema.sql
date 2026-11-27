@@ -212,6 +212,21 @@ CREATE TABLE story_first_classification_jobs (
 CREATE INDEX story_first_classification_jobs_queued_idx
     ON story_first_classification_jobs (story_id) WHERE status IN ('pending', 'running');
 
+-- CREATE-US-09-AC02/AC07: 시간 재분류의 확정 변경당 시도 기록(운영 기록). 스토리당 한 행.
+-- 최초 작업 기록·분류 시각·노출 상태와 별개다. 행이 없으면 이번 확정 변경의 시도가 아직 없다.
+-- attempts는 공급자 호출 전에 올린다(멈춘 시도 포함). 상한은 worker.MAX_RECLASSIFY_ATTEMPTS(3).
+-- attempt_token은 시도 예약마다 새로 쓰며, 반영·재시도 직전에 예약 때 값과 비교한다.
+-- failure_reason이 NULL이면 실행 중(또는 비정상 종료), 'permanent'이거나 상한에서 끝나면 종료다.
+-- 실제 반영된 관련 확정 변경(story_basic 경로)과 성공 반영이 같은 트랜잭션에서 행을 지운다.
+-- 배포 DB에는 app/db/migrations/create_us09_reclassification_attempts.sql로 만든다.
+CREATE TABLE story_category_reclassification_attempts (
+    story_id bigint PRIMARY KEY REFERENCES stories(id),
+    attempts integer NOT NULL CHECK (attempts BETWEEN 1 AND 3),
+    attempt_token uuid NOT NULL UNIQUE,
+    failure_reason text CHECK (failure_reason IN ('permanent', 'temporary', 'interrupted')),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 -- 서비스 구현 의무 (SQL만으로 완료되지 않음):
 -- 소유권 확인, 스토리 행 잠금 규약, 스토리/캐릭터/태그를 한 트랜잭션으로 저장.
 -- 완성 저장: 필수값, 캐릭터 1~10명, 기본 정보+캐릭터 이름/상세 합산 3000자,
