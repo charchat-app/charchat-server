@@ -51,7 +51,8 @@ POINT_OF_VIEW_GUIDE = {
     "first_person": (
         "지문은 서술하는 캐릭터가 자신을 '나'로 표현한다. 캐릭터 블록의 지문은 그 블록 캐릭터의 "
         "'나'로 쓰고, 여러 인물의 관점을 다룰 때는 지금 누구의 '나'인지 구별되게 쓴다. "
-        "특정 주인공 한 명을 따로 정하지 않는다."
+        "특정 주인공 한 명을 따로 정하지 않는다. 1인칭에서는 지문을 되도록 캐릭터 블록 안에 쓰고, "
+        "나레이터 블록은 어느 캐릭터의 '나'도 아닌 짧은 장면 전환에만 쓴다."
     ),
     "second_person": (
         "지문에서 이용자 캐릭터를 가리킬 때는 이름 대신 '너' 또는 '당신'으로 쓰며 "
@@ -78,7 +79,7 @@ COMPOSITION_GUIDE = {
     "보조한다. 목표 비율은 대사 70 : 서술 30이다.",
     "action": (
         "행동·표정·움직임·장면 변화로 장면을 이끌고 대사는 그 흐름에 맞춰 둔다. "
-        "목표 비율은 서술 70 : 대사 30이다."
+        "목표 비율은 대사 30 : 서술 70이다."
     ),
     "balanced": "장면에 맞게 대사와 행동·상황 서술을 고르게 "
     "쓴다. 목표 비율은 대사 50 : 서술 50이다.",
@@ -130,7 +131,7 @@ STYLE_GUIDE = {
         "기존 갈등이나 인물 성격을 지우지는 않는다."
     ),
 }
-STYLE_COMMON = "문체는 서술의 분위기만 조절한다. 캐릭터의 성격·고유 말투는 그대로 둔다."
+STYLE_COMMON = "문체를 적용해도 캐릭터의 성격·고유 말투는 바꾸지 않는다."
 DEFAULT_EXPRESSION = {
     "point_of_view": "third_person",
     "tense": "past",
@@ -219,9 +220,10 @@ def _style_lines(expression: dict) -> list[str]:
             if code in STYLE_GUIDE
         ]
         return [*lines, f"  {STYLE_COMMON}"]
-    if mode == "custom" and expression.get("custom_style"):
+    custom = (expression.get("custom_style") or "").strip()
+    if mode == "custom" and custom:
         # 제작자가 직접 쓴 지침만 보낸다. 기본 제공 가이드를 섞지 않는다(AC09).
-        return [f"문체: {expression['custom_style']}", f"  {STYLE_COMMON}"]
+        return ["문체(제작자 지침):", custom, f"  {STYLE_COMMON}"]
     return []
 
 
@@ -292,7 +294,7 @@ def _bonds(ctx: PromptContext) -> str:
 
 
 def _format_example(ctx: PromptContext) -> str:
-    past = (ctx.expression or {}).get("tense", DEFAULT_EXPRESSION["tense"]) != "present"
+    past = {**DEFAULT_EXPRESSION, **(ctx.expression or {})}["tense"] != "present"
     look, take, rain = (
         ("창밖을 바라보았다.", "우산을 집어 들었다.", "빗소리가 커졌다.")
         if past

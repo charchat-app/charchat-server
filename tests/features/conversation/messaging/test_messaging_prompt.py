@@ -181,7 +181,7 @@ def test_kan16_ac29_chat_us_02_ac11_second_request_rereads_latest_saved_settings
         "세계관: 새 세계관",
         "#느와르 #추리",
         "- 도경: 다정한 형사",
-        "문체: 하드보일드",
+        "문체(제작자 지침):\n하드보일드",
         "응답 길이: 길게",
         "- 도경 → 민서: 호감도 42",
     ):
@@ -252,7 +252,7 @@ def test_chat_us_06_ac07_tense_sends_meaning_and_matching_format_example(code, l
     assert f"*창밖을 {narration}.*" in system
 
 
-def test_chat_us_06_default_expression_is_third_person_past_balanced_normal():
+def test_chat_us_06_ac06_ac07_ac11_ac13_default_expression_is_third_person_past_balanced_normal():
     system = system_for()
     for expected in ("시점: 3인칭", "시제: 과거형", "대화 구성: 밸런스형", "응답 길이: 보통"):
         assert expected in system
@@ -266,7 +266,9 @@ def test_chat_us_06_ac08_two_preset_styles_send_both_guides_only():
     for code, guide in STYLE_GUIDE.items():
         if code not in ("lyrical", "tense"):
             assert guide not in system
-    assert "캐릭터의 성격·고유 말투는 그대로 둔다" in system
+    assert "문체를 적용해도 캐릭터의 성격·고유 말투는 바꾸지 않는다" in system
+    # 문체를 서술에만 묶지 않는다(설레는·섬세한 가이드는 대사·말끝도 다룬다).
+    assert "서술의 분위기만" not in system
 
 
 @pytest.mark.parametrize("code", sorted(STYLE_GUIDE))
@@ -278,7 +280,8 @@ def test_chat_us_06_ac09_custom_style_sends_creator_text_without_preset_guides()
     system = system_for(
         style_mode="custom", preset_styles=["lyrical"], custom_style="짧은 문장, 건조한 하드보일드"
     )
-    assert "문체: 짧은 문장, 건조한 하드보일드" in system
+    assert "문체(제작자 지침):\n짧은 문장, 건조한 하드보일드\n" in system
+    assert "  문체를 적용해도 캐릭터의 성격·고유 말투는 바꾸지 않는다." in system
     for guide in STYLE_GUIDE.values():
         assert guide not in system
     assert "서정적인" not in system
@@ -301,7 +304,7 @@ def test_chat_us_06_ac10_no_style_adds_no_style_guide():
     [
         ("dialogue", "대사 중심", "대사 70 : 서술 30"),
         ("balanced", "밸런스형", "대사 50 : 서술 50"),
-        ("action", "행동 중심", "서술 70 : 대사 30"),
+        ("action", "행동 중심", "대사 30 : 서술 70"),
     ],
 )
 def test_chat_us_06_ac11_composition_sends_guide_and_soft_ratio(code, label, ratio):
@@ -364,7 +367,7 @@ def test_chat_us_06_ac01_ac03_ac04_ac05_guardrail_rules():
     assert "상대마다 맞는 호칭·어조·거리감·태도로 말한다" in guide
 
 
-def test_chat_us_06_user_written_character_lines_are_not_repeated():
+def test_chat_us_06_ac06_user_written_character_lines_are_not_repeated():
     """이용자가 캐릭터·나레이터 줄을 대신 쓰면 이미 일어난 전개로 보고 되풀이하지 않는다."""
     messages = build_messages(
         minimal_context(
@@ -379,3 +382,24 @@ def test_chat_us_06_user_written_character_lines_are_not_repeated():
     assert "이용자가 그 인물을 대신 써서 이미 정한" in guide
     assert "되풀이하지 말고, 그 바로 다음부터 이어 쓴다" in guide
     assert messages[1]["content"].endswith("[민서] 같이 가자\n[도경] 그래, 가자.")
+
+
+def test_chat_us_06_guides_pin_the_design_meaning_literally():
+    """가이드 상수를 비우거나 뜻을 바꾸면 실패하도록 핵심 문구를 그대로 고정한다(AC06·07·08·11)."""
+    first = system_for(point_of_view="first_person")
+    assert "지문은 서술하는 캐릭터가 자신을 '나'로 표현한다" in first
+    assert "지금 누구의 '나'인지 구별되게 쓴다" in first
+    assert "나레이터 블록은 어느 캐릭터의 '나'도 아닌 짧은 장면 전환에만 쓴다" in first
+    third = system_for(point_of_view="third_person")
+    assert "인물 바깥에서 등장 캐릭터들의 행동과 상황을 이름이나 그·그녀 같은 대명사로" in third
+    assert "행동·상황 서술을 과거형(~했다)으로 쓴다. 예: 물컵을 내밀었다." in system_for(
+        tense="past"
+    )
+    assert "행동·상황 서술을 현재형(~한다)으로 쓴다. 예: 물컵을 내민다." in system_for(
+        tense="present"
+    )
+    styles = system_for(style_mode="preset", preset_styles=["romantic", "warm"])
+    assert "설정에 없는 호감이나 연애 관계를 사실로 확정하지는 않는다" in styles
+    assert "기존 갈등이나 인물 성격을 지우지는 않는다" in styles
+    assert "대사로 장면을 이끌고 행동·상황 서술은 보조한다" in system_for(composition="dialogue")
+    assert "행동·표정·움직임·장면 변화로 장면을 이끌고" in system_for(composition="action")
