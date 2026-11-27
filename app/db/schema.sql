@@ -30,6 +30,7 @@ CREATE TABLE stories (
     save_state text NOT NULL DEFAULT 'draft'
         CHECK (save_state IN ('draft', 'private', 'public')),
     saved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    category_classification_needed boolean NOT NULL DEFAULT false,
     deleted_at timestamptz
 );
 -- owner_id는 제작자 계정 식별값. 실제 계정 FK/인증은 계정 모델 설계 후 연결한다.
@@ -81,7 +82,16 @@ BEGIN
            IS DISTINCT FROM 'v1' THEN
         NEW := jsonb_populate_record(NEW, '{"rating_pass_digest": null}'::jsonb);
     END IF;
-    IF to_jsonb(NEW) - review_keys = to_jsonb(OLD) - review_keys
+    -- saved_at 보존 예외는 아래 순서로 판정한다(위 지문 정리 뒤의 NEW 기준). 각 예외는 그 UPDATE가
+    -- 해당 컬럼만 바꿨을 때만 적용하며, 두 종류가 한 UPDATE에 섞이면 saved_at을 새로 쓴다.
+    -- 1) CREATE-US-09: 카테고리 분류 대상 표시(category_classification_needed)만 바뀐 UPDATE.
+    -- 2) CREATE-US-08: 검토 메타데이터(review_keys)만 실제로 바뀐 UPDATE.
+    IF (to_jsonb(NEW) -> 'category_classification_needed')
+           IS DISTINCT FROM (to_jsonb(OLD) -> 'category_classification_needed')
+       AND (to_jsonb(NEW) - 'category_classification_needed')
+           IS NOT DISTINCT FROM (to_jsonb(OLD) - 'category_classification_needed') THEN
+        NEW.saved_at := OLD.saved_at;
+    ELSIF to_jsonb(NEW) - review_keys = to_jsonb(OLD) - review_keys
        AND to_jsonb(NEW) - 'saved_at' IS DISTINCT FROM to_jsonb(OLD) - 'saved_at' THEN
         NEW.saved_at := OLD.saved_at;
     ELSE
@@ -159,6 +169,63 @@ CREATE INDEX story_tags_tag_story_idx ON story_tags(tag_id, story_id);
 -- 같은 스토리/태그 연결은 PK로 하나뿐이다.
 -- 비공개/임시 저장에도 태그 연결은 유지하며 공개 사용 수에서만 제외한다.
 -- 후보 매칭·동률 정렬·0개 태그 노출 여부는 미결이다.
+
+-- CREATE-US-09: 카테고리 기준 데이터와 스토리 연결. 원격 DB의 기존 정의와 같은 모양으로 맞춘다.
+CREATE TABLE categories (
+    code text PRIMARY KEY,
+    name text NOT NULL UNIQUE
+);
+INSERT INTO categories (code, name) VALUES
+    ('bl', 'BL'),
+    ('gl', 'GL'),
+    ('historical_martial', '시대/무협'),
+    ('horror_mystery', '공포/미스테리'),
+    ('modern', '일상/현대'),
+    ('romance', '로맨스'),
+    ('romance_fantasy', '로판'),
+    ('sf_fantasy', 'SF/판타지'),
+    ('simulation_rpg', '시뮬레이션/RPG');
+
+CREATE TABLE story_categories (
+    story_id bigint NOT NULL REFERENCES stories(id),
+    category_code text NOT NULL REFERENCES categories(code),
+    PRIMARY KEY (story_id, category_code)
+);
+-- 분류 작업이 스토리 행을 FOR UPDATE로 잠근 트랜잭션 안에서 한 스토리의 연결을 통째로 바꾼다.
+-- 분류 실패·출력 오류·분류 중 확정본 변경 시에는 기존 연결을 그대로 둔다.
+
+-- CREATE-US-09-AC02: 최초 분류 작업 기록(transactional outbox). 스토리당 한 행.
+-- 최초 등록 트랜잭션에서 분류 필요 표시와 함께 넣고, 커밋 뒤에만 작업을 맡긴다.
+-- attempts는 공급자 호출 전에 올린다(멈춘 시도 포함). 상한은 worker.MAX_FIRST_ATTEMPTS(3).
+-- failure_reason은 마지막 미완료 사유의 고정 값만 담는다. 입력·응답·예외 문구는 넣지 않는다.
+-- 배포 DB에는 app/db/migrations/create_us09_first_classification_jobs.sql로 만든다.
+CREATE TABLE story_first_classification_jobs (
+    story_id bigint PRIMARY KEY REFERENCES stories(id),
+    status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 3),
+    failure_reason text
+        CHECK (failure_reason IN ('temporary', 'permanent', 'interrupted', 'stale', 'ineligible')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX story_first_classification_jobs_queued_idx
+    ON story_first_classification_jobs (story_id) WHERE status IN ('pending', 'running');
+
+-- CREATE-US-09-AC02/AC07: 시간 재분류의 확정 변경당 시도 기록(운영 기록). 스토리당 한 행.
+-- 최초 작업 기록·분류 시각·노출 상태와 별개다. 행이 없으면 이번 확정 변경의 시도가 아직 없다.
+-- attempts는 공급자 호출 전에 올린다(멈춘 시도 포함). 상한은 worker.MAX_RECLASSIFY_ATTEMPTS(3).
+-- attempt_token은 시도 예약마다 새로 쓰며, 반영·재시도 직전에 예약 때 값과 비교한다.
+-- failure_reason이 NULL이면 실행 중(또는 비정상 종료), 'permanent'이거나 상한에서 끝나면 종료다.
+-- 실제 반영된 관련 확정 변경(story_basic 경로)과 성공 반영이 같은 트랜잭션에서 행을 지운다.
+-- 배포 DB에는 app/db/migrations/create_us09_reclassification_attempts.sql로 만든다.
+CREATE TABLE story_category_reclassification_attempts (
+    story_id bigint PRIMARY KEY REFERENCES stories(id),
+    attempts integer NOT NULL CHECK (attempts BETWEEN 1 AND 3),
+    attempt_token uuid NOT NULL UNIQUE,
+    failure_reason text CHECK (failure_reason IN ('permanent', 'temporary', 'interrupted')),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
 
 -- 서비스 구현 의무 (SQL만으로 완료되지 않음):
 -- 소유권 확인, 스토리 행 잠금 규약, 스토리/캐릭터/태그를 한 트랜잭션으로 저장.

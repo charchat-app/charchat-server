@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # 로컬도 .env에 고정 키를 넣기를 권장한다.
     auth_jwt_secret: SecretStr = SecretStr("")
     auth_jwt_issuer: str = Field(default="charchat", min_length=1)
+    # CREATE-US-09 독립 분류 실행기(python -m ...category_classification.runtime)만 읽는다.
+    # 둘 다 비어 있으면 실행기가 시작하지 않는다. API 서버에는 연결하지 않는다.
+    category_openrouter_model: str | None = None
+    category_openrouter_api_key: SecretStr | None = None
 
     @model_validator(mode="after")
     def _ephemeral_jwt_secret_for_local(self) -> "Settings":
