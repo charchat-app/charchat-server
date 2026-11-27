@@ -411,6 +411,8 @@ def test_old_request_without_presets_replays_recorded_response_CREATE_US_05_AC08
                         "images",
                         "preserve_scene",
                         "finalize_auto_request_id",
+                        "requested_rating",
+                        "finalize_rating_working_copy_at",
                     },
                 ),
             },
@@ -428,7 +430,16 @@ def test_old_request_without_presets_replays_recorded_response_CREATE_US_05_AC08
         old_response = {
             k: v
             for k, v in row[1].items()
-            if k not in ("presets", "presets_pending", "finalize_auto_request_id")
+            if k
+            not in (
+                "presets",
+                "presets_pending",
+                "finalize_auto_request_id",
+                "requested_rating",
+                "effective_rating",
+                "rating_review_status",
+                "rating_only_working_copy",
+            )
         }
         connection.execute(
             "UPDATE creation_write_requests SET response=%s WHERE owner_id=%s AND request_id=%s",

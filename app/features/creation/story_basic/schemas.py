@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -86,6 +86,12 @@ class StorySummaryResponse(BaseModel):
     save_state: str = Field(description="draft·private·public")
     title: str | None
     saved_at: datetime
+    # CREATE-US-08-AC12(제작자 목록): 저장본의 실제 적용 등급과 검토 상태. 제작자 본인 목록에만
+    # 싣는다. 임시 저장 중인 등급 선택은 편집 화면 조회(/creation)에서 본다.
+    effective_rating: Literal["SAFE", "UNSAFE"] = Field(description="실제 적용 등급")
+    rating_review_status: Literal["not_reviewed", "reviewing", "completed", "failed"] = Field(
+        description="등급 검토 상태"
+    )
 
 
 class CharacterResponse(BaseModel):

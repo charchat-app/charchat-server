@@ -45,6 +45,22 @@ def preset_image_ids(document: dict | None) -> set[int]:
     return {p["image_id"] for p in staged_presets(document) or () if p.get("image_id") is not None}
 
 
+REQUESTED_RATING = "requested_rating"
+
+
+def staged_requested_rating(document: dict | None) -> str | None:
+    """CREATE-US-08-AC13: 공통 문서에 임시 저장한 등급 선택. 없으면 None(저장본 선택을 쓴다)."""
+    return (document or {}).get(REQUESTED_RATING)
+
+
+RATING_ONLY = "rating_only"
+
+
+def is_rating_only(document: dict | None) -> bool:
+    """CREATE-US-08-AC13: 공통 문서가 등급 선택만 담은 임시 저장으로만 쓰였다는 내부 표시."""
+    return (document or {}).get(RATING_ONLY) is True
+
+
 STAGED_CHARACTER_IMAGES = "staged_character_images"
 
 

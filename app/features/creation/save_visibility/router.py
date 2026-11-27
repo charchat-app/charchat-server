@@ -2,14 +2,20 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 
 from app.features.creation.images.storage import ImageStorage, get_image_storage
 from app.features.creation.save_visibility import service, soft_delete
+from app.features.creation.save_visibility.rating_review import RatingReviewCoordinator
 from app.features.creation.save_visibility.schemas import CreationSaveRequest, CreationSaveResponse
 from app.features.creation.speech_style.router import Connection, RequestId, StoryId, User
 
 router = APIRouter(tags=["creation:save_visibility"])
+
+
+def get_rating_review(request: Request) -> RatingReviewCoordinator | None:
+    """CREATE-US-08-AC02 등급 검토 조정기. `create_app(rating_review=...)`로 줄 때만 켜진다."""
+    return getattr(request.app.state, "rating_review", None)
 
 
 @router.get("/stories/{story_id}/creation", response_model=CreationSaveResponse)
@@ -25,9 +31,12 @@ def save_creation(
     user_id: User,
     connection: Connection,
     storage: Annotated[ImageStorage, Depends(get_image_storage)],
+    rating_review: Annotated[RatingReviewCoordinator | None, Depends(get_rating_review)],
 ):
     # 「저장」으로 사진 임시 저장본을 반영하면 연결이 끊긴 예전 파일을 지우므로 저장소가 필요하다.
-    return service.save_creation(connection, story_id, user_id, request_id, body, storage)
+    return service.save_creation(
+        connection, story_id, user_id, request_id, body, storage, rating_review
+    )
 
 
 @router.delete(
