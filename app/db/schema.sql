@@ -30,6 +30,7 @@ CREATE TABLE stories (
     save_state text NOT NULL DEFAULT 'draft'
         CHECK (save_state IN ('draft', 'private', 'public')),
     saved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    category_classification_needed boolean NOT NULL DEFAULT false,
     deleted_at timestamptz
 );
 -- owner_id는 제작자 계정 식별값. 실제 계정 FK/인증은 계정 모델 설계 후 연결한다.
@@ -58,7 +59,13 @@ BEGIN
         RAISE EXCEPTION 'This story save-state transition is not allowed'
             USING ERRCODE = '23514';
     END IF;
-    NEW.saved_at := clock_timestamp();
+    IF NEW.category_classification_needed IS DISTINCT FROM OLD.category_classification_needed
+       AND (to_jsonb(NEW) - 'category_classification_needed')
+           IS NOT DISTINCT FROM (to_jsonb(OLD) - 'category_classification_needed') THEN
+        NEW.saved_at := OLD.saved_at;
+    ELSE
+        NEW.saved_at := clock_timestamp();
+    END IF;
     RETURN NEW;
 END;
 $$;

@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from pydantic_core import to_jsonable_python
 
+from app.features.creation.category_classification import service as category_classification
 from app.features.creation.common.errors import app_error
 from app.features.creation.common.names import has_surrounding_space, name_compare_key
 from app.features.creation.images import service as images_service
@@ -985,6 +986,9 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             )
         speech_style.write_expression_fields(connection, story_id, body.expression)
         story.update(repository.update_save_state(connection, story_id, target))
+        category_classification.mark_after_registration(
+            connection, story_id, previous_state=current, current_state=target
+        )
         # 저장(반영)하면 2~5번 임시 저장본은 더 필요 없다. 6번 사진 임시 저장본은 위에서 반영했다.
         # 임시 프리셋 사진의 보호 연결도 끊고, 미사용 표시를 다시 계산한다(바로 지우지 않고
         # 정리 작업 유예를 따른다).
