@@ -575,6 +575,8 @@ def _stream(generation_id: int, claimed) -> None:
         _fail(generation_id, 0, "EMPTY_RESPONSE", request.reported_model)
         return
     # CHAT-US-08: 응답이 정상으로 끝난 뒤에만 장면 변화를 묻는다. 판단이 실패해도 응답은 저장한다.
+    with worker.connect() as conn:
+        repository.touch_generation(conn, generation_id)
     scene_patch = scene_judge.judge_turn(context, text, request.model, request.provider)
     try:
         _save_completed(generation_id, claimed, request.reported_model, scene_patch)

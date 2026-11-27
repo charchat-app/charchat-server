@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # CHAT-US-08: 정상 완료된 턴마다 같은 모델에 장면 변화를 따로 묻는다.
     # 끄면 장면은 시작 값 그대로다.
     chat_scene_judge_enabled: bool = True
+    # 장면 판단 호출 한 번에 기다리는 최대 시간(초). 넘으면 장면을 바꾸지 않고 응답만 저장한다.
+    chat_scene_judge_timeout_seconds: float = 30
     # fake 공급자의 조각 사이 지연(밀리초)과 강제 실패(before: 내용 없이, after: 일부 후).
     chat_fake_chunk_delay_ms: int = 30
     chat_fake_fail_mode: Literal["none", "before", "after"] = "none"

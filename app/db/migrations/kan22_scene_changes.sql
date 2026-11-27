@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS public.conversation_scene_changes (
 DO $kan22$
 DECLARE
     actual text;
+    idx regclass;
     expected text := 'after_state jsonb NOT NULL,assistant_message_id bigint NOT NULL,'
         || 'before_state jsonb NOT NULL,created_at timestamp with time zone NOT NULL,'
         || 'evidence text NOT NULL,evidence_from text NOT NULL,'
@@ -48,6 +49,23 @@ BEGIN
        AND a.attnum > 0 AND NOT a.attisdropped;
     IF actual IS DISTINCT FROM expected THEN
         RAISE EXCEPTION 'KAN-22: conversation_scene_changes has unexpected columns: %', actual;
+    END IF;
+    SELECT string_agg(pg_get_constraintdef(c.oid), ' | ' ORDER BY pg_get_constraintdef(c.oid))
+      INTO actual
+      FROM pg_constraint c
+     WHERE c.conrelid = 'public.conversation_scene_changes'::regclass;
+    IF actual IS DISTINCT FROM
+        'CHECK ((evidence_from = ANY (ARRAY[''user''::text, ''assistant''::text])))'
+        || ' | FOREIGN KEY (generation_id) REFERENCES conversation_generations(id)'
+        || ' | FOREIGN KEY (session_id) REFERENCES conversation_sessions(id) ON DELETE CASCADE'
+        || ' | PRIMARY KEY (id)' THEN
+        RAISE EXCEPTION 'KAN-22: conversation_scene_changes has unexpected constraints: %', actual;
+    END IF;
+    idx := to_regclass('public.conversation_scene_changes_session_idx');
+    IF idx IS NOT NULL AND pg_get_indexdef(idx) NOT LIKE
+        'CREATE INDEX conversation_scene_changes_session_idx ON %conversation_scene_changes'
+        || ' USING btree (session_id, id)' THEN
+        RAISE EXCEPTION 'KAN-22: conversation_scene_changes_session_idx has an unexpected definition';
     END IF;
 END;
 $kan22$;

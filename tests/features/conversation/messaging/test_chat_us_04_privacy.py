@@ -34,7 +34,8 @@ def snapshot(db, session_id):
              {rows("conversation_scene_states")} AS scene,
              {rows("conversation_character_states")} AS characters,
              {rows("conversation_relationships")} AS relationships,
-             {rows("conversation_affinities")} AS affinities""",
+             {rows("conversation_affinities")} AS affinities,
+             {rows("conversation_scene_changes")} AS scene_changes""",
         {"s": session_id},
     ).fetchone()
 

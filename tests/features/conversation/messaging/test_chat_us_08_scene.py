@@ -127,7 +127,7 @@ def test_chat_us_08_ac02_explicit_move_is_saved_with_evidence_and_used_next_turn
 
 def test_chat_us_08_ac03_saved_scene_survives_reopen(client, db, session, judge, recorder):
     judge.answers = [PARK]
-    send(client, session, [user_part("공원으로.")], request_id="turn-0001")
+    send(client, session, [user_part("다음 날 점심, 공원 벤치로 가요.")], request_id="turn-0001")
     # 다시 열기: 세션·대화 기록을 새로 읽어도 서버에 저장된 현재 장면을 쓴다.
     assert client.get(f"/api/v1/conversation/sessions/{session}", headers=PLAYER).status_code == 200
     send(client, session, [user_part("계속.")], request_id="turn-0002")
@@ -159,16 +159,50 @@ def test_chat_us_08_judge_failure_keeps_reply_and_scene(client, db, session, jud
 
 
 def test_chat_us_08_apply_error_keeps_reply(client, db, session, judge, monkeypatch):
+    """장면을 이미 쓴 뒤 SQL 오류가 나도 세이브포인트로 장면만 되돌리고 응답은 완료된다."""
     judge.answers = [PARK]
 
-    def broken(*args, **kwargs):
-        raise RuntimeError("장면 저장 오류")
+    def broken_insert(conn, **kwargs):
+        conn.execute("SELECT 1 / 0")
 
-    monkeypatch.setattr(scene_repository, "update_scene", broken)
+    monkeypatch.setattr(scene_repository, "insert_change", broken_insert)
     before = scene_row(db, session)
-    response = send(client, session, [user_part("다음 날 공원으로.")])
+    response = send(client, session, [user_part("다음 날 점심, 공원 벤치로 가요.")])
     assert generation_status(client, response) == "completed"
     assert scene_row(db, session) == before
+    assert changes(db, session) == []
+    parts = db.execute(
+        """SELECT count(*) AS n FROM conversation_message_parts p
+           JOIN conversation_generations g ON g.assistant_message_id = p.message_id
+           WHERE g.id = %s""",
+        (response.json()["id"],),
+    ).fetchone()["n"]
+    assert parts > 0
+
+
+def test_chat_us_08_malformed_judgement_keeps_reply(client, db, session, judge):
+    judge.answers = [
+        (
+            '{"changed": true, "characters": [{"name": ["도경"], "clothing": "x"}], '
+            '"evidence": "가자"}'
+        ),
+        "[" * 5000 + "]" * 5000,
+    ]
+    before = scene_row(db, session)
+    for index in range(2):
+        response = send(client, session, [user_part("가자.")], request_id=f"bad-000{index}")
+        assert generation_status(client, response) == "completed"
+    assert scene_row(db, session) == before
+    assert changes(db, session) == []
+
+
+def test_chat_us_08_change_without_evidence_in_turn_is_ignored(client, db, session, judge):
+    judge.answers = [
+        '{"changed": true, "place": "바닷가", "evidence": "둘은 바닷가로 갔다", '
+        '"evidence_from": "assistant"}'
+    ]
+    send(client, session, [user_part("배고프다.")])
+    assert scene_row(db, session)["place"] == "경찰서 옥상"
     assert changes(db, session) == []
 
 
@@ -187,7 +221,14 @@ def test_chat_us_08_character_outfit_changes_only_that_character(client, db, ses
         '{"changed": true, "characters": [{"name": "도경", "clothing": "회색 셔츠", '
         '"inner_thought": null}], "evidence": "도경이 코트를 벗었다"}'
     ]
-    send(client, session, [user_part("코트 좀 벗어요.")])
+    send(
+        client,
+        session,
+        [
+            user_part("코트 좀 벗어요."),
+            {"speaker_kind": "narrator", "character_id": None, "body": "*도경이 코트를 벗었다.*"},
+        ],
+    )
     rows = {
         row["name_snapshot"]: row
         for row in db.execute(
@@ -207,7 +248,7 @@ def test_chat_us_08_scene_change_stays_in_its_session(client, db, saved_story, s
     story, intro, _ = saved_story
     other = start_session(client, story, intro, headers={"X-User-Id": "1"})
     judge.answers = [PARK]
-    send(client, session, [user_part("공원으로.")])
+    send(client, session, [user_part("다음 날 점심, 공원 벤치로.")])
     assert scene_row(db, session)["place"] == "공원 벤치"
     assert scene_row(db, other)["place"] == "경찰서 옥상"
     assert changes(db, other) == []
@@ -215,7 +256,7 @@ def test_chat_us_08_scene_change_stays_in_its_session(client, db, saved_story, s
 
 def test_chat_us_08_retry_after_failure_applies_change_once(client, db, session, judge, recorder):
     recorder.error = ProviderError("PROVIDER_ERROR")
-    failed = send(client, session, [user_part("다음 날 공원으로.")])
+    failed = send(client, session, [user_part("다음 날 점심, 공원 벤치로 가요.")])
     assert generation_status(client, failed) == "failed"
     recorder.error = None
     judge.answers = [PARK]

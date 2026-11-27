@@ -7,6 +7,7 @@ from app.features.conversation.scene.rules import (
     ScenePatch,
     advance_date,
     apply_patch,
+    evidence_found,
     parse_judgement,
 )
 
@@ -40,6 +41,9 @@ def test_chat_us_08_ac01_no_change_or_unreadable_judgement_keeps_scene():
     assert parse_judgement('{"changed": "yes", "place": "공원"}', NAMES) is None
     # 바뀌었다고 했지만 쓸 수 있는 항목이 없으면 변화 없음이다.
     assert parse_judgement('{"changed": true, "place": "  ", "evidence": "x"}', NAMES) is None
+    # 근거 문장이 없으면 바꾸지 않는다.
+    assert parse_judgement('{"changed": true, "place": "공원"}', NAMES) is None
+    assert parse_judgement('{"changed": true, "place": "공원", "evidence": " "}', NAMES) is None
 
 
 def test_chat_us_08_ac02_parse_reads_fenced_json_and_validates_fields():
@@ -75,16 +79,21 @@ def test_chat_us_08_ac02_parse_reads_fenced_json_and_validates_fields():
         '{"changed": true, "days_passed": 0}',
         '{"changed": true, "days_passed": true}',
         '{"changed": true, "place": "a\\u0000b"}',  # PostgreSQL text에 넣을 수 없는 NUL
-        '{"changed": true, "place": "' + "가" * 201 + '"}',
+        '{"changed": true, "place": "' + "가" * 31 + '"}',  # 생성 4번 장소 상한 30자
+        '{"changed": true, "new_reference_event": "' + "가" * 11 + '"}',
+        '{"changed": true, "date": {"year": 10000, "month": 1, "day": 1}}',
+        '{"changed": true, "characters": [{"name": ["도경"], "clothing": "코트"}]}',
+        '{"changed": true, "characters": [{"name": {"a": 1}, "clothing": "코트"}]}',
         '{"changed": true, "characters": [{"name": "없는 사람", "clothing": "코트"}]}',
     ],
 )
 def test_chat_us_08_invalid_fields_are_dropped(payload):
+    payload = payload[:-1] + ', "evidence": "근거"}'
     assert parse_judgement(payload, NAMES) is None
 
 
 def test_chat_us_08_evidence_from_defaults_to_assistant():
-    patch = parse_judgement('{"changed": true, "place": "카페"}', NAMES)
+    patch = parse_judgement('{"changed": true, "place": "카페", "evidence": "카페로 갔다"}', NAMES)
     assert patch is not None
     assert patch.evidence_from == "assistant"
 
@@ -202,3 +211,43 @@ def test_chat_us_08_same_values_are_not_a_change():
     )
     assert scene == calendar_scene()
     assert changed == []
+
+
+def test_chat_us_08_year_without_value_rolls_forward_for_earlier_date():
+    scene, _ = apply_patch(calendar_scene(month=12, day=31), CHARS, ScenePatch(month=1, day=1))
+    assert (scene["year"], scene["month"], scene["day"]) == (2027, 1, 1)
+
+
+def test_chat_us_08_passing_midnight_advances_one_day():
+    scene, _ = apply_patch(calendar_scene(hour=23, minute=40), CHARS, ScenePatch(hour=1))
+    assert (scene["day"], scene["hour"], scene["minute"]) == (23, 1, None)
+    # 판단이 지난 날 수를 함께 보내면 그 값만 쓴다(이틀로 세지 않는다).
+    scene, _ = apply_patch(
+        calendar_scene(hour=23, minute=40), CHARS, ScenePatch(hour=1, days_passed=1)
+    )
+    assert scene["day"] == 23
+
+
+def test_chat_us_08_same_hour_keeps_stored_minute():
+    scene, _ = apply_patch(calendar_scene(hour=19, minute=30), CHARS, ScenePatch(hour=19))
+    assert (scene["hour"], scene["minute"]) == (19, 30)
+
+
+def test_chat_us_08_year_never_passes_creation_limit():
+    scene, _ = apply_patch(
+        calendar_scene(year=9999, month=12, day=31), CHARS, ScenePatch(days_passed=1)
+    )
+    assert (scene["year"], scene["month"], scene["day"]) == (9999, 12, 31)
+
+
+@pytest.mark.parametrize(
+    "evidence, sources, found",
+    [
+        ("다음 날 점심, 공원 벤치", ["[나레이터] *다음 날 점심, 공원 벤치.*"], True),
+        ("도경이 코트를 벗었다", ["코트 좀 벗어요.", "@도경: *도경이 코트를 벗었다.*"], True),
+        ("둘은 바다로 갔다", ["카페에 있었다."], False),
+        ("...", ["..."], False),
+    ],
+)
+def test_chat_us_08_evidence_must_appear_in_this_turn(evidence, sources, found):
+    assert evidence_found(evidence, *sources) is found

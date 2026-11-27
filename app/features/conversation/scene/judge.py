@@ -6,11 +6,12 @@
 """
 
 import logging
+from time import monotonic
 
 from app.core.config import settings
 from app.features.conversation.messaging import providers
 from app.features.conversation.messaging.prompt import PromptContext, label_parts
-from app.features.conversation.scene.rules import ScenePatch, parse_judgement
+from app.features.conversation.scene.rules import ScenePatch, evidence_found, parse_judgement
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,11 @@ JUDGE_SYSTEM = "\n".join(
             "캐릭터는 넣지 않는다."
         ),
         "- 이용자 캐릭터의 착장·속마음은 기록하지 않는다.",
+        (
+            "- 글자 수: 장소 30자, 기준 사건 10자, 착장 300자, 속마음 100자 이내로 줄여 쓴다. "
+            "자정을 넘겼으면 days_passed도 함께 쓴다."
+        ),
+        "- evidence에는 이번 턴 이용자 입력이나 AI 응답에 있는 문장을 고치지 말고 그대로 복사한다.",
         (
             "- 미지정 항목은 이야기에서 분명히 정해졌을 때만 채운다. 바뀐 것이 없으면 "
             '{"changed": false}만 쓴다.'
@@ -130,26 +136,52 @@ def build_judge_messages(context: PromptContext, reply_text: str) -> list[dict]:
 
 
 def get_judge_provider() -> providers.Provider:
-    """판단 호출 공급자. 테스트는 이 함수를 바꿔 판단 결과를 정한다."""
+    """판단 호출 공급자. 실제 공급자는 판단 전용 대기 시간으로 만든다. 테스트는 이 함수를 바꾼다."""
+    if settings.chat_llm_provider == "openai_compatible":
+        if not settings.chat_llm_base_url or not settings.chat_llm_api_key:
+            raise providers.ProviderError("PROVIDER_NOT_CONFIGURED", "장면 판단 공급자 설정 없음")
+        return providers.OpenAICompatibleProvider(
+            settings.chat_llm_base_url,
+            settings.chat_llm_api_key,
+            settings.chat_scene_judge_timeout_seconds,
+        )
     return providers.get_provider()
 
 
 def judge_turn(
     context: PromptContext, reply_text: str, model: str, provider: str
 ) -> ScenePatch | None:
-    """이번 턴의 장면 변화. 꺼져 있거나 실패·읽기 실패면 None(장면 그대로)."""
+    """이번 턴의 장면 변화. 꺼져 있거나 실패·시간 초과·읽기 실패·근거 없음이면 None(장면 그대로).
+
+    어떤 오류도 밖으로 내보내지 않는다. 판단이 잘못돼도 이미 끝난 응답은 정상 저장돼야 한다.
+    """
     if not settings.chat_scene_judge_enabled:
         return None
-    request = providers.ProviderRequest(
-        model=model,
-        provider=provider,
-        messages=build_judge_messages(context, reply_text),
-        character_names=context.session_character_names,
-        last_user_text="",
-    )
     try:
-        text = "".join(get_judge_provider().stream(request))
+        request = providers.ProviderRequest(
+            model=model,
+            provider=provider,
+            messages=build_judge_messages(context, reply_text),
+            character_names=context.session_character_names,
+            last_user_text="",
+        )
+        deadline = monotonic() + settings.chat_scene_judge_timeout_seconds
+        chunks = []
+        for chunk in get_judge_provider().stream(request):
+            chunks.append(chunk)
+            if monotonic() > deadline:
+                logger.warning("장면 판단 시간 초과: 장면을 바꾸지 않는다")
+                return None
+        patch = parse_judgement("".join(chunks), context.session_character_names)
+        if patch is None:
+            return None
+        # 근거 문장은 이번 턴 입력이나 응답에 실제로 있어야 한다(지어낸 근거로 장면을 바꾸지 않게).
+        if not evidence_found(
+            patch.evidence, label_parts(context.current, context.play_name), reply_text
+        ):
+            logger.info("장면 판단 근거가 이번 턴에 없음: 장면을 바꾸지 않는다")
+            return None
+        return patch
     except Exception:
-        logger.warning("장면 판단 호출 실패: 장면을 바꾸지 않는다", exc_info=True)
+        logger.warning("장면 판단 실패: 장면을 바꾸지 않는다", exc_info=True)
         return None
-    return parse_judgement(text, context.session_character_names)

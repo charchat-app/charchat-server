@@ -435,6 +435,10 @@ def build_messages(ctx: PromptContext) -> list[dict]:
         if index == last and index != 0:
             content = f"[현재 장면]\n{_scene(ctx)}\n\n[이용자 입력]\n{content}"
         if index == 0:
-            content = f"{first_block}\n\n[이용자 입력]\n{content}"
+            content = (
+                f"{first_block}\n\n[이용자 입력]\n{content}"
+                if first_block
+                else (f"[이용자 입력]\n{content}")
+            )
         messages.append({"role": "user", "content": content})
     return messages

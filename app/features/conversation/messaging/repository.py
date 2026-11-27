@@ -414,3 +414,12 @@ def list_relationships(conn: Connection, session_id: int):
            WHERE r.session_id = %s ORDER BY r.id""",
         (session_id,),
     ).fetchall()
+
+
+def touch_generation(conn: Connection, generation_id: int) -> None:
+    """진행 중 생성의 갱신 시각만 새로 한다(CHAT-US-08 장면 판단 동안 중단으로 오인하지 않게)."""
+    conn.execute(
+        """UPDATE conversation_generations SET updated_at = clock_timestamp()
+           WHERE id = %s AND status = 'streaming'""",
+        (generation_id,),
+    )
