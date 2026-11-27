@@ -111,6 +111,10 @@ def get_scene(client, session_id, headers=PLAYER):
 
 def put_scene(client, session_id, body, headers=PLAYER):
     # 짝 없는 서로게이트도 보낼 수 있게 ASCII 이스케이프 JSON으로 직접 보낸다(httpx json=은 UTF-8).
+    # 버전을 따로 시험하지 않는 테스트는 세션 주인(PLAYER)이 지금 받은 버전을 채운다.
+    if "version" not in body:
+        current = get_scene(client, session_id)
+        body = {**body, "version": current.json()["version"] if current.status_code == 200 else 0}
     return client.put(
         f"{SESSIONS}/{session_id}/scene",
         headers={**headers, "Content-Type": "application/json"},

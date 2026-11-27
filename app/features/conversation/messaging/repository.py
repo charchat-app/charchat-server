@@ -389,7 +389,11 @@ def get_scene(conn: Connection, session_id: int):
 
 
 def scene_user_edited(conn: Connection, session_id: int, generation_id: int | None) -> bool:
-    """CHAT-US-08: 마지막 장면 변경이 이용자 직접 수정이고, 이번 생성을 뺀 마지막 완료 턴 뒤인지."""
+    """CHAT-US-08: 마지막 장면 변경이 이용자 직접 수정이고, 이번 생성을 뺀 마지막 완료 턴 뒤인지.
+
+    완료된 생성의 updated_at은 완료 저장 뒤 다시 바뀌지 않는다는 전제다(완료 시각으로 쓴다).
+    완료 행을 나중에 고치는 기능(응답 수정 11번 등)이 생기면 별도 완료 시각 열로 바꾼다.
+    """
     row = conn.execute(
         """SELECT c.source = 'user_edit' AND c.created_at > COALESCE(
                       (SELECT max(g.updated_at) FROM conversation_generations g

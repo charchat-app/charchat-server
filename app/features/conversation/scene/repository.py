@@ -167,6 +167,15 @@ def insert_user_edit_change(conn: Connection, *, session_id: int, before: dict, 
     ).fetchone()["id"]
 
 
+def latest_change_id(conn: Connection, session_id: int) -> int:
+    """장면 버전: 세션의 마지막 장면 변경 기록 ID(없으면 0)."""
+    row = conn.execute(
+        "SELECT COALESCE(max(id), 0) AS id FROM conversation_scene_changes WHERE session_id = %s",
+        (session_id,),
+    ).fetchone()
+    return row["id"]
+
+
 def list_changes(conn: Connection, session_id: int):
     return conn.execute(
         """SELECT id, source, generation_id, assistant_message_id, evidence_message_id,

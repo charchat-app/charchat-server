@@ -38,6 +38,8 @@ class SceneResponse(BaseModel):
     characters: list[SceneCharacterResponse]
     # 삭제 스토리의 대화: 볼 수만 있고 고칠 수 없다.
     read_only: bool
+    # 장면 버전(이 세션의 마지막 장면 변경 기록 ID, 없으면 0). 수정 요청에 그대로 돌려보낸다.
+    version: int
 
 
 class SceneCharacterUpdateRequest(BaseModel):
@@ -51,6 +53,9 @@ class SceneCharacterUpdateRequest(BaseModel):
 class SceneUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # 폼을 열 때 받은 장면 버전. 그 사이 AI 판단이나 다른 수정으로 장면이 바뀌었으면 409로 거절해,
+    # 오래된 폼 값이 새 장면을 조용히 덮어쓰지 않게 한다.
+    version: Annotated[StrictInt, Field(ge=0)]
     era: StrictStr | None
     year: StrictInt | None
     month: StrictInt | None

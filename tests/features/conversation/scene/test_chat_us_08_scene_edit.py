@@ -88,6 +88,7 @@ def test_chat_us_08_user_edit_get_returns_current_scene(client, session):
         "minute": 5,
         "place": "경찰서 옥상",
         "read_only": False,
+        "version": 0,
     }
     # 세션 캐릭터 상태 순서(id), 이름은 세션 이름(name_snapshot).
     assert first["id"] < second["id"]
@@ -644,7 +645,7 @@ def test_chat_us_08_user_edit_note_kept_until_a_turn_completes(client, db, sessi
     retried = client.post(
         f"{GENERATIONS}/{failed['id']}/retry", json={"request_id": "retry-0001"}, headers=PLAYER
     )
-    assert retried.status_code in (200, 201, 202), retried.text
+    assert retried.status_code == 202, retried.text
     assert [USER_EDITED_NOTE in r.messages[-1]["content"] for r in requests] == [True, True]
 
 
@@ -678,3 +679,48 @@ def test_chat_us_08_user_edit_characters_list_is_bounded(client, db, session):
     # 100개까지는 형식 검사를 지나 중복 ID로 거절된다.
     response = put_scene(client, session, {**PARK_EDIT, "characters": [row] * 100})
     assert response.json()["code"] == "CONVERSATION_SCENE_CHARACTER_INVALID"
+
+
+# ---- 장면 버전: 폼을 연 뒤 바뀐 장면을 오래된 폼 값으로 덮어쓰지 않는다 ----
+
+
+def test_chat_us_08_user_edit_version_starts_at_zero_and_follows_changes(client, db, session):
+    assert get_scene(client, session).json()["version"] == 0
+    edited = put_scene(client, session, park_edit(client, session))
+    assert edited.status_code == 200, edited.text
+    (change,) = changes(db, session)
+    assert edited.json()["version"] == change["id"]
+    assert get_scene(client, session).json()["version"] == change["id"]
+
+
+def test_chat_us_08_user_edit_stale_form_is_rejected_after_judge_change(
+    client, db, session, recorder, judge
+):
+    # 이용자가 폼을 연 뒤(버전 0) AI 판단이 장소를 바꾸면,
+    # 그 폼으로 저장해도 판단을 덮어쓰지 않는다.
+    opened = get_scene(client, session).json()
+    judge.answers = [
+        '{"changed": true, "place": "옥상 계단", "evidence": "옥상 계단으로 내려갔다", '
+        '"evidence_from": "user"}'
+    ]
+    send(client, session, "옥상 계단으로 내려갔다.")
+    moved = scene_snapshot(db, session)
+    response = put_scene(
+        client, session, {**park_edit(client, session), "version": opened["version"]}
+    )
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["code"] == "CONVERSATION_SCENE_CHANGED"
+    assert body["version"] == get_scene(client, session).json()["version"] != opened["version"]
+    assert scene_snapshot(db, session) == moved
+    assert [row["source"] for row in changes(db, session)] == ["judge"]
+
+
+def test_chat_us_08_user_edit_version_is_required(client, db, session):
+    body = {**park_edit(client, session)}
+    response = client.put(
+        f"/api/v1/conversation/sessions/{session}/scene", json=body, headers=PLAYER
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "VALIDATION_ERROR"
+    assert changes(db, session) == []

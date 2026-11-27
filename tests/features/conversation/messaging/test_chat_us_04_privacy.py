@@ -94,6 +94,7 @@ def test_chat_us_04_ac01_ac03_other_account_is_refused_on_every_route_without_si
         "장면 수정": client.put(
             f"{SESSIONS}/{session}/scene",
             json={
+                "version": 0,
                 "era": None,
                 "year": 2026,
                 "month": 1,

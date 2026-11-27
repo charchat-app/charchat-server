@@ -144,6 +144,13 @@ class GenerationInProgressError(AppError):
     title = "이전 응답이 끝난 뒤에 장면을 고칠 수 있습니다"
 
 
+class SceneChangedError(AppError):
+    # 폼을 연 뒤 AI 판단이나 다른 수정으로 장면이 바뀌었다. 최신 장면을 다시 불러와 고친다.
+    status = 409
+    code = "CONVERSATION_SCENE_CHANGED"
+    title = "그 사이 장면이 바뀌었습니다. 최신 장면을 다시 불러와 주세요"
+
+
 class SceneInvalidError(AppError):
     status = 422
     code = "CONVERSATION_SCENE_INVALID"
@@ -264,7 +271,7 @@ def _character_issues(requested: list[dict], session_ids: set[int]) -> list[dict
     return issues
 
 
-def _response(scene: dict, characters: list[dict], read_only: bool) -> SceneResponse:
+def _response(scene: dict, characters: list[dict], read_only: bool, version: int) -> SceneResponse:
     return SceneResponse(
         **{key: scene.get(key) for key in SCENE_FIELDS},
         characters=[
@@ -277,6 +284,7 @@ def _response(scene: dict, characters: list[dict], read_only: bool) -> SceneResp
             for row in characters
         ],
         read_only=read_only,
+        version=version,
     )
 
 
@@ -289,7 +297,8 @@ def get_scene(conn: Connection, owner_id: int, session_id: int) -> SceneResponse
             raise SessionNotFoundError()
         row = repository.get_scene(conn, session_id)
         characters = [dict(r) for r in repository.list_character_states(conn, session_id)]
-    return _response(dict(row) if row else {}, characters, session["read_only"])
+        version = repository.latest_change_id(conn, session_id)
+    return _response(dict(row) if row else {}, characters, session["read_only"], version)
 
 
 def update_scene(
@@ -321,6 +330,11 @@ def update_scene(
         characters = [
             dict(r) for r in repository.list_character_states_for_update(conn, session_id)
         ]
+        # 장면 행을 잠근 뒤라 판단 적용(같은 행을 잠근다)과 겹치지 않는다.
+        # 폼을 연 뒤 바뀌었으면 거절한다.
+        version = repository.latest_change_id(conn, session_id)
+        if request.version != version:
+            raise SceneChangedError(version=version)
         values, requested, issues = check_user_edit(scene["date_mode"], request)
         character_issues = _character_issues(requested, {r["id"] for r in characters})
         # 문제는 한 번에 모두 알려 준다. 캐릭터 ID 문제가 하나라도 있으면 캐릭터 코드로 응답한다.
@@ -338,10 +352,10 @@ def update_scene(
                 repository.update_scene(conn, session_id, new_scene)
             for state in changed:
                 repository.update_character_state(conn, session_id, state)
-            repository.insert_user_edit_change(
+            version = repository.insert_user_edit_change(
                 conn,
                 session_id=session_id,
                 before=_state(scene, characters),
                 after=_state(new_scene, after_characters),
             )
-    return _response(new_scene, after_characters, False)
+    return _response(new_scene, after_characters, False, version)
