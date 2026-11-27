@@ -7,6 +7,7 @@ from contextlib import ExitStack
 
 from pydantic_core import to_jsonable_python
 
+from app.features.creation.category_classification import service as category_classification
 from app.features.creation.common.errors import app_error
 from app.features.creation.common.names import has_surrounding_space, name_compare_key
 from app.features.creation.images import service as images_service
@@ -518,7 +519,15 @@ def validate_completed(connection, story_ref: AuthorizedStory, body):
 
 
 def save_creation(
-    connection, story_id, owner_id, request_id, body, storage=None, review_coordinator=None
+    connection,
+    story_id,
+    owner_id,
+    request_id,
+    body,
+    storage=None,
+    review_coordinator=None,
+    *,
+    on_first_commit=None,
 ):
     """2~4번 공통 저장. 「저장」이면 이미지 임시 저장본도 함께 검사·반영한다(안 B).
 
@@ -526,13 +535,17 @@ def save_creation(
     CREATE-US-08-AC02: 조정기를 주면 비공개·공개 「저장」이 커밋된 뒤 그 저장본을 조정기에
     알린다(UNSAFE면 검토를 넘기고, 아니면 앞선 검토를 무효로 한다). `after_commit`은
     트랜잭션을 감싸므로 그 안의 울타리는 COMMIT이 끝난 뒤에 나온다.
+    CREATE-US-09: 최초 등록이면 분류 대상 표시는 같은 트랜잭션에서 쓰고, `on_first_commit`은
+    커밋과 검토 울타리가 끝난 뒤에만 부른다(라우터가 응답 뒤 백그라운드 분류로 등록한다).
     """
     with ExitStack() as after_commit:
-        result, released = _save_creation(
+        result, released, first_registration = _save_creation(
             connection, story_id, owner_id, request_id, body, review_coordinator, after_commit
         )
     if storage is not None and released:
         images_service.release_images(connection, storage, released)
+    if first_registration and on_first_commit is not None:
+        on_first_commit()
     return result
 
 
@@ -789,7 +802,7 @@ def _save_creation(
         if previous:
             if previous["request_hash"] != digest:
                 raise app_error(409, "IDEMPOTENCY_KEY_REUSED", "같은 요청키의 내용이 다릅니다.")
-            return CreationSaveResponse.model_validate(previous["response"]), set()
+            return CreationSaveResponse.model_validate(previous["response"]), set(), False
         copy = working_copy.read(connection, story_id)
         # CREATE-US-07-AC09: 같은 요청키 재전송(위)은 기록한 응답을 돌려준다.
         # 새 확정 요청은 잠금 안에서 그 자동 저장 뒤로 바뀐 것이 없을 때만
@@ -847,7 +860,7 @@ def _save_creation(
             speech_style.remember_write_request(
                 connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
             )
-            return result, set()
+            return result, set(), False
         if body.preserve_scene:
             # 등급 전용 임시본의 장면은 저장 당시 복사본일 뿐이다.
             # 다른 경로에서 바꾼 정본 장면을 되돌리지 않는다. 토큰 없는 예전 「저장」도
@@ -993,7 +1006,7 @@ def _save_creation(
             speech_style.remember_write_request(
                 connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
             )
-            return result, set()
+            return result, set(), False
         if temporary:
             # 미등록 스토리의 임시 저장은 본 테이블에 바로 쓴다. 공개 상태는 바꾸지 않는다.
             target = current
@@ -1113,6 +1126,9 @@ def _save_creation(
         if rating is not None:
             repository.update_requested_rating(connection, story_id, rating)
         story.update(repository.update_save_state(connection, story_id, target))
+        first_registration = category_classification.mark_after_registration(
+            connection, story_id, previous_state=current, current_state=target
+        )
         # 저장(반영)하면 2~5번 임시 저장본은 더 필요 없다. 6번 사진 임시 저장본은 위에서 반영했다.
         # 임시 프리셋 사진의 보호 연결도 끊고, 미사용 표시를 다시 계산한다(바로 지우지 않고
         # 정리 작업 유예를 따른다).
@@ -1135,4 +1151,4 @@ def _save_creation(
         # 시점 값으로 고정되고, 커밋 뒤 넘김 실패는 현재 검토 상태에만 쓴다(CREATE-US-08-AC02·AC11).
         if handoff is not None:
             rating_review.fence_final_save(story_id, review_coordinator, after_commit, handoff)
-        return result, released
+        return result, released, first_registration
