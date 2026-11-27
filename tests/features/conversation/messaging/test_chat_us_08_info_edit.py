@@ -382,6 +382,36 @@ def test_chat_us_08_info_edit_omitted_fields_keep_reply_values(client, db, sessi
     assert generation_text(db, generation["id"]).count("```info") == 1
 
 
+def test_chat_us_08_info_edit_keeps_multiline_start_values_whole(client, db, session, recorder):
+    # 리뷰(11-27): 제작 화면은 착장·속마음을 여러 줄로 받는다. 장소만 고쳐도 다른 캐릭터 값이
+    # 첫 줄만 남거나, 줄 하나가 닫는 줄(```)이 되어 블록이 일찍 끝나면 안 된다.
+    db.execute(
+        """UPDATE conversation_character_states SET clothing = %s, inner_thought = %s
+           WHERE session_id = %s AND name_snapshot = '도경'""",
+        ("상의: 흰 셔츠\n  하의: 청바지  \n", "아무 말 안 한다\n```\n들킬까 봐 겁난다", session),
+    )
+    generation = turn(client, session, recorder, None, "안녕.", "turn-0001")
+    message_id = generation["assistant_message"]["id"]
+    scene = turns(client, session)["current_scene"]
+    dogyeong = next(c for c in scene["characters"] if c["name"] == "도경")
+    assert dogyeong == {
+        "name": "도경",
+        "clothing": "상의: 흰 셔츠 하의: 청바지",
+        "inner_thought": "아무 말 안 한다 ``` 들킬까 봐 겁난다",
+    }
+    response = client.put(info_url(session, message_id), headers=PLAYER, json={"place": "부두"})
+    assert response.status_code == 200, response.text
+    after = response.json()["current_scene"]
+    assert next(c for c in after["characters"] if c["name"] == "도경") == dogyeong
+    assert after["place"] == "부두"
+    # 앱이 current_scene을 그대로 돌려보내도 통과한다.
+    resend = {key: after[key] for key in ("date", "time", "place", "characters")}
+    response = client.put(info_url(session, message_id), headers=PLAYER, json=resend)
+    assert response.status_code == 200, response.text
+    assert response.json()["current_scene"] == after
+    assert generation_text(db, generation["id"]).count("```info") == 1
+
+
 @pytest.mark.parametrize(
     "body",
     [

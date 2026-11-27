@@ -310,6 +310,18 @@ def _date_line(scene: dict) -> str | None:
     return None
 
 
+def one_line(value: str | None) -> str | None:
+    """값 안의 줄바꿈을 공백 하나로 바꿔 한 줄로 만든다(앞뒤 공백 제거, 비면 None).
+
+    시작 장면의 착장·속마음은 제작 화면에서 여러 줄로 입력할 수 있다. info는 한 줄에 한 항목이라
+    줄바꿈이 그대로 들어가면 둘째 줄부터 잘리거나, 줄 하나가 닫는 줄(```)이 되어 블록이 일찍 끝난다.
+    """
+    if value is None:
+        return None
+    joined = " ".join(part.strip() for part in str(value).splitlines() if part.strip())
+    return joined or None
+
+
 def format_info_lines(scene: dict | None, character_states: list[dict]) -> list[str]:
     """현재 장면을 info와 같은 줄 형식으로 쓴다. 미지정 줄은 쓰지 않고 캐릭터 줄은 모두 쓴다.
 
@@ -326,11 +338,11 @@ def format_info_lines(scene: dict | None, character_states: list[dict]) -> list[
         # 분이 미지정이면 0분으로 채우지 않는다.
         hour, minute = scene["hour"], scene.get("minute")
         lines.append(f"시간: {hour:02d}:{minute:02d}" if minute is not None else f"시간: {hour}시")
-    if scene.get("place"):
-        lines.append(f"장소: {scene['place']}")
+    if place := one_line(scene.get("place")):
+        lines.append(f"장소: {place}")
     for state in character_states:
-        clothing = state.get("clothing") or "-"
-        thought = state.get("inner_thought") or "-"
+        clothing = one_line(state.get("clothing")) or "-"
+        thought = one_line(state.get("inner_thought")) or "-"
         lines.append(f"[{state['name']}] 착장: {clothing} | 속마음: {thought}")
     return lines
 
@@ -351,12 +363,13 @@ def scene_view(scene: dict | None, character_states: list[dict]) -> dict:
     return {
         "date": date,
         "time": time,
-        "place": scene.get("place") or None,
+        # info 줄과 같은 한 줄 값으로 보여 준다(그대로 수정 API에 돌려보내도 통과하게).
+        "place": one_line(scene.get("place")),
         "characters": [
             {
                 "name": state["name"],
-                "clothing": state.get("clothing"),
-                "inner_thought": state.get("inner_thought"),
+                "clothing": one_line(state.get("clothing")),
+                "inner_thought": one_line(state.get("inner_thought")),
             }
             for state in character_states
         ],

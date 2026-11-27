@@ -536,3 +536,23 @@ def test_chat_us_08_scene_view_has_info_shape_and_every_character():
     assert scene_view(None, []) == {"date": None, "time": None, "place": None, "characters": []}
     # 날짜 방식만 있고 값이 없으면 date는 null이다.
     assert scene_view({"date_mode": "elapsed"}, [])["date"] is None
+
+
+def test_chat_us_08_info_format_joins_multiline_values_into_one_line():
+    # 시작 장면의 여러 줄 착장·속마음은 한 줄로 이어 쓴다. 다시 읽어도 같은 값이다.
+    lines = format_info_lines(
+        {"place": " 해무항\n부두 "},
+        [
+            {
+                "name": "도경",
+                "clothing": "상의: 흰 셔츠\r\n하의: 청바지",
+                "inner_thought": "```\n겁난다",
+            }
+        ],
+    )
+    assert lines == [
+        "장소: 해무항 부두",
+        "[도경] 착장: 상의: 흰 셔츠 하의: 청바지 | 속마음: ``` 겁난다",
+    ]
+    info = "```info\n" + "\n".join(lines) + "\n```"
+    assert split_info(f"본문\n{info}") == ("본문", "\n".join(lines))
