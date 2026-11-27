@@ -174,6 +174,69 @@ def test_criteria_treat_text_as_untrusted_and_stay_on_child_sexualization_CREATE
         assert word not in text, word
 
 
+# --- 명시된 의도·언급만 있는 경우의 기준 문구(제품 결정) ---------------------------------------
+# 제품 결정: 아동·미성년자를 성적 대상으로 삼으려는 스토리의 명시된 의도는 행위·묘사·장면이
+# 쓰여 있지 않아도 blocked다. 예방·교육·금지만을 위한 언급은 언급만으로 blocked가 아니다.
+# 실제 전송된 요청의 기준 문구를 확인한다. 고정 입력은 중립 표식뿐이다(구체 장면 없음).
+
+
+def emitted_question(choice: str):
+    outcome, transport = judge(reply_for(choice))
+    [request] = transport.requests
+    question = body_of(request)["questions"][QUESTION]
+    criteria = {k: v.lower() for k, v in question["criteria"].items()}
+    return outcome, question, criteria
+
+
+def test_blocked_criterion_covers_stated_intent_without_described_act_CREATE_US_08_AC15():
+    outcome, _, criteria = emitted_question("blocked")
+    assert outcome is CommonSafety.BLOCKED
+    blocked = criteria["blocked"]
+    # 명시된 의도 자체가 차단 사유다.
+    assert "stated" in blocked
+    assert "intent" in blocked
+    assert "sexualiz" in blocked
+    assert "child or minor" in blocked
+    # 행위·묘사·장면이 쓰여 있지 않아도 차단이다.
+    assert any(p in blocked for p in ("even when no", "even if no")), blocked
+    for word in ("act", "depiction", "scene"):
+        assert word in blocked, word
+    # 기존 차단 범위는 유지한다.
+    assert "sexual acts" in blocked
+    assert "sexual interest" in blocked
+    assert "across fields" in blocked
+
+
+def test_clear_criterion_keeps_prevention_education_prohibition_mentions_CREATE_US_08_AC15():
+    outcome, _, criteria = emitted_question("clear")
+    assert outcome is CommonSafety.CLEAR
+    clear = criteria["clear"]
+    for word in ("prevention", "education", "prohibition"):
+        assert word in clear, word
+    # 언급만으로는 차단하지 않는다.
+    assert "mention alone" in clear
+    # 기존 통과 범위는 유지한다.
+    assert "non-sexual" in clear
+
+
+def test_intent_rule_keeps_three_options_and_no_policy_expansion_CREATE_US_08_AC15():
+    _, question, criteria = emitted_question("clear")
+    # 선택지는 그대로 셋이다.
+    assert tuple(criteria) == CHOICES == ("clear", "blocked", "unclear")
+    # 명시된 의도는 unclear로 보내지 않는다. unclear는 진짜 모호함에만 쓴다.
+    assert "intent" not in criteria["unclear"]
+    assert "cannot be determined" in criteria["unclear"]
+    assert "not as a default" in criteria["unclear"]
+    # 질문 범위·추측 금지는 유지하고 다른 정책을 섞지 않는다.
+    instructions = question["instructions"].lower()
+    assert "sexualizes a child or minor" in instructions
+    assert "do not speculate" in instructions
+    assert "do not apply any other content policy" in instructions
+    text = json.dumps(question).lower()
+    for word in ("20", "rating", "unsafe", "eligib", "violence", "self-harm"):
+        assert word not in text, word
+
+
 # --- 명시적 선택만 통과·차단 ------------------------------------------------------------------
 
 
