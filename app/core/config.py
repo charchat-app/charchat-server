@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     chat_stream_flush_ms: int = 100
     # 이 시간(초) 동안 갱신이 없는 진행 중 생성은 서버 중단으로 보고 실패 처리한다.
     chat_generation_stale_seconds: float = 180
+    # CHAT-US-08: 정상 완료된 턴마다 같은 모델에 장면 변화를 따로 묻는다.
+    # 끄면 장면은 시작 값 그대로다.
+    chat_scene_judge_enabled: bool = True
     # fake 공급자의 조각 사이 지연(밀리초)과 강제 실패(before: 내용 없이, after: 일부 후).
     chat_fake_chunk_delay_ms: int = 30
     chat_fake_fail_mode: Literal["none", "before", "after"] = "none"

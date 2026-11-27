@@ -75,7 +75,9 @@ def test_chat_us_02_ac11_pure_later_turn_history_then_new_input():
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
     assert messages[1]["content"].endswith("[이용자 입력]\n[민서] 처음")
     assert messages[2]["content"] == "@도경: 답\n@나레이터: 서술"
-    assert messages[3]["content"] == "[민서] 지금 입력"
+    # CHAT-US-08: 이후 턴에는 현재 장면이 첫 블록이 아니라 새 입력 바로 앞에 붙는다.
+    assert "[현재 장면]" not in messages[1]["content"]
+    assert messages[3]["content"] == "[현재 장면]\n장소: 옥상\n\n[이용자 입력]\n[민서] 지금 입력"
     # 이용자 입력의 {{user}}는 바꾸지 않는다.
     later = build_messages(minimal_context(current=[PromptPart("user", "민서", "{{user}}")]))
     assert later[1]["content"].endswith("[민서] {{user}}")
@@ -192,7 +194,9 @@ def test_kan16_ac29_chat_us_02_ac11_second_request_rereads_latest_saved_settings
     assert messages[1]["content"].endswith("[이용자 입력]\n[민서] 첫 입력")
     # 저장된 이전 응답이 발화자·순서를 유지한 이력으로 들어간다(AC09·AC11).
     assert messages[2] == {"role": "assistant", "content": "@도경: 응답 1번\n@나레이터: 끝"}
-    assert messages[3] == {"role": "user", "content": "[민서] 두 번째"}
+    assert messages[3]["role"] == "user"
+    assert messages[3]["content"].startswith("[현재 장면]\n장소: 경찰서 옥상")
+    assert messages[3]["content"].endswith("[이용자 입력]\n[민서] 두 번째")
     # 첫 요청은 당시 설정 그대로였다.
     assert "제목: 비 오는 도시" in first_request.messages[0]["content"]
 
@@ -443,3 +447,25 @@ def test_chat_us_06_ac11_balanced_guide_literal():
 
 def test_chat_us_06_ac06_first_person_format_example_uses_na():
     assert "*나는 창밖을 바라보았다.*" in system_for(point_of_view="first_person")
+
+
+def test_chat_us_08_ac01_guardrail_keeps_scene_until_change_is_stated():
+    guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
+    assert "[현재 장면]은 지금의 날짜·시각·장소·착장이다" in guide
+    assert "근거 없이 다른 장소나 시간대로 건너뛰지 않는다" in guide
+    assert "장면을 멈춰 두지 않고 대화는 자연스럽게 진행한다" in guide
+
+
+def test_chat_us_08_scene_block_has_no_invented_defaults():
+    hour_only = build_messages(minimal_context(scene={"place": "옥상", "hour": 21, "minute": None}))
+    assert "시각: 21시" in hour_only[1]["content"]
+    assert "21:00" not in hour_only[1]["content"]
+    elapsed = build_messages(
+        minimal_context(scene={"date_mode": "elapsed", "reference_event": None, "elapsed_day": 3})
+    )
+    assert "날짜: 3일째" in elapsed[1]["content"]
+    assert "시작 이후" not in elapsed[1]["content"]
+    with_event = build_messages(
+        minimal_context(scene={"date_mode": "elapsed", "reference_event": "감금", "elapsed_day": 3})
+    )
+    assert "날짜: 감금 이후 3일째" in with_event[1]["content"]

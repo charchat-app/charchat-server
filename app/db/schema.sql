@@ -824,3 +824,23 @@ CREATE TABLE auth_login_attempts (
         OR (state_hash IS NOT NULL AND app_code_challenge IS NOT NULL AND return_to IS NOT NULL)
     )
 );
+
+-- CHAT-US-08 (KAN-22) 대화 중 장면 변경 기록. 정상 완료된 턴에서 장면·캐릭터 상태가 바뀔 때마다 한 줄.
+-- 재생성 후보 전환(10번)·구간 삭제(12번)·응답 수정(11번)이 '그때의 장면'으로 돌아갈 때 쓴다.
+-- before_state/after_state: {"scene": 장면 현재값, "characters": [{"id","name","clothing","inner_thought"}]}
+-- 메시지 ID는 같은 세션의 conversation_messages.id다(구간 삭제 정책이 정해지기 전이라 FK는 두지 않는다).
+-- 공용 DB 적용은 별도 승인 후 app/db/migrations/kan22_scene_changes.sql로 한다.
+CREATE TABLE public.conversation_scene_changes (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id bigint NOT NULL REFERENCES public.conversation_sessions(id) ON DELETE CASCADE,
+    generation_id bigint NOT NULL REFERENCES public.conversation_generations(id),
+    assistant_message_id bigint NOT NULL,
+    evidence_message_id bigint NOT NULL,
+    evidence_from text NOT NULL CHECK (evidence_from IN ('user', 'assistant')),
+    evidence text NOT NULL DEFAULT '',
+    before_state jsonb NOT NULL,
+    after_state jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX conversation_scene_changes_session_idx
+    ON public.conversation_scene_changes (session_id, id);

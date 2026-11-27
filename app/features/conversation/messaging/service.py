@@ -25,6 +25,9 @@ from app.features.conversation.messaging.schemas import (
     MessageSendRequest,
     TurnsResponse,
 )
+from app.features.conversation.scene import judge as scene_judge
+from app.features.conversation.scene import service as scene_service
+from app.features.conversation.scene.rules import ScenePatch
 
 logger = logging.getLogger(__name__)
 
@@ -475,8 +478,13 @@ def _finish_output_limit(
         )
 
 
-def _save_completed(generation_id: int, claimed, reported_model: str | None) -> None:
-    """파싱한 발화자별 부분을 assistant 메시지에 저장하고 생성·메시지를 completed로 바꾼다."""
+def _save_completed(
+    generation_id: int, claimed, reported_model: str | None, scene_patch: ScenePatch | None = None
+) -> None:
+    """파싱한 발화자별 부분을 assistant 메시지에 저장하고 생성·메시지를 completed로 바꾼다.
+
+    CHAT-US-08: 같은 트랜잭션에서 장면 변화를 적용한다. 완료로 바뀌지 않으면 장면도 그대로다.
+    """
     session_id = claimed["session_id"]
     with worker.connect() as conn, conn.transaction():
         repository.lock_session_by_id(conn, session_id)
@@ -496,6 +504,14 @@ def _save_completed(generation_id: int, claimed, reported_model: str | None) -> 
         ):
             # 그 사이 중단 정리된 생성이면 응답 저장도 되돌린다.
             raise RuntimeError("생성이 더 이상 진행 중이 아닙니다.")
+        scene_service.apply_turn_change(
+            conn,
+            session_id=session_id,
+            generation_id=generation_id,
+            user_message_id=claimed["user_message_id"],
+            assistant_message_id=claimed["assistant_message_id"],
+            patch=scene_patch,
+        )
 
 
 def _stream(generation_id: int, claimed) -> None:
@@ -558,8 +574,10 @@ def _stream(generation_id: int, claimed) -> None:
     if not text.strip():
         _fail(generation_id, 0, "EMPTY_RESPONSE", request.reported_model)
         return
+    # CHAT-US-08: 응답이 정상으로 끝난 뒤에만 장면 변화를 묻는다. 판단이 실패해도 응답은 저장한다.
+    scene_patch = scene_judge.judge_turn(context, text, request.model, request.provider)
     try:
-        _save_completed(generation_id, claimed, request.reported_model)
+        _save_completed(generation_id, claimed, request.reported_model, scene_patch)
     except Exception:
         logger.exception("응답 저장 실패: generation=%s", generation_id)
         with worker.connect() as conn:
