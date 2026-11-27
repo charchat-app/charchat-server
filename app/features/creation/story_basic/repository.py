@@ -7,6 +7,11 @@ from psycopg import Connection
 Row = dict[str, Any]
 
 
+def set_consistent_read(conn: Connection) -> None:
+    """검색 결과와 공통 안전 판정(CREATE-US-08-AC15)이 같은 스냅숏을 보게 한다."""
+    conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+
 def insert_story(
     conn: Connection, owner_id: int, title: str | None, subtitle: str | None, world: str | None
 ) -> Row:
@@ -31,7 +36,8 @@ def list_owned_stories(conn: Connection, owner_id: int) -> list[Row]:
     """삭제되지 않은 본인 스토리를 최근 저장 순으로 돌려준다."""
     return conn.execute(
         """
-        SELECT id, save_state, title, saved_at FROM stories
+        SELECT id, save_state, title, saved_at, effective_rating, rating_review_status
+        FROM stories
         WHERE owner_id = %s AND deleted_at IS NULL
         ORDER BY saved_at DESC, id DESC
         """,

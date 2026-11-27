@@ -13,9 +13,10 @@
 from contextlib import contextmanager
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from psycopg import Connection
 
+from app.core.common_safety import CommonSafetyGuard
 from app.core.config import settings
 from app.core.exceptions import UnauthenticatedError
 from app.db.session import get_conn
@@ -93,3 +94,11 @@ def get_optional_user_id(
 
 
 CurrentUserId = Annotated[int, Depends(get_current_user_id)]
+
+
+def get_common_safety(request: Request) -> CommonSafetyGuard | None:
+    """CREATE-US-08-AC15 주입된 공통 안전 판정기. 없으면 None(기존 동작)."""
+    return getattr(request.app.state, "common_safety", None)
+
+
+CommonSafetyDep = Annotated[CommonSafetyGuard | None, Depends(get_common_safety)]
