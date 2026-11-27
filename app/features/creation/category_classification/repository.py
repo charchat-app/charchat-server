@@ -4,10 +4,19 @@ from psycopg.rows import tuple_row
 
 PENDING = """category_classification_needed AND save_state IN ('private', 'public')
              AND deleted_at IS NULL"""
+# 최초 분류 대상: 아직 유효 결과가 한 번도 저장되지 않은 스토리(별칭 s 기준).
+NO_RESULTS = "NOT EXISTS (SELECT 1 FROM story_categories sc WHERE sc.story_id = s.id)"
 
 
-def read_inputs(connection, story_id, *, pending_only=False):
-    eligibility = f"AND ({PENDING})" if pending_only else ""
+def _eligibility(pending_only, first_only):
+    clauses = ([f"({PENDING})"] if pending_only or first_only else []) + (
+        [NO_RESULTS] if first_only else []
+    )
+    return "".join(f" AND {clause}" for clause in clauses)
+
+
+def read_inputs(connection, story_id, *, pending_only=False, first_only=False):
+    eligibility = _eligibility(pending_only, first_only)
     with connection.cursor(row_factory=tuple_row) as cursor:
         return cursor.execute(
             f"""SELECT s.world_description,
@@ -44,10 +53,11 @@ def category_codes(connection):
     return {row[0] for row in connection.execute("SELECT code FROM categories")}
 
 
-def lock_pending(connection, story_id):
+def lock_pending(connection, story_id, *, first_only=False):
+    eligibility = _eligibility(True, first_only)
     return (
         connection.execute(
-            f"SELECT id FROM stories WHERE id=%s AND ({PENDING}) FOR UPDATE", (story_id,)
+            f"SELECT s.id FROM stories s WHERE s.id=%s{eligibility} FOR UPDATE OF s", (story_id,)
         ).fetchone()
         is not None
     )

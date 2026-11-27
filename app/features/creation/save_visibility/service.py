@@ -472,14 +472,20 @@ def validate_completed(connection, story_ref: AuthorizedStory, body):
         )
 
 
-def save_creation(connection, story_id, owner_id, request_id, body, storage=None):
+def save_creation(
+    connection, story_id, owner_id, request_id, body, storage=None, *, on_first_commit=None
+):
     """2~4번 공통 저장. 「저장」이면 이미지 임시 저장본도 함께 검사·반영한다(안 B).
 
     반영으로 연결이 끊긴 예전 사진은 커밋 뒤 바로 지운다(다른 곳에서 쓰는 사진은 남는다).
     """
-    result, released = _save_creation(connection, story_id, owner_id, request_id, body)
+    result, released, first_registration = _save_creation(
+        connection, story_id, owner_id, request_id, body
+    )
     if storage is not None and released:
         images_service.release_images(connection, storage, released)
+    if first_registration and on_first_commit is not None:
+        on_first_commit()
     return result
 
 
@@ -727,7 +733,7 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
         if previous:
             if previous["request_hash"] != digest:
                 raise app_error(409, "IDEMPOTENCY_KEY_REUSED", "같은 요청키의 내용이 다릅니다.")
-            return CreationSaveResponse.model_validate(previous["response"]), set()
+            return CreationSaveResponse.model_validate(previous["response"]), set(), False
         copy = working_copy.read(connection, story_id)
         # CREATE-US-07-AC09: 같은 요청키 재전송(위)은 기록한 응답을 돌려준다.
         # 새 확정 요청은 잠금 안에서 그 자동 저장 뒤로 바뀐 것이 없을 때만
@@ -773,7 +779,7 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             speech_style.remember_write_request(
                 connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
             )
-            return result, set()
+            return result, set(), False
         if body.preserve_scene:
             body = with_latest_scene(connection, story, body, copy)
         current, target = story["save_state"], body.save_state
@@ -876,7 +882,7 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             speech_style.remember_write_request(
                 connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
             )
-            return result, set()
+            return result, set(), False
         if temporary:
             # 미등록 스토리의 임시 저장은 본 테이블에 바로 쓴다. 공개 상태는 바꾸지 않는다.
             target = current
@@ -986,7 +992,7 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             )
         speech_style.write_expression_fields(connection, story_id, body.expression)
         story.update(repository.update_save_state(connection, story_id, target))
-        category_classification.mark_after_registration(
+        first_registration = category_classification.mark_after_registration(
             connection, story_id, previous_state=current, current_state=target
         )
         # 저장(반영)하면 2~5번 임시 저장본은 더 필요 없다. 6번 사진 임시 저장본은 위에서 반영했다.
@@ -1000,4 +1006,4 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
         speech_style.remember_write_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )
-        return result, released
+        return result, released, first_registration
