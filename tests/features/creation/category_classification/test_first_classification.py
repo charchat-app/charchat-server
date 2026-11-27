@@ -9,7 +9,16 @@ from app.features.creation.category_classification.worker import (
     ClassificationInput,
     classify_first,
 )
+from app.features.creation.save_visibility.rating_review import (
+    DatabaseReviewResults,
+    RatingReviewCoordinator,
+)
 from app.main import create_app
+from tests.features.creation.save_visibility.review_fakes import (
+    ELIGIBLE,
+    FakeEvaluator,
+    MemoryLastPassStore,
+)
 from tests.features.creation.speech_style.test_common_save_api import body, complete, put
 
 STORIES = "/api/v1/creation/stories"
@@ -79,6 +88,52 @@ def test_first_registration_classifies_after_response_CREATE_US_09_AC01_AC04(
     # AC01: 확정본의 세계관과 캐릭터 상세만 전달한다(캐릭터 이름·제목 제외).
     assert classifier.calls == [ClassificationInput("마법 학교", ("원래 상세",))]
     assert state(db, story) == {"pending": False, "categories": ["modern", "romance"]}
+
+
+def test_unsafe_first_registration_runs_rating_review_and_classification_CREATE_US_09_AC04(
+    db, db_url
+):
+    # CREATE-US-09-AC04 · CREATE-US-08-AC02: 둘 다 주입한 앱에서
+    # 최초 UNSAFE 등록 한 번에 등급 검토와 최초 분류가 각각 한 번 실행된다.
+    # 같은 요청키 재전송은 어느 쪽도 다시 넘기지 않는다.
+    classifier = FakeClassifier()
+    evaluator = FakeEvaluator(ELIGIBLE)
+    coordinator = RatingReviewCoordinator(
+        evaluator, MemoryLastPassStore(), results=DatabaseReviewResults(db_url)
+    )
+    app = create_app(db_url, rating_review=coordinator, category_classifier=classifier)
+    try:
+        with TestClient(app) as client:
+            client.headers["X-User-Id"] = "100"
+            story = create_complete(client, db_url)
+            payload = {**body("private"), "requested_rating": "UNSAFE"}
+            first = put(client, story, payload, "unsafe-register")
+            assert first.status_code == 200, first.text
+            assert first.json()["save_state"] == "private"
+            assert first.json()["requested_rating"] == "UNSAFE"
+            assert coordinator.wait(5)
+            assert len(classifier.calls) == 1
+            assert [story_id for story_id, _ in evaluator.calls] == [story["id"]]
+
+            replay = put(client, story, payload, "unsafe-register")
+            assert replay.status_code == 200
+            assert replay.json() == first.json()
+            assert coordinator.wait(5)
+            assert len(classifier.calls) == 1
+            assert len(evaluator.calls) == 1
+    finally:
+        coordinator.close()
+    assert state(db, story) == {"pending": False, "categories": ["modern", "romance"]}
+    rating = db.execute(
+        """SELECT requested_rating, effective_rating, rating_review_status
+           FROM stories WHERE id=%s""",
+        (story["id"],),
+    ).fetchone()
+    assert rating == {
+        "requested_rating": "UNSAFE",
+        "effective_rating": "UNSAFE",
+        "rating_review_status": "completed",
+    }
 
 
 def test_draft_temporary_replay_and_resave_do_not_dispatch_CREATE_US_09_AC04(api, db, db_url):

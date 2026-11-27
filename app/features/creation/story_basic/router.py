@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from app.api.deps import CurrentUserId, DbConn
+from app.api.deps import CommonSafetyDep, CurrentUserId, DbConn
 from app.features.creation.story_basic import service
 from app.features.creation.story_basic.schemas import (
     PublicStorySummaryResponse,
@@ -59,9 +59,10 @@ def search_stories_by_tag(
     tag: Annotated[str, Query(min_length=1, max_length=100, description="찾을 해시태그")],
     user_id: CurrentUserId,
     conn: DbConn,
+    guard: CommonSafetyDep,
 ) -> list[PublicStorySummaryResponse]:
     """해시태그가 붙은 공개 스토리 (CREATE-US-01-AC16). 화면은 탐색 기능에서 연결한다.
 
     태그에 '/' 등이 들어가도 찾을 수 있게 경로가 아니라 쿼리(?tag=)로 받는다.
     """
-    return service.search_public_stories_by_tag(conn, tag)
+    return service.search_public_stories_by_tag(conn, tag, guard)

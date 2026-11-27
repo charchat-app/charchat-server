@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 from psycopg import Connection
 
+from app.core import common_safety
+from app.core.common_safety import CommonSafetyGuard
 from app.core.exceptions import AppError
 from app.features.creation.category_classification import service as category_classification
 from app.features.creation.common.names import has_surrounding_space, name_compare_key
@@ -394,13 +396,26 @@ def suggest_tags(conn: Connection, query: str) -> list[TagSuggestionResponse]:
     return [TagSuggestionResponse(**r) for r in rows]
 
 
-def search_public_stories_by_tag(conn: Connection, tag: str) -> list[PublicStorySummaryResponse]:
+def search_public_stories_by_tag(
+    conn: Connection, tag: str, guard: CommonSafetyGuard | None = None
+) -> list[PublicStorySummaryResponse]:
     """AC16: 해시태그로 공개 스토리를 찾는다. 대소문자·띄어쓰기를 무시하고 같은 태그로 본다.
 
     노출 순위·비중은 탐색 기능에서 정한다.
+    CREATE-US-08-AC15: 판정기를 주입하면 결과와 같은 스냅숏의 정본으로 스토리마다 판정해
+    통과한 스토리만 돌려준다(차단·판정 불가는 조용히 뺀다). 결과는 캐시하지 않는다.
     """
     key = name_compare_key(strip_tag_mark(tag))
     if key == "":
         return []
-    rows = repo.list_public_stories_by_tag(conn, key, TAG_SEARCH_LIMIT)
-    return [PublicStorySummaryResponse(**r) for r in rows]
+    if guard is None:
+        rows = repo.list_public_stories_by_tag(conn, key, TAG_SEARCH_LIMIT)
+        return [PublicStorySummaryResponse(**r) for r in rows]
+    with conn.transaction():
+        repo.set_consistent_read(conn)
+        rows = repo.list_public_stories_by_tag(conn, key, TAG_SEARCH_LIMIT)
+        return [
+            PublicStorySummaryResponse(**r)
+            for r in rows
+            if common_safety.story_is_clear(conn, guard, r["id"])
+        ]

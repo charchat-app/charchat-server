@@ -3,7 +3,15 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from app.features.creation.images.schemas import (
     MAX_CHARACTER_IMAGES,
@@ -38,6 +46,9 @@ RelationList = Annotated[
 AffinityList = Annotated[
     list[InitialAffinity], Field(max_length=MAX_AFFINITIES), AfterValidator(unique_affinities)
 ]
+# CREATE-US-08: stories.requested_rating·effective_rating과 같은 값. 대소문자를 바꾸지 않는다.
+Rating = Literal["SAFE", "UNSAFE"]
+RatingReviewStatus = Literal["not_reviewed", "reviewing", "completed", "failed"]
 
 
 class CreationSaveRequest(FewshotsSaveRequest):
@@ -83,6 +94,26 @@ class CreationSaveRequest(FewshotsSaveRequest):
     # 반영할 내용은 임시 저장본에서 고르므로 basic·presets·images는
     # 함께 보낼 수 없다. 생략·null은 기존 요청·해시와 같다.
     finalize_auto_request_id: ClientKey | None = None
+    # CREATE-US-08-AC01·AC13: 제작자가 고른 스토리 등급(선택). 빼면 기존 선택(임시 저장한 값
+    # 또는 저장본)을 유지하고, 보낼 때는 SAFE·UNSAFE만 받는다(null 거절). 생략하면 기존 요청·
+    # 해시와 같다. 실제 적용 등급(effective_rating)·검토 상태는 요청으로 바꿀 수 없다(보내면
+    # extra=forbid로 422).
+    requested_rating: Rating | None = None
+    # CREATE-US-08-AC13: 등급만 담은 임시 저장본을 반영할 때 그 응답의 `working_copy_saved_at`을
+    # 그대로 보낸다(선택). preserve_scene 「저장」(kind=save, mode=manual)에서만 쓰고,
+    # basic·presets·images·finalize_auto_request_id와 함께 보낼 수 없다. requested_rating은
+    # 함께 보내 임시 저장한 선택을 바꿀 수 있다. 스토리 잠금 안에서 임시 저장본이 그 시각
+    # 그대로 등급만 담고, 공개 상태가 같고, 사진 임시 저장본이 없을 때만 반영하고, 아니면
+    # 409 CREATION_RATING_WORKING_COPY_CHANGED다. 생략·null은 기존 요청·해시와 같다.
+    finalize_rating_working_copy_at: datetime | None = None
+
+    @field_validator("requested_rating", mode="before")
+    @classmethod
+    def reject_null_rating(cls, value):
+        # 기본값(생략)에는 검사기가 돌지 않으므로, 여기 오는 None은 직접 보낸 null이다.
+        if value is None:
+            raise ValueError("requested_rating은 SAFE 또는 UNSAFE로 보내거나 빼야 합니다.")
+        return value
 
     @model_validator(mode="after")
     def check_finalize_autosave(self) -> "CreationSaveRequest":
@@ -92,6 +123,21 @@ class CreationSaveRequest(FewshotsSaveRequest):
             raise ValueError("자동 저장 확정은 preserve_scene 「저장」에서만 쓴다.")
         if self.basic is not None or self.presets is not None or self.images is not None:
             raise ValueError("자동 저장 확정에는 basic·presets·images를 보낼 수 없다.")
+        if self.requested_rating is not None:
+            # 확정은 자동 저장한 내용만 반영한다. 등급 선택도 임시 저장본에서 고른다.
+            raise ValueError("자동 저장 확정에는 requested_rating을 보낼 수 없다.")
+        return self
+
+    @model_validator(mode="after")
+    def check_finalize_rating(self) -> "CreationSaveRequest":
+        if self.finalize_rating_working_copy_at is None:
+            return self
+        if self.kind != "save" or self.mode != "manual" or not self.preserve_scene:
+            raise ValueError("등급 임시 저장본 반영은 preserve_scene 「저장」에서만 쓴다.")
+        if self.basic is not None or self.presets is not None or self.images is not None:
+            raise ValueError("등급 임시 저장본 반영에는 basic·presets·images를 보낼 수 없다.")
+        if self.finalize_auto_request_id is not None:
+            raise ValueError("등급 임시 저장본 반영과 자동 저장 확정은 함께 쓸 수 없다.")
         return self
 
     @model_validator(mode="after")
@@ -226,6 +272,61 @@ class CreationSaveResponse(FewshotsResponse):
     # `basic.characters` 위치다. 항목 모양은 사진 API(`/images`)와 같다. 없으면 [].
     # 이 필드 전에 기록된 응답을 재전송할 때도 []로 채운다.
     staged_character_images: list["StagedCharacterImagesResponse"] = Field(default_factory=list)
+    # CREATE-US-08-AC01·AC13: 편집 화면의 등급 선택. 임시 저장한 선택이 있으면 그 값,
+    # 없으면 저장본(stories.requested_rating)이다.
+    requested_rating: Rating = "SAFE"
+    # CREATE-US-08: 실제 적용 등급과 검토 상태(저장본). 임시 저장·저장으로 바뀌지 않는다.
+    # 등급 필드 전에 기록된 요청키 응답을 재전송할 때는 컬럼 기본값으로 채운다.
+    effective_rating: Rating = "SAFE"
+    rating_review_status: RatingReviewStatus = "not_reviewed"
+    # CREATE-US-08-AC09~AC11: 마지막 검토가 적격이 아니었던 이유(허용 목록 코드만). 저장된 사유를
+    # 허용 목록으로 다시 검증해 맞을 때만 채우고, 없거나 알 수 없는 값(예전 자유 텍스트 포함)은
+    # null이다. 평가기 원문은 담지 않는다. 이 필드 전 응답을 재전송할 때도 null로 채운다.
+    rating_review_reason: "RatingReviewReason | None" = None
+    # CREATE-US-08-AC13: 2~5번 임시 저장본이 등급 선택만 담았고 사진 임시 저장본이 없으면 true.
+    # 이때만 `finalize_rating_working_copy_at`으로 반영할 수 있다. 이 필드 전 응답은 false로 채운다.
+    rating_only_working_copy: bool = False
+
+
+class RatingReviewReason(BaseModel):
+    """검증된 미적격 판정의 종류와 사유 코드. 평가기 원문·자유 텍스트를 담지 않는다."""
+
+    outcome: Literal["ineligible", "undetermined", "unavailable"]
+    reasons: list[
+        Literal[
+            "underage_stated",
+            "minor_depicted",
+            "restricted_kinship",
+            "age_undetermined",
+            "kinship_undetermined",
+            "invalid_signals",
+            "evaluator_failure",
+        ]
+    ]
+    # CREATE-US-08-AC09: 사유가 가리키는 인물·관계. 사유·검토 요청·지금 정본 내용에 묶이는 검증된
+    # 대상이 있을 때만 키가 있다(없으면 키 자체를 싣지 않아 예전 응답·영수증 모양과 같다).
+    targets: "list[RatingReviewTarget] | None" = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_targets(self, handler):
+        data = handler(self)
+        if self.targets is None:
+            data.pop("targets", None)
+        return data
+
+
+class RatingReviewTarget(BaseModel):
+    """사유 하나의 대상. 표시 라벨은 제작자가 쓴 인물 이름 또는 고정 역할 문구다(DB ID 없음)."""
+
+    reason: Literal[
+        "underage_stated",
+        "minor_depicted",
+        "restricted_kinship",
+        "age_undetermined",
+        "kinship_undetermined",
+    ]
+    kind: Literal["character", "relationship"]
+    label: str
 
 
 class StagedCharacterImagesResponse(BaseModel):
@@ -235,6 +336,7 @@ class StagedCharacterImagesResponse(BaseModel):
     images: list[ImageItem]
 
 
+RatingReviewReason.model_rebuild()
 CreationSaveResponse.model_rebuild()
 
 

@@ -3,6 +3,7 @@
 import hashlib
 import json
 from collections import defaultdict
+from contextlib import ExitStack
 
 from pydantic_core import to_jsonable_python
 
@@ -12,7 +13,7 @@ from app.features.creation.common.names import has_surrounding_space, name_compa
 from app.features.creation.images import service as images_service
 from app.features.creation.initial_state import service as initial_state
 from app.features.creation.intro import service as intro_service
-from app.features.creation.save_visibility import repository, working_copy
+from app.features.creation.save_visibility import rating_review, repository, working_copy
 from app.features.creation.save_visibility.schemas import (
     CreationSaveRequest,
     CreationSaveResponse,
@@ -56,6 +57,22 @@ def canonical_presets(connection, story_ref: AuthorizedStory) -> list[PresetResp
     return with_image_urls(connection, story_ref.owner_id, presets)
 
 
+def rating_fields(connection, story_id, staged_rating=None) -> dict:
+    """CREATE-US-08 응답 등급 필드. 선택은 임시 저장한 값이 있으면 그것, 없으면 저장본이다.
+
+    적용 등급·검토 상태는 언제나 저장본 값이다. 사유는 허용 목록으로 다시 검증한 코드만
+    내보내고, 맞지 않는 저장값(예전 자유 텍스트 등)은 null로 둔다(CREATE-US-08-AC09~AC11).
+    AC09 사유 대상은 사유·요청 표·정본 내용에 다시 묶일 때만 `targets`로 더한다.
+    """
+    row = repository.read_rating(connection, story_id)
+    return {
+        "requested_rating": staged_rating or row["requested_rating"],
+        "effective_rating": row["effective_rating"],
+        "rating_review_status": row["rating_review_status"],
+        "rating_review_reason": rating_review.reason_view(connection, story_id, row),
+    }
+
+
 def response(
     connection,
     story,
@@ -74,6 +91,7 @@ def response(
     )
     return CreationSaveResponse(
         **few.model_dump(),
+        **rating_fields(connection, story["id"]),
         expression=speech_style.read_expression_fields(connection, story["id"]),
         intros=intro_service.read_intros(connection, story["id"]) if intros is None else intros,
         relations=initial_state.read_relations(connection, story["id"])
@@ -102,6 +120,7 @@ def working_response(connection, story, owner_id, document, saved_at, request_id
     )
     return CreationSaveResponse(
         **base.model_dump(),
+        **rating_fields(connection, story["id"], working_copy.staged_requested_rating(document)),
         expression=document["expression"],
         intros=document["intros"],
         relations=document["relations"],
@@ -280,7 +299,34 @@ def get_creation(connection, story_id, owner_id):
         result.images_working_copy_saved_at = images_service.images_working_copy_saved_at(
             connection, story_id
         )
+        mark_rating_only(result, copy)
         return result
+
+
+def mark_rating_only(result, copy) -> None:
+    """CREATE-US-08-AC13: 등급만 담은 임시 저장본이고 사진 임시 저장본이 없을 때만 true."""
+    result.rating_only_working_copy = (
+        working_copy.is_rating_only((copy or {}).get("creation"))
+        and result.images_working_copy_saved_at is None
+    )
+
+
+def rating_copy_unchanged(story, body, copy) -> bool:
+    """CREATE-US-08-AC13: 스토리 잠금 안에서, 반영하려는 등급 임시 저장본이 그대로인지.
+
+    공개 상태는 그대로이거나 비공개→공개만 허용한다(공개 전환 조건은 완성 검사가 확인).
+    """
+    transition = (story["save_state"], body.save_state)
+    return bool(
+        is_rating_only_copy(copy)
+        and copy["creation_saved_at"] == body.finalize_rating_working_copy_at
+        and (transition[0] == transition[1] or transition == ("private", "public"))
+    )
+
+
+def is_rating_only_copy(copy) -> bool:
+    """등급만 담은 공통 임시 저장본이고 사진 임시 저장본이 없는지."""
+    return bool(copy and copy["images"] is None and working_copy.is_rating_only(copy["creation"]))
 
 
 def too_long(field, code, length, limit, message):
@@ -473,15 +519,29 @@ def validate_completed(connection, story_ref: AuthorizedStory, body):
 
 
 def save_creation(
-    connection, story_id, owner_id, request_id, body, storage=None, *, on_first_commit=None
+    connection,
+    story_id,
+    owner_id,
+    request_id,
+    body,
+    storage=None,
+    review_coordinator=None,
+    *,
+    on_first_commit=None,
 ):
     """2~4번 공통 저장. 「저장」이면 이미지 임시 저장본도 함께 검사·반영한다(안 B).
 
     반영으로 연결이 끊긴 예전 사진은 커밋 뒤 바로 지운다(다른 곳에서 쓰는 사진은 남는다).
+    CREATE-US-08-AC02: 조정기를 주면 비공개·공개 「저장」이 커밋된 뒤 그 저장본을 조정기에
+    알린다(UNSAFE면 검토를 넘기고, 아니면 앞선 검토를 무효로 한다). `after_commit`은
+    트랜잭션을 감싸므로 그 안의 울타리는 COMMIT이 끝난 뒤에 나온다.
+    CREATE-US-09: 최초 등록이면 분류 대상 표시는 같은 트랜잭션에서 쓰고, `on_first_commit`은
+    커밋과 검토 울타리가 끝난 뒤에만 부른다(라우터가 응답 뒤 백그라운드 분류로 등록한다).
     """
-    result, released, first_registration = _save_creation(
-        connection, story_id, owner_id, request_id, body
-    )
+    with ExitStack() as after_commit:
+        result, released, first_registration = _save_creation(
+            connection, story_id, owner_id, request_id, body, review_coordinator, after_commit
+        )
     if storage is not None and released:
         images_service.release_images(connection, storage, released)
     if first_registration and on_first_commit is not None:
@@ -661,6 +721,11 @@ def request_digest(story_id, body) -> str:
         exclude.add("images")
     if body.finalize_auto_request_id is None:
         exclude.add("finalize_auto_request_id")
+    if body.requested_rating is None:
+        # CREATE-US-08-AC13: 등급을 뺀 요청은 등급 연결 전과 같은 해시를 쓴다.
+        exclude.add("requested_rating")
+    if body.finalize_rating_working_copy_at is None:
+        exclude.add("finalize_rating_working_copy_at")
     exclude.update(SCENE_FIELDS if body.preserve_scene else ("preserve_scene",))
     payload = {
         "operation": "creation-save-v4",
@@ -716,14 +781,18 @@ def with_latest_scene(connection, story, body, copy):
             }
         )
     )
-    payload = body.model_dump(mode="json", exclude=set(SCENE_FIELDS))
+    # 생략한 등급(None)은 다시 검증할 때 직접 보낸 null로 보이지 않게 뺀다(CREATE-US-08).
+    unset = {"requested_rating"} if body.requested_rating is None else set()
+    payload = body.model_dump(mode="json", exclude=set(SCENE_FIELDS) | unset)
     payload.update({field: scene[field] for field in SCENE_FIELDS})
     if body.kind == "temporary" or body.mode == "auto":
         payload["save_state"] = scene.get("save_state", story["save_state"])
     return CreationSaveRequest.model_validate(payload)
 
 
-def _save_creation(connection, story_id, owner_id, request_id, body):
+def _save_creation(
+    connection, story_id, owner_id, request_id, body, review_coordinator=None, after_commit=None
+):
     story_ref = AuthorizedStory(story_id, owner_id)
     digest = request_digest(story_id, body)
     with connection.transaction():
@@ -747,6 +816,15 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
                 409,
                 "CREATION_AUTOSAVE_CHANGED",
                 "자동 저장 뒤 내용이 바뀌었습니다. 다시 확인해 주세요.",
+            )
+        # CREATE-US-08-AC13: 등급만 담은 임시 저장본 반영도 같은 방식으로 잠금 안에서 확인한다.
+        if body.finalize_rating_working_copy_at is not None and not rating_copy_unchanged(
+            story, body, copy
+        ):
+            raise app_error(
+                409,
+                "CREATION_RATING_WORKING_COPY_CHANGED",
+                "등급 임시 저장 뒤 내용이 바뀌었습니다. 다시 확인해 주세요.",
             )
         temporary = body.kind == "temporary" or body.mode == "auto"
         faces = face_entries(body)
@@ -773,6 +851,9 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             )
             apply_image_references(connection, story_id, owner_id, body, admitted)
             apply_presets(connection, story_ref, body.presets)
+            # CREATE-US-08-AC01: 미등록 스토리는 보낸 등급 선택만 본 테이블에 바로 쓴다.
+            if body.requested_rating is not None:
+                repository.update_requested_rating(connection, story_id, body.requested_rating)
             story.update(repository.update_save_state(connection, story_id, "draft"))
             result = response(connection, story, owner_id)
             result.request_id = request_id
@@ -781,7 +862,14 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             )
             return result, set(), False
         if body.preserve_scene:
-            body = with_latest_scene(connection, story, body, copy)
+            # 등급 전용 임시본의 장면은 저장 당시 복사본일 뿐이다.
+            # 다른 경로에서 바꾼 정본 장면을 되돌리지 않는다. 토큰 없는 예전 「저장」도
+            # 등급 전용 임시본이면 잠금 안의 최신 정본 장면을 쓴다.
+            rating_only = body.finalize_rating_working_copy_at is not None or (
+                not temporary and is_rating_only_copy(copy)
+            )
+            scene_copy = None if rating_only else copy
+            body = with_latest_scene(connection, story, body, scene_copy)
         current, target = story["save_state"], body.save_state
         if temporary and current != "draft":
             # 비공개·공개 스토리의 임시 저장: 이용자가 보는 저장본은 그대로, 임시 저장본에만 쓴다.
@@ -796,8 +884,43 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
                     "basic",
                     "images",
                     "finalize_auto_request_id",
+                    "requested_rating",
+                    "finalize_rating_working_copy_at",
                 },
             )
+            # CREATE-US-08-AC13: 등급 선택은 보낸 값을 두고, 빼고 보내면 이미 임시 저장한 선택을
+            # 유지한다. 저장본 등급·적용 등급·검토 상태는 바꾸지 않는다.
+            creation_doc = copy["creation"] if copy else None
+            rating = body.requested_rating or working_copy.staged_requested_rating(creation_doc)
+            if rating is not None:
+                document[working_copy.REQUESTED_RATING] = rating
+            # CREATE-US-08-AC13: 이번 쓰기가 등급만 보낸 preserve_scene 임시 저장이고, 앞의
+            # 임시 저장본이 비었거나 등급만 담았고, 사진 임시 저장본이 없을 때만 표시를 남긴다.
+            # 문서는 매번 새로 만들므로 다른 임시 저장은 표시를 남기지 않는다(보수적으로 지움).
+            # 등급을 빼고 보낸 경우는 앞의 임시 저장본이 실제 등급 전용이고 공개 상태 선택이
+            # 그대로일 때만 표시를 유지한다(장면 임시 저장본을 등급 전용으로 올리지 않는다).
+            previous_rating_only = creation_doc is not None and working_copy.is_rating_only(
+                creation_doc
+            )
+            if (
+                body.preserve_scene
+                and body.basic is None
+                and body.presets is None
+                and body.images is None
+                and (not copy or copy["images"] is None)
+                and (
+                    (
+                        body.requested_rating is not None
+                        and (creation_doc is None or previous_rating_only)
+                    )
+                    or (
+                        body.requested_rating is None
+                        and previous_rating_only
+                        and creation_doc.get("save_state") == document.get("save_state")
+                    )
+                )
+            ):
+                document[working_copy.RATING_ONLY] = True
             # CREATE-US-07-AC09: 쓰기 전 임시 저장본 기준으로 확정 가능 여부를
             # 정하고, 가능하면 내부 표시(응답에는 싣지 않음)를 남긴다.
             finalizable = (
@@ -877,6 +1000,7 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
             result.images_working_copy_saved_at = images_service.images_working_copy_saved_at(
                 connection, story_id
             )
+            mark_rating_only(result, {"creation": document})
             if finalizable:
                 result.finalize_auto_request_id = request_id
             speech_style.remember_write_request(
@@ -991,6 +1115,16 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
                 connection, story_id, body, {p["id"] for p in people}
             )
         speech_style.write_expression_fields(connection, story_id, body.expression)
+        # CREATE-US-08-AC01·AC13: 등급 선택은 보낸 값이 우선이고, 없으면 「저장」일 때만 임시
+        # 저장한 선택을 반영한다. 둘 다 없으면 저장본 선택을 그대로 둔다. 같은 트랜잭션이라
+        # 검사·저장이 실패하면 함께 되돌아간다. 적용 등급·검토 상태·사유·요청 시각은 쓰지 않고
+        # 검토를 시작하지도 않는다(후속 조각).
+        # (결과 저장 경로의 적용 등급·검토 상태는 아래 `prepare_final_save`가 쓴다.)
+        rating = body.requested_rating
+        if rating is None and not temporary:
+            rating = working_copy.staged_requested_rating(staged_doc)
+        if rating is not None:
+            repository.update_requested_rating(connection, story_id, rating)
         story.update(repository.update_save_state(connection, story_id, target))
         first_registration = category_classification.mark_after_registration(
             connection, story_id, previous_state=current, current_state=target
@@ -1000,10 +1134,21 @@ def _save_creation(connection, story_id, owner_id, request_id, body):
         # 정리 작업 유예를 따른다).
         unlinked = working_copy.clear_creation(connection, story_id, admitted=admitted)
         images_service.refresh_orphaned_images(connection, unlinked & admitted)
+        # CREATE-US-08-AC02·AC14: 비공개·공개 「저장」이면 모든 쓰기 뒤 정본을 읽는다. 결과 저장
+        # 경로면 검토 대기(또는 SAFE)를 같은 트랜잭션에 써 응답에도 담는다. 미등록·임시·자동
+        # 저장은 검토와 무관하다.
+        handoff = None
+        if review_coordinator is not None and not temporary and target != "draft":
+            handoff = rating_review.prepare_final_save(connection, story_id, review_coordinator)
         result = response(
             connection, story, owner_id, groups, people, request_id, intros, relations, affinities
         )
         speech_style.remember_write_request(
             connection, owner_id, request_id, story_id, digest, result.model_dump(mode="json")
         )
+        # 마지막 단계로 검토 조정기 울타리에 들어간다(스토리 잠금 안). 이 뒤로는 COMMIT 말고
+        # SQL이 없다. 커밋에 성공하면 울타리를 나오며 알린다. 요청키 영수증과 이 응답은 커밋
+        # 시점 값으로 고정되고, 커밋 뒤 넘김 실패는 현재 검토 상태에만 쓴다(CREATE-US-08-AC02·AC11).
+        if handoff is not None:
+            rating_review.fence_final_save(story_id, review_coordinator, after_commit, handoff)
         return result, released, first_registration
