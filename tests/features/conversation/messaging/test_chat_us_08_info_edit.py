@@ -774,7 +774,10 @@ def test_chat_us_08_info_edit_invalid_values_are_422(
     response = client.put(
         info_url(session, generation["assistant_message"]["id"]), headers=PLAYER, json=body
     )
-    assert problem(response, 422, code)["field"] == field
+    body_json = problem(response, 422, code)
+    assert body_json["field"] == field
+    # 앱 공용 클라이언트(ApiError.issues)가 읽는 모양으로도 같은 칸을 알려 준다.
+    assert body_json["issues"] == [{"field": field, "code": code, "message": body_json["detail"]}]
     assert generation_text(db, generation["id"]) == text
     assert turns(client, session)["current_scene"] == scene
 

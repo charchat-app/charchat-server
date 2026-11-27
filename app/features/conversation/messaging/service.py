@@ -121,19 +121,33 @@ class InfoNotLatestReplyError(AppError):
     title = "마지막 AI 응답의 장면 정보만 고칠 수 있습니다"
 
 
-class InfoDateModeMismatchError(AppError):
+class _InfoFieldError(AppError):
+    """칸 하나가 틀린 422.
+
+    앱 공용 클라이언트가 이미 읽는 `issues`([{field, code, message}])도 함께 준다.
+    """
+
+    def __init__(self, detail: str | None = None, **extra) -> None:
+        super().__init__(detail, **extra)
+        if "field" in extra:
+            self.extra["issues"] = [
+                {"field": extra["field"], "code": self.code, "message": self.detail}
+            ]
+
+
+class InfoDateModeMismatchError(_InfoFieldError):
     status = 422
     code = "SCENE_INFO_DATE_MODE_MISMATCH"
     title = "이 대화의 날짜 방식은 바꿀 수 없습니다"
 
 
-class InfoUnknownCharacterError(AppError):
+class InfoUnknownCharacterError(_InfoFieldError):
     status = 422
     code = "SCENE_INFO_UNKNOWN_CHARACTER"
     title = "이 대화에 등장하는 캐릭터가 아닙니다"
 
 
-class InfoInvalidValueError(AppError):
+class InfoInvalidValueError(_InfoFieldError):
     status = 422
     code = "SCENE_INFO_INVALID_VALUE"
     title = "장면 정보 값이 올바르지 않습니다"
