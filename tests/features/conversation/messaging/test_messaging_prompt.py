@@ -350,7 +350,45 @@ def test_chat_us_06_ac13_response_length_sends_initial_target(code, label, targe
     assert "중간에 끊지 말고 자연스럽게 마무리한다" in system
     # 시험에서 목표보다 짧게 끝나는 경향이 있어 덜 쓰지 말라는 안내도 보낸다.
     assert "목표보다 한참 짧게 끝내지 않는다" in system
-    assert "같은 말을 되풀이하지 말고 행동·반응·장면을 더 전개한다" in system
+
+
+@pytest.mark.parametrize(
+    ("code", "minimum", "paragraphs", "beats"),
+    [
+        ("short", "300자", "5~8개", "2~3번"),
+        ("normal", "500자", "8~14개", "4~6번"),
+        ("long", "1000자", "15~25개", "8~12번"),
+    ],
+)
+def test_chat_us_06_ac13_response_length_sends_minimum_paragraphs_and_scene_beats(
+    code, minimum, paragraphs, beats
+):
+    system = system_for(response_length=code)
+    length_part = system.split("응답 길이:")[1].split("## 이용자 캐릭터")[0]
+    assert (
+        f"  {minimum}보다 짧게 끝내지 않는다. 빈 줄로 나뉜 문단 {paragraphs} 정도로, "
+        in length_part
+    )
+    assert f"행동→반응→대사로 이어지는 장면 흐름을 {beats} " in length_part
+    # 다른 길이의 최소 분량은 섞지 않는다.
+    others = {"short": "300자보다", "normal": "500자보다", "long": "1000자보다"}
+    for other, phrase in others.items():
+        if other != code:
+            assert phrase not in system
+    if code == "long":
+        assert "장면을 한 단계 더 진전시킨다" in length_part
+
+
+def test_chat_us_06_ac13_response_length_says_how_to_fill_without_padding_or_user_actions():
+    system = system_for(response_length="long")
+    # 모자랄 때 무엇을 더할지: 행동·반응·장면 묘사·캐릭터끼리 주고받는 대사(되풀이 금지).
+    assert (
+        "모자라면 같은 말을 되풀이하지 말고 캐릭터의 다음 행동과 다른 캐릭터의 반응, "
+        "소리·빛·사물 같은 장면 묘사, 캐릭터끼리 주고받는 대사로 장면을 더 전개한다." in system
+    )
+    # 분량을 채우려고 이용자 캐릭터를 대신 쓰지 않고, 이용자에게 묻는 말로 일찍 끝내지 않는다.
+    assert "이용자 캐릭터의 대사·행동은 쓰지 않는다." in system
+    assert "목표 분량에 이르기 전에 이용자에게 묻는 말로 서둘러 끝내지 않는다." in system
 
 
 def test_chat_us_06_ac14_fewshot_is_reference_and_settings_win():
