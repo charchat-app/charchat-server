@@ -452,7 +452,7 @@ def test_chat_us_06_ac06_first_person_format_example_uses_na():
 
 def test_chat_us_08_ac01_guardrail_keeps_scene_until_change_is_stated():
     guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
-    assert "[현재 장면]은 지금의 날짜·시각·장소와 캐릭터별 착장·속마음이다" in guide
+    assert "[현재 장면]은 지금의 날짜·시간·장소와 캐릭터별 착장·속마음이다" in guide
     assert "근거 없이 다른 장소나 시간대로" in guide
     assert "장면을 멈춰 두지 않고 대화는 자연스럽게 진행한다" in guide
 
@@ -528,11 +528,17 @@ def test_chat_us_08_info_block_rules_literal():
         "시간은 24시간제(19:30)로 쓰고, 분을 모르면 19시처럼 쓴다. "
         "[현재 장면]에 없는(미지정) 줄은 이야기에서 분명히 정해질 때만 채운다.",
         "글자 수: 장소 30자, 기준 사건 10자, 착장 300자, 속마음 100자 이내.",
+        # 블록이 같은 줄에 붙으면 말풍선에 남으므로 여는 줄은 새 줄에 따로 쓴다.
+        "여는 줄 ```info는 발화자 블록이 끝난 뒤 새 줄에 따로 쓴다.",
+        # 자리 표시·'미정'은 값이 아니다(info.py 규칙 10). 모르면 줄을 뺀다.
+        "모르는 날짜·시간·장소 줄은 쓰지 않고 뺀다. 미정·모름·없음 같은 말이나 <...> 자리 "
+        "표시를 값으로 쓰지 않는다.",
     ):
         assert literal in section
-    # 형식 예시가 그대로 들어 있고 시스템 메시지의 맨 끝이다.
+    # 형식 예시가 그대로 들어 있고 시스템 메시지의 맨 끝이다. <...>는 옮겨 쓰지 않는 자리다.
     assert section.endswith(
-        "형식:\n```info\n시간: <시>:<분>\n장소: <장소>\n"
+        "형식(<...>는 실제 값으로 바꿔 쓸 자리다. <...>를 그대로 옮겨 쓰지 않는다):\n"
+        "```info\n시간: <시>:<분>\n장소: <장소>\n"
         "[도경] 착장: <착장> | 속마음: <속마음>\n[Bea] 착장: <착장> | 속마음: <속마음>\n```"
     )
     # 날짜 방식이 없는 세션은 날짜 줄을 쓰지 않는다.
@@ -566,3 +572,27 @@ def test_chat_us_08_info_is_not_in_first_block_or_history():
     messages = build_messages(minimal_context(history=history))
     assert all("```info" not in m["content"] for m in messages[1:])
     assert [m["content"].count("[현재 장면]") for m in messages[1:]] == [0, 0, 1]
+
+
+def test_chat_us_08_output_format_puts_info_block_last_without_contradiction():
+    output = build_messages(minimal_context())[0]["content"].split("## 출력 형식")[1]
+    output = output.split("## 장면 정보(info)")[0]
+    assert "발화자별 블록으로만" not in output
+    assert (
+        "응답은 발화자별 블록으로 쓰고, 맨 끝에 장면 정보(info) 블록 하나를 붙인다(형식은 "
+        "아래 장면 정보 규칙). 각 발화자 블록은 새 줄에서 `@이름: ` 태그로 시작한다."
+    ) in output
+
+
+def test_chat_us_08_info_block_is_required_even_though_history_hides_it():
+    # 이력의 앞 응답은 info를 뗀 말풍선이라, 매 응답에 info를 쓰라는 지침을 따로 둔다.
+    assert (
+        "대화 이력의 앞 응답들은 info 블록을 뗀 채로 보이지만, 이번 응답을 포함해 모든 응답 "
+        "끝에 info 블록을 빠짐없이 쓴다."
+    ) in info_section()
+
+
+def test_chat_us_08_prompt_uses_one_word_for_time():
+    system = build_messages(minimal_context(scene={"date_mode": "calendar", "hour": 9}))
+    assert "시각" not in system[0]["content"]
+    assert "시각" not in system[1]["content"]

@@ -259,22 +259,35 @@ def list_parts(conn: Connection, session_id: int, message_ids: list[int]) -> dic
     return parts
 
 
-def expire_stale_generations(conn: Connection, session_id: int, stale_seconds: float) -> None:
-    """서버 중단 등으로 갱신이 멈춘 진행 중 생성을 실패로 정리해 세션이 막히지 않게 한다."""
+def lock_stale_generations(conn: Connection, session_id: int, stale_seconds: float):
+    """서버 중단 등으로 갱신이 멈춘 진행 중 생성(id, 원문)을 잠가 읽는다. 트랜잭션 안에서 부른다.
+
+    실패 상태(보이는 글이 있는지)는 서비스가 원문으로 정하고 expire_generation으로 바꾼다.
+    """
+    return conn.execute(
+        """SELECT id, text FROM conversation_generations
+           WHERE session_id = %s AND status IN ('pending', 'streaming')
+             AND updated_at < clock_timestamp() - make_interval(secs => %s)
+           ORDER BY id
+           FOR UPDATE""",
+        (session_id, stale_seconds),
+    ).fetchall()
+
+
+def expire_generation(conn: Connection, generation_id: int, status: str) -> None:
+    """lock_stale_generations로 잠근 생성을 GENERATION_STALE 실패로 끝낸다(assistant 메시지도)."""
     conn.execute(
         """WITH expired AS (
                UPDATE conversation_generations
-               SET status = CASE WHEN text = '' THEN 'failed' ELSE 'failed_partial' END,
-                   error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
-               WHERE session_id = %s AND status IN ('pending', 'streaming')
-                 AND updated_at < clock_timestamp() - make_interval(secs => %s)
-               RETURNING session_id, assistant_message_id, status
+               SET status = %s, error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
+               WHERE id = %s AND status IN ('pending', 'streaming')
+               RETURNING session_id, assistant_message_id
            )
            UPDATE conversation_messages m
-           SET status = CASE e.status WHEN 'failed_partial' THEN 'interrupted' ELSE 'failed' END
+           SET status = %s
            FROM expired e
            WHERE m.session_id = e.session_id AND m.id = e.assistant_message_id""",
-        (session_id, stale_seconds),
+        (status, generation_id, MESSAGE_STATUS[status]),
     )
 
 

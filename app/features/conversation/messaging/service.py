@@ -9,7 +9,12 @@ from psycopg.errors import UniqueViolation
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.features.conversation.messaging import providers, repository, worker
-from app.features.conversation.messaging.info import apply_info, parse_info, split_info
+from app.features.conversation.messaging.info import (
+    apply_info,
+    parse_info,
+    scene_view,
+    split_info,
+)
 from app.features.conversation.messaging.parser import JS_TRIM_CHARS, parse_assistant_text
 from app.features.conversation.messaging.prompt import (
     PromptContext,
@@ -19,6 +24,7 @@ from app.features.conversation.messaging.prompt import (
 )
 from app.features.conversation.messaging.schemas import (
     ChatMessageResponse,
+    CurrentSceneResponse,
     GenerationResponse,
     GenerationRetryRequest,
     MessagePartRequest,
@@ -187,6 +193,47 @@ def _load_generation(conn: Connection, generation_id: int, offset: int = 0) -> G
     )
 
 
+# ---- 보이는 글 판단(CHAT-US-08: info만 있는 응답은 빈 응답) ----
+
+
+def _session_character_names(conn: Connection, session_id: int) -> list[str]:
+    """앱이 말풍선 태그로 인정하는 이름(세션 캐릭터 이름). 모델 요청의 등장 캐릭터 이름과 같다."""
+    return [row["name"] or "" for row in repository.list_session_characters(conn, session_id)]
+
+
+def has_visible_text(text: str, character_names: list[str]) -> bool:
+    """응답 원문에 이용자에게 보이는 글이 있는가. 빈 응답·실패 상태·청구를 정하는 하나뿐인 기준.
+
+    맨 끝 info 블록을 뗀 본문(info.py 규칙 1~6)을 앱과 같은 규칙(세션 캐릭터 이름, JS trim)으로
+    말풍선으로 나눴을 때 한 부분이라도 남으면 보인다. 받은 글자 수로 정하지 않는다. 그래서 info만
+    받고 끝나거나 끊긴 응답은 어느 경로(완료·공급자 오류·출력 한도·중단 정리·내부 오류)에서도 보이는
+    글이 없는 응답(failed, 청구 없음, 재시도 가능)이 된다.
+    """
+    body, _ = split_info(text)
+    return bool(parse_assistant_text(body, character_names, trim_chars=JS_TRIM_CHARS))
+
+
+def _failure_status(text: str, character_names: list[str]) -> str:
+    """실패한 생성의 상태: 보이는 글이 있으면 failed_partial(재시도 불가), 없으면 failed."""
+    return "failed_partial" if has_visible_text(text, character_names) else "failed"
+
+
+def _expire_stale(conn: Connection, session_id: int) -> None:
+    """서버 중단 등으로 갱신이 멈춘 진행 중 생성을 실패로 정리해 세션이 막히지 않게 한다.
+
+    상태는 받은 글자 수가 아니라 보이는 글(has_visible_text)로 정한다.
+    """
+    with conn.transaction():
+        stale = repository.lock_stale_generations(
+            conn, session_id, settings.chat_generation_stale_seconds
+        )
+        if not stale:
+            return
+        names = _session_character_names(conn, session_id)
+        for row in stale:
+            repository.expire_generation(conn, row["id"], _failure_status(row["text"], names))
+
+
 # ---- 전송 ----
 
 
@@ -227,7 +274,7 @@ def _insert_generation(
     생성 행에 연결한다. 재시도는 기존 이용자 메시지를 다시 쓰고 assistant 메시지만 새로 만든다.
     """
     session_id = session["id"]
-    repository.expire_stale_generations(conn, session_id, settings.chat_generation_stale_seconds)
+    _expire_stale(conn, session_id)
     try:
         with conn.transaction():
             if user_message_id is None:
@@ -291,9 +338,7 @@ def retry_generation(
             return _load_generation(conn, existing["id"])
         if session["read_only"]:
             raise ConversationReadOnlyError()
-        repository.expire_stale_generations(
-            conn, session_id, settings.chat_generation_stale_seconds
-        )
+        _expire_stale(conn, session_id)
         target = repository.get_generation(conn, generation_id, owner_id)
         latest = repository.get_latest_generation(conn, session_id)
         # 내용 없이 실패한 최신 요청만 이용자가 직접 다시 시도한다. 자동 재호출은 없다(AC15·16).
@@ -323,9 +368,7 @@ def get_generation(
         if row is None:
             raise GenerationNotFoundError()
         if row["status"] in repository.ACTIVE_STATUSES:
-            repository.expire_stale_generations(
-                conn, row["session_id"], settings.chat_generation_stale_seconds
-            )
+            _expire_stale(conn, row["session_id"])
     deadline = monotonic() + wait
     while True:
         with worker.connect() as conn:
@@ -344,19 +387,24 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
     session = repository.get_session(conn, session_id, owner_id)
     if session is None:
         raise SessionNotFoundError()
-    repository.expire_stale_generations(conn, session_id, settings.chat_generation_stale_seconds)
+    _expire_stale(conn, session_id)
     with conn.transaction():
         repository.set_consistent_read(conn)
         names = _Names(conn, session_id)
         rows = repository.list_messages(conn, session_id)
         parts = repository.list_parts(conn, session_id, [row["id"] for row in rows])
-        texts = {
-            row["message_id"]: row["text"]
-            for row in repository.list_completed_texts(conn, session_id)
-        }
+        completed = repository.list_completed_texts(conn, session_id)
+        texts = {row["message_id"]: row["text"] for row in completed}
         messages = [
             _chat_message(row, parts[row["id"]], names, texts.get(row["id"])) for row in rows
         ]
+        # CHAT-US-08: 다음 요청의 [현재 장면]과 같은 함수로 만든 누적 현재 장면(상태 카드용).
+        scene, states = _current_scene(
+            conn,
+            session_id,
+            repository.list_session_characters(conn, session_id),
+            completed=completed,
+        )
         latest = repository.get_latest_generation(conn, session_id)
         latest_id = latest["id"] if latest else None
         active = None
@@ -380,6 +428,7 @@ def get_turns(conn: Connection, owner_id: int, session_id: int) -> TurnsResponse
             # 세션의 현재 선택 모델(CHAT-US-13에서 바꿀 수 있음)의 표시 이름(models.name)과 id.
             model=session["model_name"],
             model_id=session["selected_model_id"],
+            current_scene=CurrentSceneResponse(**scene_view(scene, states)),
         )
 
 
@@ -393,13 +442,18 @@ def _prompt_part(part: dict, names: _Names) -> PromptPart:
 
 
 def _current_scene(
-    conn: Connection, session_id: int, session_characters, before_position: int
+    conn: Connection,
+    session_id: int,
+    session_characters,
+    before_position: int | None = None,
+    completed=None,
 ) -> tuple[dict | None, list[dict]]:
-    """CHAT-US-08 현재 장면과 캐릭터별 착장·속마음.
+    """CHAT-US-08 현재 장면과 캐릭터별 착장·속마음(모델 요청 [현재 장면]과 턴 API current_scene).
 
-    세션 시작 값(conversation_scene_states·character_states, 첫 대화용)에서 출발해 이번 이용자
-    입력 앞의 정상 완료된 응답 info를 오래된 것부터 덮어쓴다. info에 없는 항목은 앞 값을 잇는다.
-    세션 시작 값 행은 바꾸지 않는다.
+    세션 시작 값(conversation_scene_states·character_states, 첫 대화용)에서 출발해 정상 완료된
+    응답 info를 오래된 것부터 덮어쓴다. info에 없는 항목은 앞 값을 잇는다. before_position이
+    있으면 그 이용자 입력 앞의 응답만 쓴다(요청 때). 없으면 완료된 응답 전부(다음 요청이 쓸 값).
+    completed는 이미 읽은 list_completed_texts 결과(같은 조건)다. 세션 시작 값 행은 바꾸지 않는다.
     """
     row = repository.get_scene(conn, session_id)
     scene = dict(row) if row else None
@@ -413,7 +467,9 @@ def _current_scene(
     ]
     date_mode = scene["date_mode"] if scene else None
     names = [state["name"] for state in states]
-    for row in repository.list_completed_texts(conn, session_id, before_position):
+    if completed is None:
+        completed = repository.list_completed_texts(conn, session_id, before_position)
+    for row in completed:
         _, info = split_info(row["text"])
         if info is not None:
             scene, states = apply_info(scene, states, parse_info(info, date_mode, names))
@@ -507,9 +563,12 @@ def _speaker_ids(conn: Connection, session_id: int) -> dict[str, int]:
     return mapping
 
 
-def _fail(generation_id: int, streamed: int, code: str, reported_model: str | None) -> None:
-    status = "failed" if streamed == 0 else "failed_partial"
+def _fail(
+    generation_id: int, code: str, reported_model: str | None, character_names: list[str]
+) -> None:
+    """청구하지 않는 실패로 끝낸다. 상태는 지금까지 받은 원문의 보이는 글로 정한다."""
     with worker.connect() as conn:
+        status = _failure_status(repository.get_full_text(conn, generation_id), character_names)
         repository.finish_generation(
             conn, generation_id, status, error_code=code, reported_model=reported_model
         )
@@ -520,9 +579,8 @@ def _finish_output_limit(
 ) -> None:
     with worker.connect() as conn, conn.transaction():
         # CHAT-US-08: 맨 끝 info 블록은 보이는 글이 아니다(info만 있으면 청구하지 않는다).
-        body, _ = split_info(repository.get_full_text(conn, generation_id))
-        visible = bool(
-            parse_assistant_text(body, session_character_names, trim_chars=JS_TRIM_CHARS)
+        visible = has_visible_text(
+            repository.get_full_text(conn, generation_id), session_character_names
         )
         repository.finish_generation(
             conn,
@@ -575,13 +633,13 @@ def _stream(generation_id: int, claimed) -> None:
         character_names=context.session_character_names,
         last_user_text="\n".join(part.body for part in context.current),
     )
-    streamed = 0
+    names = context.session_character_names
     pending: list[str] = []
     # 첫 조각은 바로 기록하고 이후에는 최소 간격마다 모아 쓴다.
     last_flush = 0.0
 
     def flush() -> bool:
-        nonlocal streamed, pending, last_flush
+        nonlocal pending, last_flush
         last_flush = monotonic()
         if not pending:
             return True
@@ -590,7 +648,6 @@ def _stream(generation_id: int, claimed) -> None:
         with worker.connect() as conn:
             if not repository.append_text(conn, generation_id, chunk, request.reported_model):
                 return False
-        streamed += len(chunk)
         return True
 
     try:
@@ -609,18 +666,18 @@ def _stream(generation_id: int, claimed) -> None:
                 generation_id, context.session_character_names, request.reported_model
             )
         else:
-            _fail(generation_id, streamed, exc.code, request.reported_model)
+            _fail(generation_id, exc.code, request.reported_model, names)
         return
     except Exception:
         logger.exception("응답 생성 공급자 오류: generation=%s", generation_id)
         flush()
-        _fail(generation_id, streamed, "PROVIDER_ERROR", request.reported_model)
+        _fail(generation_id, "PROVIDER_ERROR", request.reported_model, names)
         return
     with worker.connect() as conn:
         text = repository.get_full_text(conn, generation_id)
     # CHAT-US-08: info 블록만 있는 응답도 빈 응답이다(완료·청구하지 않는다).
-    if not split_info(text)[0].strip():
-        _fail(generation_id, 0, "EMPTY_RESPONSE", request.reported_model)
+    if not has_visible_text(text, names):
+        _fail(generation_id, "EMPTY_RESPONSE", request.reported_model, names)
         return
     try:
         _save_completed(generation_id, claimed, request.reported_model)
@@ -650,7 +707,10 @@ def run_generation(generation_id: int) -> None:
             with worker.connect() as conn:
                 row = repository.get_generation(conn, generation_id)
                 if row is not None:
-                    status = "failed" if row["text_length"] == 0 else "failed_partial"
+                    status = _failure_status(
+                        repository.get_full_text(conn, generation_id),
+                        _session_character_names(conn, row["session_id"]),
+                    )
                     repository.finish_generation(
                         conn, generation_id, status, error_code="INTERNAL_ERROR"
                     )

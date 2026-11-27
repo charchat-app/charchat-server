@@ -83,6 +83,20 @@ class SceneInfoResponse(BaseModel):
     characters: list[SceneInfoCharacterResponse]
 
 
+class CurrentSceneResponse(BaseModel):
+    """CHAT-US-08 누적 현재 장면: 다음 요청의 [현재 장면]이 쓰는 값(상태 카드가 그린다).
+
+    세션 시작 값에 정상 완료된 응답의 info를 오래된 것부터 덮어쓴 결과다. 모양은 info의 읽은 값과
+    같고(text 없음), characters는 세션 캐릭터 전원(세션 순서, 모르는 항목은 null)이다.
+    date는 날짜 방식이 없거나 날짜 값이 하나도 없으면 null, time은 시가 없으면 null이다.
+    """
+
+    date: SceneInfoDateResponse | None
+    time: SceneInfoTimeResponse | None
+    place: str | None
+    characters: list[SceneInfoCharacterResponse]
+
+
 class ChatMessageResponse(BaseModel):
     id: int
     role: Literal["user", "assistant"]
@@ -117,3 +131,5 @@ class TurnsResponse(BaseModel):
     model: str
     # 세션의 현재 선택 모델 id(CHAT-US-13). 다음 전송·재시도가 이 모델로 요청한다.
     model_id: int
+    # CHAT-US-08: 다음 요청에 쓰일 누적 현재 장면(메시지별 info는 그 응답 하나의 값).
+    current_scene: CurrentSceneResponse
