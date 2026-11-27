@@ -644,7 +644,7 @@ def _run_child_offline(monkeypatch, mode):
     import psycopg
     from psycopg.rows import dict_row
 
-    from tests.features.creation.save_visibility import jev_http_transport
+    from app.features.creation.save_visibility import jev_http_transport
 
     connections, verified, smoked = [], [], []
 

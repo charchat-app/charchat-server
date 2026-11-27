@@ -666,7 +666,7 @@ def child_main(environ=None, *, mode=MODE_RATING, out=print):
                 target = connection
 
             stage = "import"
-            from tests.features.creation.save_visibility.jev_http_transport import (
+            from app.features.creation.save_visibility.jev_http_transport import (
                 JevHttpTransport,
             )
 
