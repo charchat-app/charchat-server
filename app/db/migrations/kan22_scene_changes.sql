@@ -20,24 +20,32 @@ $kan22$;
 CREATE TABLE IF NOT EXISTS public.conversation_scene_changes (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     session_id bigint NOT NULL REFERENCES public.conversation_sessions(id) ON DELETE CASCADE,
-    generation_id bigint NOT NULL REFERENCES public.conversation_generations(id),
-    assistant_message_id bigint NOT NULL,
-    evidence_message_id bigint NOT NULL,
-    evidence_from text NOT NULL CHECK (evidence_from IN ('user', 'assistant')),
+    -- judge = AI 판단(생성·메시지·근거 있음), user_edit = 이용자 직접 수정(모두 없음)
+    source text NOT NULL DEFAULT 'judge' CHECK (source IN ('judge', 'user_edit')),
+    generation_id bigint REFERENCES public.conversation_generations(id),
+    assistant_message_id bigint,
+    evidence_message_id bigint,
+    evidence_from text CHECK (evidence_from IN ('user', 'assistant')),
     evidence text NOT NULL DEFAULT '',
     before_state jsonb NOT NULL,
     after_state jsonb NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT conversation_scene_changes_source_fields CHECK (
+        (source = 'judge' AND generation_id IS NOT NULL AND assistant_message_id IS NOT NULL
+         AND evidence_message_id IS NOT NULL AND evidence_from IS NOT NULL)
+        OR (source = 'user_edit' AND generation_id IS NULL AND assistant_message_id IS NULL
+            AND evidence_message_id IS NULL AND evidence_from IS NULL)
+    )
 );
 DO $kan22$
 DECLARE
     actual text;
     idx regclass;
-    expected text := 'after_state jsonb NOT NULL,assistant_message_id bigint NOT NULL,'
+    expected text := 'after_state jsonb NOT NULL,assistant_message_id bigint,'
         || 'before_state jsonb NOT NULL,created_at timestamp with time zone NOT NULL,'
-        || 'evidence text NOT NULL,evidence_from text NOT NULL,'
-        || 'evidence_message_id bigint NOT NULL,generation_id bigint NOT NULL,'
-        || 'id bigint NOT NULL,session_id bigint NOT NULL';
+        || 'evidence text NOT NULL,evidence_from text,'
+        || 'evidence_message_id bigint,generation_id bigint,'
+        || 'id bigint NOT NULL,session_id bigint NOT NULL,source text NOT NULL';
 BEGIN
     SELECT string_agg(
                format('%s %s%s', a.attname, format_type(a.atttypid, a.atttypmod),
@@ -57,6 +65,12 @@ BEGIN
        AND c.contype <> 'n';  -- PostgreSQL 18의 NOT NULL 제약은 컬럼 검사에서 이미 본다
     IF actual IS DISTINCT FROM
         'CHECK ((evidence_from = ANY (ARRAY[''user''::text, ''assistant''::text])))'
+        || ' | CHECK ((source = ANY (ARRAY[''judge''::text, ''user_edit''::text])))'
+        || ' | CHECK ((((source = ''judge''::text) AND (generation_id IS NOT NULL)'
+        || ' AND (assistant_message_id IS NOT NULL) AND (evidence_message_id IS NOT NULL)'
+        || ' AND (evidence_from IS NOT NULL)) OR ((source = ''user_edit''::text)'
+        || ' AND (generation_id IS NULL) AND (assistant_message_id IS NULL)'
+        || ' AND (evidence_message_id IS NULL) AND (evidence_from IS NULL))))'
         || ' | FOREIGN KEY (generation_id) REFERENCES conversation_generations(id)'
         || ' | FOREIGN KEY (session_id) REFERENCES conversation_sessions(id) ON DELETE CASCADE'
         || ' | PRIMARY KEY (id)' THEN

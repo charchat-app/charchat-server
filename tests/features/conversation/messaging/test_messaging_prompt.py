@@ -451,9 +451,48 @@ def test_chat_us_06_ac06_first_person_format_example_uses_na():
 
 def test_chat_us_08_ac01_guardrail_keeps_scene_until_change_is_stated():
     guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
-    assert "[현재 장면]은 지금의 날짜·시각·장소·착장이다" in guide
-    assert "근거 없이 다른 장소나 시간대로 건너뛰지 않는다" in guide
+    assert "[현재 장면]은 지금의 날짜·시각·장소와 캐릭터별 착장·속마음이다" in guide
+    assert "근거 없이 다른 장소나 시간대로" in guide
     assert "장면을 멈춰 두지 않고 대화는 자연스럽게 진행한다" in guide
+
+
+def test_chat_us_08_user_edit_guardrail_follows_current_scene_of_user_character():
+    """이용자가 장면을 직접 고칠 수 있고(11-27 결정 C), 장면의 기준은 이용자 캐릭터다."""
+    guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
+    assert "[현재 장면]은 이용자 캐릭터가 있는 곳 기준이다." in guide
+    assert (
+        "[현재 장면]이 앞 대화와 다르면 [현재 장면]을 따른다(이용자가 장면을 직접 고쳤을 수 있다)."
+        in guide
+    )
+
+
+def test_chat_us_08_guardrail_uses_clothing_and_inner_thought_as_current_state():
+    guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
+    assert (
+        "착장과 속마음은 단순 정보가 아니라 응답에 반영할 지금의 상태다. 캐릭터의 행동·묘사는 "
+        "지금 입은 옷과 어긋나지 않게 쓰고, 속마음은 그 캐릭터의 말투·태도·망설임·행동에 드러나게 "
+        "한다. 속마음을 설명하듯 그대로 말하지는 않는다."
+    ) in guide
+    # 장면 지침 바로 다음 줄이다.
+    lines = guide.splitlines()
+    scene_line = next(i for i, line in enumerate(lines) if line.startswith("- [현재 장면]은"))
+    assert lines[scene_line + 1].startswith("- 착장과 속마음은 단순 정보가 아니라")
+
+
+def test_chat_us_08_scene_block_lists_clothing_and_inner_thought_of_every_character():
+    states = [
+        {"name": "도경", "clothing": "젖은 코트", "inner_thought": "피곤하다"},
+        {"name": "Bea", "clothing": "노란 우비", "inner_thought": "도경이 걱정된다"},
+    ]
+    block = build_messages(minimal_context(character_states=states))[1]["content"]
+    scene = block.split("[현재 장면]")[1]
+    for line in (
+        "도경 착장: 젖은 코트",
+        "도경 속마음: 피곤하다",
+        "Bea 착장: 노란 우비",
+        "Bea 속마음: 도경이 걱정된다",
+    ):
+        assert line in scene
 
 
 def test_chat_us_08_scene_block_has_no_invented_defaults():

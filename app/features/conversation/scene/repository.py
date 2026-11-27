@@ -3,6 +3,60 @@
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
+MAX_BIGINT = 2**63 - 1
+
+
+def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool = False):
+    """대화 시작·전송·모델 변경 API와 같은 접근 규칙으로 세션을 찾는다.
+
+    삭제 스토리의 세션은 읽기 전용(read_only)으로 남는다. lock이면 세션 행을 잠근다
+    (전송·재시도·모델 변경과 같은 잠금 순서: 세션 → 장면).
+    """
+    if session_id > MAX_BIGINT:
+        return None
+    return conn.execute(
+        """SELECT cs.id, s.deleted_at IS NOT NULL AS read_only
+           FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
+           WHERE cs.id = %s AND cs.owner_id = %s
+             AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
+                  OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))"""
+        + (" FOR UPDATE OF cs" if lock else ""),
+        (session_id, owner_id),
+    ).fetchone()
+
+
+def has_active_generation(conn: Connection, session_id: int, stale_seconds: float) -> bool:
+    """진행 중(pending·streaming) 생성이 있는지. 갱신이 멈춘(stale) 생성은 진행 중이 아니다."""
+    return (
+        conn.execute(
+            """SELECT 1 FROM conversation_generations
+               WHERE session_id = %s AND status IN ('pending', 'streaming')
+                 AND updated_at >= clock_timestamp() - make_interval(secs => %s)
+               LIMIT 1""",
+            (session_id, stale_seconds),
+        ).fetchone()
+        is not None
+    )
+
+
+def get_scene(conn: Connection, session_id: int):
+    """잠그지 않고 읽는다(장면 조회 API)."""
+    return conn.execute(
+        """SELECT date_mode, era, year, month, day, reference_event, elapsed_day, hour, minute,
+                  place
+           FROM conversation_scene_states WHERE session_id = %s""",
+        (session_id,),
+    ).fetchone()
+
+
+def list_character_states(conn: Connection, session_id: int):
+    """잠그지 않고 읽는다(장면 조회 API). 이름은 세션 이름(name_snapshot)이다."""
+    return conn.execute(
+        """SELECT id, name_snapshot AS name, clothing, inner_thought
+           FROM conversation_character_states WHERE session_id = %s ORDER BY id""",
+        (session_id,),
+    ).fetchall()
+
 
 def get_scene_for_update(conn: Connection, session_id: int):
     return conn.execute(
@@ -56,9 +110,9 @@ def insert_change(
 ) -> int:
     return conn.execute(
         """INSERT INTO conversation_scene_changes
-               (session_id, generation_id, assistant_message_id, evidence_message_id,
+               (session_id, source, generation_id, assistant_message_id, evidence_message_id,
                 evidence_from, evidence, before_state, after_state)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+           VALUES (%s, 'judge', %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (
             session_id,
             generation_id,
@@ -72,10 +126,19 @@ def insert_change(
     ).fetchone()["id"]
 
 
+def insert_user_edit_change(conn: Connection, *, session_id: int, before: dict, after: dict) -> int:
+    """이용자가 장면을 직접 고친 기록. 생성·메시지·근거는 없다."""
+    return conn.execute(
+        """INSERT INTO conversation_scene_changes (session_id, source, before_state, after_state)
+           VALUES (%s, 'user_edit', %s, %s) RETURNING id""",
+        (session_id, Jsonb(before), Jsonb(after)),
+    ).fetchone()["id"]
+
+
 def list_changes(conn: Connection, session_id: int):
     return conn.execute(
-        """SELECT id, generation_id, assistant_message_id, evidence_message_id, evidence_from,
-                  evidence, before_state, after_state, created_at
+        """SELECT id, source, generation_id, assistant_message_id, evidence_message_id,
+                  evidence_from, evidence, before_state, after_state, created_at
            FROM conversation_scene_changes WHERE session_id = %s ORDER BY id""",
         (session_id,),
     ).fetchall()

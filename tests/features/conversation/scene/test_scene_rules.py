@@ -2,6 +2,8 @@
 
 import pytest
 
+from app.features.conversation.messaging.prompt import PromptContext, PromptPart
+from app.features.conversation.scene.judge import build_judge_messages
 from app.features.conversation.scene.rules import (
     CharacterPatch,
     ScenePatch,
@@ -252,3 +254,34 @@ def test_chat_us_08_year_never_passes_creation_limit():
 )
 def test_chat_us_08_evidence_must_appear_in_this_turn(evidence, sources, found):
     assert evidence_found(evidence, *sources) is found
+
+
+def test_chat_us_08_judge_anchors_scene_to_user_character():
+    """장면의 기준은 이용자 캐릭터다(11-27 PM 결정). 판단 요청의 지침에 그대로 들어간다."""
+    context = PromptContext(
+        title="제목",
+        subtitle="",
+        world_description="",
+        tags=[],
+        characters=[],
+        expression={},
+        fewshots=[],
+        intro=[],
+        play_name="민서",
+        profile_description="",
+        scene={"place": "옥상"},
+        character_states=[],
+        affinities=[],
+        relationships=[],
+        session_character_names=["도경"],
+        current=[PromptPart("user", "민서", "도경은 먼저 내려갔다.")],
+    )
+    system = build_judge_messages(context, "@도경: 먼저 갈게.")[0]["content"]
+    rule = (
+        "- 장면의 기준은 이용자 캐릭터다. 장소·시각·날짜는 이용자 캐릭터가 있는 곳과 겪는 "
+        "시간을 따른다. 다른 캐릭터만 다른 곳으로 떠나거나 다른 곳에 있다는 서술은 장소 "
+        "변화가 아니다. 이용자 캐릭터가 이동했을 때만 장소를 바꾼다."
+    )
+    assert rule in system
+    lines = system.splitlines()
+    assert lines[lines.index(rule) - 1].startswith("- 장소: 다른 곳으로 이동한 것이 분명할 때만")
