@@ -163,6 +163,24 @@ CREATE TABLE story_categories (
 -- 분류 작업이 스토리 행을 FOR UPDATE로 잠근 트랜잭션 안에서 한 스토리의 연결을 통째로 바꾼다.
 -- 분류 실패·출력 오류·분류 중 확정본 변경 시에는 기존 연결을 그대로 둔다.
 
+-- CREATE-US-09-AC02: 최초 분류 작업 기록(transactional outbox). 스토리당 한 행.
+-- 최초 등록 트랜잭션에서 분류 필요 표시와 함께 넣고, 커밋 뒤에만 작업을 맡긴다.
+-- attempts는 공급자 호출 전에 올린다(멈춘 시도 포함). 상한은 worker.MAX_FIRST_ATTEMPTS(3).
+-- failure_reason은 마지막 미완료 사유의 고정 값만 담는다. 입력·응답·예외 문구는 넣지 않는다.
+-- 배포 DB에는 app/db/migrations/create_us09_first_classification_jobs.sql로 만든다.
+CREATE TABLE story_first_classification_jobs (
+    story_id bigint PRIMARY KEY REFERENCES stories(id),
+    status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 3),
+    failure_reason text
+        CHECK (failure_reason IN ('temporary', 'permanent', 'interrupted', 'stale', 'ineligible')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX story_first_classification_jobs_queued_idx
+    ON story_first_classification_jobs (story_id) WHERE status IN ('pending', 'running');
+
 -- 서비스 구현 의무 (SQL만으로 완료되지 않음):
 -- 소유권 확인, 스토리 행 잠금 규약, 스토리/캐릭터/태그를 한 트랜잭션으로 저장.
 -- 완성 저장: 필수값, 캐릭터 1~10명, 기본 정보+캐릭터 이름/상세 합산 3000자,

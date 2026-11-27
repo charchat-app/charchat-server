@@ -2,8 +2,9 @@
 
 import io
 import json
+import urllib.error
 import urllib.request
-from http.client import HTTPResponse
+from http.client import HTTPResponse, IncompleteRead
 
 import pytest
 
@@ -14,7 +15,10 @@ from app.features.creation.category_classification.classifier import (
     ClassificationError,
     OpenRouterClassifier,
 )
-from app.features.creation.category_classification.worker import ClassificationInput
+from app.features.creation.category_classification.worker import (
+    ClassificationInput,
+    RetryableClassificationError,
+)
 
 VALUE = ClassificationInput("마법 학교 세계관", ("기숙사 사감", None))
 
@@ -172,6 +176,64 @@ def test_default_transport_rejects_non_fixed_origin():
         module.urllib_transport("http://openrouter.ai/api/v1/chat/completions", {}, b"", 1, 10)
 
 
+def opener_raising(monkeypatch, error):
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            raise error
+
+    monkeypatch.setattr(module, "_opener", Opener)
+
+
+@pytest.mark.parametrize("code", [408, 429, 500, 502, 503, 599])
+def test_transient_http_status_is_retryable_CREATE_US_09_AC02(monkeypatch, code):
+    error = urllib.error.HTTPError(ENDPOINT, code, "x", {}, io.BytesIO(b"secret body"))
+    opener_raising(monkeypatch, error)
+    with pytest.raises(RetryableClassificationError) as caught:
+        module.urllib_transport(ENDPOINT, {}, b"", 1, 10)
+    # 기존 호출 측이 잡는 분류 실패 계층도 그대로 유지한다. 본문은 싣지 않는다.
+    assert isinstance(caught.value, ClassificationError)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("timed out"),
+        urllib.error.URLError("unreachable"),
+        ConnectionResetError(),
+        IncompleteRead(b"{}"),
+    ],
+)
+def test_network_and_timeout_failures_are_retryable_CREATE_US_09_AC02(monkeypatch, error):
+    opener_raising(monkeypatch, error)
+    with pytest.raises(RetryableClassificationError):
+        module.urllib_transport(ENDPOINT, {}, b"", 1, 10)
+
+
+@pytest.mark.parametrize("code", [302, 400, 401, 403, 404, 413, 422])
+def test_other_http_status_is_permanent_CREATE_US_09_AC02(monkeypatch, code):
+    opener_raising(monkeypatch, urllib.error.HTTPError(ENDPOINT, code, "x", {}, io.BytesIO()))
+    with pytest.raises(ClassificationError) as caught:
+        module.urllib_transport(ENDPOINT, {}, b"", 1, 10)
+    assert not isinstance(caught.value, RetryableClassificationError)
+
+
+def test_invalid_model_output_is_permanent_CREATE_US_09_AC02():
+    classify, _ = make(reply('{"categories": ["unknown"]}'))
+    with pytest.raises(ClassificationError) as caught:
+        classify(VALUE)
+    assert not isinstance(caught.value, RetryableClassificationError)
+
+
+def test_classifier_passes_retryable_transport_error_through_CREATE_US_09_AC02():
+    def failing(*_):
+        raise module.TemporaryClassificationError("Classifier HTTP status 429")
+
+    classify = OpenRouterClassifier(model="m", api_key="k", transport=failing)
+    with pytest.raises(RetryableClassificationError):
+        classify(VALUE)
+
+
 @pytest.mark.parametrize(
     "length,valid", [(None, True), ("2", True), ("invalid", False), ("3", False)]
 )
@@ -197,5 +259,7 @@ def test_transport_rejects_malformed_or_truncated_length(monkeypatch, length, va
     if valid:
         assert module.urllib_transport(ENDPOINT, {}, b"", 1, 10) == b"{}"
     else:
-        with pytest.raises(ClassificationError):
+        error = RetryableClassificationError if length == "3" else ClassificationError
+        with pytest.raises(error) as caught:
             module.urllib_transport(ENDPOINT, {}, b"", 1, 10)
+        assert isinstance(caught.value, RetryableClassificationError) == (length == "3")

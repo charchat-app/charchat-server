@@ -12,9 +12,13 @@ import json
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from http.client import IncompleteRead
 from typing import BinaryIO
 
-from app.features.creation.category_classification.worker import ClassificationInput
+from app.features.creation.category_classification.worker import (
+    ClassificationInput,
+    RetryableClassificationError,
+)
 
 ORIGIN = "https://openrouter.ai"
 ENDPOINT = f"{ORIGIN}/api/v1/chat/completions"
@@ -57,6 +61,10 @@ class ClassificationError(Exception):
     """분류 호출·응답 실패. 메시지에 입력·응답 본문을 담지 않는다."""
 
 
+class TemporaryClassificationError(ClassificationError, RetryableClassificationError):
+    """일시적인 분류 공급자 오류."""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # None을 돌려주면 urllib이 3xx를 HTTPError로 올린다.
@@ -96,13 +104,18 @@ def urllib_transport(
             expected_length = response.length
             data = _read_capped(response, limit)
             if expected_length is not None and len(data) != expected_length:
-                raise ClassificationError("Classifier response was incomplete")
+                raise TemporaryClassificationError("Classifier response was incomplete")
             return data
     except urllib.error.HTTPError as exc:
         exc.close()
-        raise ClassificationError(f"Classifier HTTP status {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ClassificationError(f"Classifier transport failed: {type(exc).__name__}") from None
+        kind = (
+            TemporaryClassificationError
+            if exc.code in (408, 429) or 500 <= exc.code < 600
+            else ClassificationError
+        )
+        raise kind(f"Classifier HTTP status {exc.code}") from None
+    except (OSError, IncompleteRead):
+        raise TemporaryClassificationError("Classifier network or timeout failure") from None
 
 
 def _unique_object(items):
@@ -200,7 +213,7 @@ class OpenRouterClassifier:
             raw = self._transport(
                 ENDPOINT, headers, self.request_body(value), self.timeout, MAX_RESPONSE_BYTES
             )
-        except ClassificationError:
+        except (ClassificationError, RetryableClassificationError):
             raise
         except Exception as exc:
             raise ClassificationError(

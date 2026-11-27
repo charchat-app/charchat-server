@@ -53,6 +53,63 @@ def category_codes(connection):
     return {row[0] for row in connection.execute("SELECT code FROM categories")}
 
 
+def enqueue_first(connection, story_id):
+    connection.execute(
+        "INSERT INTO story_first_classification_jobs (story_id) VALUES (%s) ON CONFLICT DO NOTHING",
+        (story_id,),
+    )
+
+
+def reopen_first_for_edit(connection, story_id, max_attempts):
+    connection.execute(
+        """UPDATE story_first_classification_jobs
+           SET status='pending', attempts=0, failure_reason=NULL, updated_at=clock_timestamp()
+           WHERE story_id=%s AND (status='failed' OR (status='running' AND attempts=%s))""",
+        (story_id, max_attempts),
+    )
+
+
+def try_lock_first(connection, story_id):
+    return connection.execute("SELECT pg_try_advisory_lock(%s::bigint)", (-story_id,)).fetchone()[0]
+
+
+def first_job(connection, story_id):
+    return connection.execute(
+        "SELECT status, attempts, failure_reason "
+        "FROM story_first_classification_jobs WHERE story_id=%s",
+        (story_id,),
+    ).fetchone()
+
+
+def start_first_attempt(connection, story_id):
+    connection.execute(
+        """UPDATE story_first_classification_jobs
+           SET attempts=attempts+1, status='running', failure_reason=NULL,
+               updated_at=clock_timestamp()
+           WHERE story_id=%s""",
+        (story_id,),
+    )
+
+
+def finish_first_attempt(connection, story_id, status, reason=None, *, reset_attempts=False):
+    connection.execute(
+        """UPDATE story_first_classification_jobs
+           SET status=%s, failure_reason=%s, updated_at=clock_timestamp(),
+               attempts=CASE WHEN %s THEN 0 ELSE attempts END WHERE story_id=%s""",
+        (status, reason, reset_attempts, story_id),
+    )
+
+
+def recoverable_first_ids(connection):
+    return [
+        row[0]
+        for row in connection.execute(
+            """SELECT story_id FROM story_first_classification_jobs
+               WHERE status IN ('pending', 'running') ORDER BY story_id"""
+        )
+    ]
+
+
 def lock_pending(connection, story_id, *, first_only=False):
     eligibility = _eligibility(True, first_only)
     return (

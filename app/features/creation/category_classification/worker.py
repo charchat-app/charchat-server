@@ -1,6 +1,7 @@
 """CREATE-US-09 등록 후 확정 변경을 모아 처리하는 독립 분류 작업."""
 
 import logging
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event
@@ -15,6 +16,11 @@ logger = logging.getLogger(__name__)
 INTERVAL_SECONDS = 3600
 # 이 DB의 카테고리 배치만 직렬화한다. 스토리 행 잠금과는 별개다.
 CYCLE_LOCK = 0x43415409
+MAX_FIRST_ATTEMPTS = 3
+
+
+class RetryableClassificationError(Exception):
+    """다시 시도할 수 있는 분류기 오류."""
 
 
 @dataclass(frozen=True)
@@ -45,12 +51,18 @@ def _validate(raw: object, known_codes: set[str]) -> tuple[str, ...] | None:
     return tuple(raw)
 
 
-def _infer(classify: Classifier, snapshot, known_codes: set[str]) -> tuple[str, ...] | None:
+def _infer(
+    classify: Classifier, snapshot, known_codes: set[str], *, propagate_retryable=False
+) -> tuple[str, ...] | None:
     """트랜잭션·행 잠금 밖에서 호출한다. 실패·잘못된 출력은 None."""
     world, characters = snapshot
     value = ClassificationInput(world, tuple(description for _, description in characters))
     try:
         return _validate(classify(value), known_codes)
+    except RetryableClassificationError:
+        if propagate_retryable:
+            raise
+        return None
     except Exception:
         # 공급자 예외에 입력/응답이 포함될 수 있으므로 본문을 기록하지 않는다.
         return None
@@ -93,32 +105,75 @@ def run_cycle(database_url: str, classify: Classifier) -> CycleReport:
         return report
 
 
-FirstOutcome = Literal["completed", "stale", "failed", "ineligible", "error"]
+FirstOutcome = Literal["completed", "stale", "failed", "ineligible", "error", "busy"]
+
+
+def _first_attempts(conn, story_id, classify) -> FirstOutcome:
+    known_codes = repository.category_codes(conn)
+    while True:
+        with conn.transaction():
+            eligible = repository.lock_pending(conn, story_id, first_only=True)
+            job = repository.first_job(conn, story_id)
+            if job is None or job[0] not in ("pending", "running"):
+                return "ineligible"
+            if not eligible:
+                repository.finish_first_attempt(conn, story_id, "failed", "ineligible")
+                return "ineligible"
+            status, attempts, last_reason = job
+            if attempts == MAX_FIRST_ATTEMPTS:
+                reason = "interrupted" if status == "running" else last_reason
+                repository.finish_first_attempt(conn, story_id, "failed", reason)
+                return "failed"
+            snapshot = repository.read_inputs(conn, story_id, first_only=True)
+            repository.start_first_attempt(conn, story_id)
+        attempt = attempts + 1
+        try:
+            codes = _infer(classify, snapshot, known_codes, propagate_retryable=True)
+            reason = "permanent"
+        except RetryableClassificationError:
+            codes, reason = None, "temporary"
+
+        # 확정 저장과 동일한 순서로 스토리 행을 잠근 뒤 작업 기록을 갱신한다.
+        with conn.transaction():
+            if not repository.lock_pending(conn, story_id, first_only=True):
+                repository.finish_first_attempt(conn, story_id, "failed", "ineligible")
+                return "ineligible"
+            if (
+                repository.first_job(conn, story_id)[0] != "running"
+                or repository.read_inputs(conn, story_id, first_only=True) != snapshot
+            ):
+                repository.finish_first_attempt(
+                    conn, story_id, "pending", "stale", reset_attempts=attempt == MAX_FIRST_ATTEMPTS
+                )
+                return "stale"
+            if codes is not None:
+                repository.save_result(conn, story_id, codes)
+                repository.finish_first_attempt(conn, story_id, "completed")
+                return "completed"
+            if reason == "temporary" and attempt < MAX_FIRST_ATTEMPTS:
+                repository.finish_first_attempt(conn, story_id, "pending", reason)
+            else:
+                repository.finish_first_attempt(conn, story_id, "failed", reason)
+                return "failed"
 
 
 def classify_first(database_url: str, story_id: int, classify: Classifier) -> FirstOutcome:
-    """최초 등록 직후 한 스토리만 분류한다. 요청 커넥션과 별도의 새 연결을 쓴다.
-
-    유효 결과가 아직 없고 분류 필요로 표시된 활성 등록 스토리만 다룬다. 실패·잘못된 출력·
-    분류 중 확정본 변경(stale)은 표시와 기존 상태를 그대로 둔다. 다시 시도하지 않는다.
-    """
+    """커밋된 최초 분류 작업 하나를 실행한다. 세션 종료 시 작업 잠금도 해제된다."""
     try:
         with psycopg.connect(database_url, autocommit=True) as conn:
-            snapshot = repository.read_inputs(conn, story_id, first_only=True)
-            if snapshot is None:
-                return "ineligible"
-            known_codes = repository.category_codes(conn)
-            codes = _infer(classify, snapshot, known_codes)
-            if codes is None:
-                logger.warning("First category classification failed story_id=%d", story_id)
-                return "failed"
-            if _save_if_current(conn, story_id, snapshot, codes, first_only=True):
-                return "completed"
-            logger.info("First category classification was stale story_id=%d", story_id)
-            return "stale"
+            if not repository.try_lock_first(conn, story_id):
+                return "busy"
+            return _first_attempts(conn, story_id, classify)
     except psycopg.Error:
         logger.error("First category classification failed due to a database error")
         return "error"
+
+
+def recover_first_jobs(database_url: str, classify: Classifier) -> dict[FirstOutcome, int]:
+    """별도 작업 실행기가 대기 중이거나 중단된 최초 작업을 다시 맡는다."""
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        ids = repository.recoverable_first_ids(conn)
+    return dict(Counter(classify_first(database_url, story_id, classify) for story_id in ids))
 
 
 def run_hourly(

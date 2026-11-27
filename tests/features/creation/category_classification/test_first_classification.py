@@ -191,10 +191,13 @@ def test_first_worker_skips_ineligible_stories_CREATE_US_09_AC04(db, db_url):
         return story_id
 
     prior = seed("private", True, ["modern"])
-    for story_id in (seed("draft", False), seed("private", False), prior, 999_999):
+    # 최초 분류 작업 기록(AC02)이 없는 스토리는 등록 대기 표시가 있어도 다루지 않는다.
+    unqueued = seed("public", True)
+    for story_id in (seed("draft", False), seed("private", False), prior, unqueued, 999_999):
         assert classify_first(db_url, story_id, unexpected) == "ineligible"
     assert state(db, {"id": prior}) == {"pending": True, "categories": ["modern"]}
     eligible = seed("public", True)
+    db.execute("INSERT INTO story_first_classification_jobs(story_id) VALUES (%s)", (eligible,))
     assert classify_first(db_url, eligible, lambda _: ["gl"]) == "completed"
     assert state(db, {"id": eligible}) == {"pending": False, "categories": ["gl"]}
     assert classify_first(db_url, eligible, unexpected) == "ineligible"
