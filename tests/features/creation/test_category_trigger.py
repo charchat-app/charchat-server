@@ -2,6 +2,7 @@
 
 import pytest
 
+from app.features.creation.category_classification.worker import run_cycle
 from tests.features.creation.speech_style.test_common_save_api import body, complete, put
 
 STORIES = "/api/v1/creation/stories"
@@ -81,3 +82,39 @@ def test_only_committed_category_inputs_mark_pending_CREATE_US_09_AC07(client, d
     rename["characters"][0]["description"] = "바뀐 인물 상세"
     assert client.put(endpoint, json=rename).status_code == 200
     assert pending(db, story)
+
+
+def test_api_roster_changes_coalesce_into_one_cycle_CREATE_US_09_AC07(client, db, db_url):
+    client.headers["X-User-Id"] = "100"
+    story = create_complete(client, db_url)
+    assert put(client, story, body("private"), "register").status_code == 200
+    story_id = story["id"]
+    db.execute("INSERT INTO story_categories VALUES (%s,'modern')", (story_id,))
+    db.execute("UPDATE stories SET category_classification_needed=false WHERE id=%s", (story_id,))
+    (cid,) = [
+        r["id"] for r in db.execute("SELECT id FROM characters WHERE story_id=%s", (story_id,))
+    ]
+    endpoint = f"{STORIES}/{story_id}"
+    original = {"id": cid, "name": "하린", "description": "원래 상세"}
+    added = {"name": "윤서", "description": "새 인물"}
+    basic = {"title": "검수 스토리", "subtitle": "한 줄 소개", "world_description": "기존 세계관"}
+    assert client.put(endpoint, json={**basic, "characters": [original, added]}).status_code == 200
+    assert pending(db, story)
+    calls = []
+
+    def classify(value):
+        calls.append(value.character_descriptions)
+        return ["modern"]
+
+    assert run_cycle(db_url, classify).completed == 1
+    rows = db.execute("SELECT id,name,description FROM characters WHERE story_id=%s", (story_id,))
+    second = next(row for row in rows if row["id"] != cid)
+    assert client.put(endpoint, json={**basic, "characters": [second, original]}).status_code == 200
+    assert not pending(db, story)
+    assert client.put(endpoint, json={**basic, "characters": [original]}).status_code == 200
+    assert pending(db, story)
+    latest = {**original, "description": "최종 상세"}
+    assert client.put(endpoint, json={**basic, "characters": [latest]}).status_code == 200
+    assert run_cycle(db_url, classify).completed == 1
+    assert calls == [("원래 상세", "새 인물"), ("최종 상세",)]
+    assert run_cycle(db_url, classify).selected == 0

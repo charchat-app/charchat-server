@@ -139,6 +139,30 @@ CREATE INDEX story_tags_tag_story_idx ON story_tags(tag_id, story_id);
 -- 비공개/임시 저장에도 태그 연결은 유지하며 공개 사용 수에서만 제외한다.
 -- 후보 매칭·동률 정렬·0개 태그 노출 여부는 미결이다.
 
+-- CREATE-US-09: 카테고리 기준 데이터와 스토리 연결. 원격 DB의 기존 정의와 같은 모양으로 맞춘다.
+CREATE TABLE categories (
+    code text PRIMARY KEY,
+    name text NOT NULL UNIQUE
+);
+INSERT INTO categories (code, name) VALUES
+    ('bl', 'BL'),
+    ('gl', 'GL'),
+    ('historical_martial', '시대/무협'),
+    ('horror_mystery', '공포/미스테리'),
+    ('modern', '일상/현대'),
+    ('romance', '로맨스'),
+    ('romance_fantasy', '로판'),
+    ('sf_fantasy', 'SF/판타지'),
+    ('simulation_rpg', '시뮬레이션/RPG');
+
+CREATE TABLE story_categories (
+    story_id bigint NOT NULL REFERENCES stories(id),
+    category_code text NOT NULL REFERENCES categories(code),
+    PRIMARY KEY (story_id, category_code)
+);
+-- 분류 작업이 스토리 행을 FOR UPDATE로 잠근 트랜잭션 안에서 한 스토리의 연결을 통째로 바꾼다.
+-- 분류 실패·출력 오류·분류 중 확정본 변경 시에는 기존 연결을 그대로 둔다.
+
 -- 서비스 구현 의무 (SQL만으로 완료되지 않음):
 -- 소유권 확인, 스토리 행 잠금 규약, 스토리/캐릭터/태그를 한 트랜잭션으로 저장.
 -- 완성 저장: 필수값, 캐릭터 1~10명, 기본 정보+캐릭터 이름/상세 합산 3000자,
