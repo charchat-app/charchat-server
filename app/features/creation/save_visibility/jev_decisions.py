@@ -100,10 +100,14 @@ _AGE_CONTEXT = {
     AgeContext.CONTRADICTORY: "Age cues for this character conflict with each other.",
 }
 _MINOR = {
-    MinorDepiction.ABSENT: "This character is not portrayed as a minor or child.",
+    MinorDepiction.ABSENT: (
+        "This character is not portrayed as a minor or child. Use this when there is no "
+        "independent evidence of minor portrayal; a numeric age by itself is not evidence of "
+        "minor portrayal, because the stated age is classified separately."
+    ),
     MinorDepiction.DEPICTED: (
-        "This character is portrayed as a minor or child (appearance, school grade, role, or "
-        "behavior), regardless of any stated age."
+        "This character is independently portrayed as a minor or child (appearance, school "
+        "grade, role, or behavior), regardless of any stated age."
     ),
     MinorDepiction.UNCLEAR: "It is unclear whether this character is portrayed as a minor.",
 }
@@ -245,7 +249,12 @@ def build_plan(snapshot) -> _Plan | None:
             _AGE_CONTEXT,
         )
         questions[f"{key}_minor_portrayal"] = _question(
-            roster + "Classify whether this character is portrayed as a minor.", _MINOR
+            roster + "Classify whether this character is independently portrayed as a minor "
+            "through appearance, school grade, role, or behavior. A numeric age by itself is not "
+            "evidence of minor portrayal; the stated age is classified in a separate question. "
+            "Independent appearance, school grade, role, or behavior still counts regardless of "
+            "any stated age.",
+            _MINOR,
         )
         questions[f"{key}_kinship_in_description"] = _question(
             roster + "Classify family ties between this character and the user written in the "

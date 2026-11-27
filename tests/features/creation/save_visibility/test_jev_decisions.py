@@ -238,6 +238,30 @@ def test_kinship_criteria_cover_short_korean_terms_and_honorifics_CREATE_US_08_A
     assert "Ignore descriptions and other relations." in relation
 
 
+def test_minor_portrayal_excludes_numeric_age_alone_keeps_separate_cues_CREATE_US_08_AC04_AC09():
+    """미성년 묘사 질문: 숫자 나이만으로는 독립 묘사 근거가 아니다(나이는 age_band가 본다).
+
+    실제로 따로 적힌 근거(외모·학년·역할·행동)는 명시 나이와 관계없이 그대로 묘사로 본다.
+    선택지 집합·질문 이름·판정 매핑은 바꾸지 않는다.
+    """
+    _, transport = evaluate()
+    questions = body_of(transport.requests[0])["questions"]
+    for key in ("c1", "c2"):
+        question = questions[f"{key}_minor_portrayal"]
+        assert set(question["criteria"]) == {"absent", "depicted", "unclear"}
+        depicted = question["criteria"]["depicted"]
+        # 따로 적힌 근거는 명시 나이와 관계없이 유지한다.
+        for cue in ("appearance", "school grade", "role", "behavior"):
+            assert cue in depicted
+        assert "regardless of any stated age" in depicted
+        # 숫자 나이만으로는 독립 근거가 아님을 질문 계약에 명시한다.
+        contract = " ".join([question["instructions"], *question["criteria"].values()]).lower()
+        sentences = [s for s in contract.split(".") if "numeric age by itself" in s]
+        assert sentences, "numeric age by itself must be explicitly addressed"
+        assert any(" not " in f" {s} " for s in sentences)
+        assert any("evidence" in s for s in sentences)
+
+
 def test_user_character_question_is_narrow_independent_depiction_CREATE_US_08_AC04():
     _, transport = evaluate()
     question = body_of(transport.requests[0])["questions"]["user_character_age"]
