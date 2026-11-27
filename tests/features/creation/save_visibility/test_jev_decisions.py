@@ -212,6 +212,32 @@ def test_kinship_criteria_are_only_counterpart_and_user_biological_ties_CREATE_U
     assert "relations list" in description
 
 
+def test_kinship_criteria_cover_short_korean_terms_and_honorifics_CREATE_US_08_AC06_AC08():
+    """합성 사례 회귀: 관계만 있는 `친형제자매`는 형제자매, 호칭만 쓴 `오빠`는 비제한 관계다.
+
+    판정 정책은 그대로 두고 질문 문구만 본다. 명시적 짧은 한국어 친족어는 추가 문장 없이 혈연을
+    정하고, 뜻이 갈리는 맨 형제 용어는 추측하지 않으며, 출처 범위 제한은 유지한다.
+    """
+    _, transport = evaluate(snap(relations=[("user", None, "character", 9001, "친형제자매")]))
+    questions = body_of(transport.requests[0])["questions"]
+    for name in ("c1_kinship_in_description", "c1_kinship_in_relation"):
+        criteria = questions[name]["criteria"]
+        sibling = criteria["biological_sibling"]
+        assert "친형제자매" in sibling
+        assert "no extra sentence" in sibling  # 명시적 친족어만으로 충분하다.
+        unclear = criteria["unclear"]
+        assert "형제" in unclear and "do not guess" in unclear  # 맨 형제 용어는 추측 금지.
+        assert "친형제자매" not in unclear
+        non_restricted = criteria["non_restricted"]
+        assert "오빠" in non_restricted and "honorific" in non_restricted
+        assert "only an honorific is non_restricted, not none" in criteria["none"]
+    # 출처 범위 제한은 그대로다.
+    assert "ignore the relations list" in questions["c1_kinship_in_description"]["instructions"]
+    relation = questions["c1_kinship_in_relation"]["instructions"]
+    assert "only in these relations: r1." in relation
+    assert "Ignore descriptions and other relations." in relation
+
+
 def test_user_character_question_is_narrow_independent_depiction_CREATE_US_08_AC04():
     _, transport = evaluate()
     question = body_of(transport.requests[0])["questions"]["user_character_age"]

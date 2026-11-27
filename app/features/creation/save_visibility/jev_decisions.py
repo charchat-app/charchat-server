@@ -108,22 +108,30 @@ _MINOR = {
     MinorDepiction.UNCLEAR: "It is unclear whether this character is portrayed as a minor.",
 }
 # 승인 범위(AC06~08): 이 명단 인물과 유저 캐릭터 사이의 생물학적 혈연만 제한한다.
+# 문구만 다듬는다(판정 정책·키워드 규칙 없음). 짧은 한국어 친족어 예시는 합성 사례 회귀를 막는다.
 _KINSHIP = {
-    Kinship.NONE: "No family tie between this character and the user is written.",
+    Kinship.NONE: (
+        "No family tie or family term between this character and the user is written. A "
+        "family term written explicitly as only an honorific is non_restricted, not none."
+    ),
     Kinship.NON_RESTRICTED: (
         "Only non-restricted ties between this character and the user: family terms used as "
-        "nicknames or honorifics, in-laws, or step or adoptive family (never biological). Ties "
-        "with other roster characters or third parties do not count."
+        "nicknames or honorifics (for example 오빠 explicitly written as only an honorific), "
+        "in-laws, or step or adoptive family (never biological). Ties with other roster "
+        "characters or third parties do not count."
     ),
     Kinship.BIOLOGICAL_PARENT_CHILD: (
         "This character and the user are explicitly written as biological parent and child."
     ),
     Kinship.BIOLOGICAL_SIBLING: (
-        "This character and the user are explicitly written as biological siblings."
+        "This character and the user are explicitly written as biological siblings. An "
+        "explicit biological sibling term such as 친형제자매 alone establishes this; no extra "
+        "sentence is needed."
     ),
     Kinship.UNCLEAR: (
         "A family tie between this character and the user is written but whether it is "
-        "biological is not stated; do not guess."
+        "biological is not stated, such as a bare sibling term like 형제 with nothing else; "
+        "do not guess."
     ),
 }
 _IGNORE_OTHER_TIES = (
