@@ -14,26 +14,58 @@ def get_session(conn: Connection, session_id: int, owner_id: int, *, lock: bool 
     """
     if session_id > MAX_BIGINT:
         return None
+    if lock:
+        # messaging.repository.get_session과 같이 조인 없이 세션 행만 먼저 잠근다. 조인 쿼리에
+        # FOR UPDATE를 붙이면 기다리는 동안 바뀐 stories 행(삭제 등)을 옛 값으로 다시 확인한다.
+        # 잠금을 얻은 뒤 아래 조회는 커밋된 최신 값을 읽는다.
+        locked = conn.execute(
+            "SELECT id FROM conversation_sessions WHERE id = %s AND owner_id = %s FOR UPDATE",
+            (session_id, owner_id),
+        ).fetchone()
+        if locked is None:
+            return None
     return conn.execute(
         """SELECT cs.id, s.deleted_at IS NOT NULL AS read_only
            FROM conversation_sessions cs JOIN stories s ON s.id = cs.story_id
            WHERE cs.id = %s AND cs.owner_id = %s
              AND (s.deleted_at IS NOT NULL OR s.save_state = 'public'
-                  OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))"""
-        + (" FOR UPDATE OF cs" if lock else ""),
+                  OR (s.owner_id = cs.owner_id AND s.save_state IN ('public', 'private')))""",
         (session_id, owner_id),
     ).fetchone()
 
 
-def has_active_generation(conn: Connection, session_id: int, stale_seconds: float) -> bool:
-    """진행 중(pending·streaming) 생성이 있는지. 갱신이 멈춘(stale) 생성은 진행 중이 아니다."""
+def expire_stale_generations(conn: Connection, session_id: int, stale_seconds: float) -> None:
+    """갱신이 멈춘 진행 중 생성을 실패로 정리한다. 세션 행을 잠근 트랜잭션 안에서 호출한다.
+
+    SQL은 messaging.repository.expire_stale_generations(전송·재시도가 쓰는 정리)와 같다.
+    다른 기능의 repository는 import하지 않는 규칙이라 그대로 옮겨 두었다. 바꿀 때 함께 바꾼다.
+    정리된 생성은 나중에 작업이 살아 있어도 완료로 저장되지 않는다(finish_generation이
+    streaming만 끝내고, mark_streaming이 pending만 집는다). 그래서 이용자 수정을 덮어쓰지 않는다.
+    """
+    conn.execute(
+        """WITH expired AS (
+               UPDATE conversation_generations
+               SET status = CASE WHEN text = '' THEN 'failed' ELSE 'failed_partial' END,
+                   error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
+               WHERE session_id = %s AND status IN ('pending', 'streaming')
+                 AND updated_at < clock_timestamp() - make_interval(secs => %s)
+               RETURNING session_id, assistant_message_id, status
+           )
+           UPDATE conversation_messages m
+           SET status = CASE e.status WHEN 'failed_partial' THEN 'interrupted' ELSE 'failed' END
+           FROM expired e
+           WHERE m.session_id = e.session_id AND m.id = e.assistant_message_id""",
+        (session_id, stale_seconds),
+    )
+
+
+def has_active_generation(conn: Connection, session_id: int) -> bool:
+    """진행 중(pending·streaming) 생성이 있는지. 먼저 expire_stale_generations로 정리하고 부른다."""
     return (
         conn.execute(
             """SELECT 1 FROM conversation_generations
-               WHERE session_id = %s AND status IN ('pending', 'streaming')
-                 AND updated_at >= clock_timestamp() - make_interval(secs => %s)
-               LIMIT 1""",
-            (session_id, stale_seconds),
+               WHERE session_id = %s AND status IN ('pending', 'streaming') LIMIT 1""",
+            (session_id,),
         ).fetchone()
         is not None
     )

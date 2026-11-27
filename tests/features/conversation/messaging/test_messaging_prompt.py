@@ -457,13 +457,38 @@ def test_chat_us_08_ac01_guardrail_keeps_scene_until_change_is_stated():
 
 
 def test_chat_us_08_user_edit_guardrail_follows_current_scene_of_user_character():
-    """이용자가 장면을 직접 고칠 수 있고(11-27 결정 C), 장면의 기준은 이용자 캐릭터다."""
+    """장면의 기준은 이용자 캐릭터다. 직접 수정 알림은 지침이 아니라 그때의 장면 블록에만 붙는다
+    (판단이 놓친 이동까지 '장면을 따르라'로 되돌리지 않게)."""
     guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
     assert "[현재 장면]은 이용자 캐릭터가 있는 곳 기준이다." in guide
-    assert (
-        "[현재 장면]이 앞 대화와 다르면 [현재 장면]을 따른다(이용자가 장면을 직접 고쳤을 수 있다)."
-        in guide
+    assert "앞 대화와 다르면" not in guide
+    assert "직접 고쳤" not in guide
+
+
+USER_EDITED_NOTE = "※ 이용자가 방금 이 장면을 직접 고쳤다. 앞 대화와 달라도 이 장면에서 이어 간다."
+
+
+def test_chat_us_08_user_edit_note_ends_scene_block_only_when_edited():
+    states = [{"name": "도경", "clothing": "회색 셔츠", "inner_thought": None}]
+    first = build_messages(minimal_context(character_states=states, scene_user_edited=True))
+    scene = first[1]["content"].split("[현재 장면]\n")[1].split("\n\n")[0]
+    assert scene.endswith("도경 착장: 회색 셔츠\n" + USER_EDITED_NOTE)
+    assert USER_EDITED_NOTE not in first[0]["content"]
+    # 이후 턴: 새 입력 바로 앞 [현재 장면] 블록 끝, [이용자 입력] 앞.
+    history = [
+        PromptHistoryMessage("user", [PromptPart("user", "민서", "앞 입력")]),
+        PromptHistoryMessage("assistant", [PromptPart("narrator", None, "앞 응답")]),
+    ]
+    later = build_messages(minimal_context(scene_user_edited=True, history=history))
+    assert later[-1]["content"] == (
+        "[현재 장면]\n장소: 옥상\n" + USER_EDITED_NOTE + "\n\n[이용자 입력]\n[민서] 지금 입력"
     )
+    # 고치지 않았으면 어디에도 없다.
+    for messages in (
+        build_messages(minimal_context()),
+        build_messages(minimal_context(history=history)),
+    ):
+        assert all(USER_EDITED_NOTE not in m["content"] for m in messages)
 
 
 def test_chat_us_08_guardrail_uses_clothing_and_inner_thought_as_current_state():

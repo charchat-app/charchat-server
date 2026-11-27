@@ -164,7 +164,8 @@ def _clean_text(value: str | None, field: str, limit: int, issues: list[dict]) -
     """앞뒤 공백을 지우고 빈 문자열은 미지정(None)으로 본다. NUL·상한 초과는 문제로 모은다."""
     if value is None:
         return None
-    if "\x00" in value:
+    if "\x00" in value or any("\ud800" <= ch <= "\udfff" for ch in value):
+        # NUL·짝 없는 서로게이트는 DB에 저장할 수 없다(500 대신 422).
         issues.append(_issue(field, "SCENE_TEXT_INVALID"))
         return None
     value = value.strip()
@@ -305,9 +306,12 @@ def update_scene(
             raise SessionNotFoundError()
         if session["read_only"]:
             raise ConversationReadOnlyError()
-        if repository.has_active_generation(
+        # 전송·재시도와 같이 멈춘 생성은 먼저 실패로 정리한다. 정리하지 않고 지나치면 아직 살아 있는
+        # 작업이 나중에 완료 저장하며 고치기 전 장면으로 판단한 결과를 덮어쓸 수 있다.
+        repository.expire_stale_generations(
             conn, session_id, settings.chat_generation_stale_seconds
-        ):
+        )
+        if repository.has_active_generation(conn, session_id):
             raise GenerationInProgressError()
         row = repository.get_scene_for_update(conn, session_id)
         if row is None:
@@ -319,8 +323,9 @@ def update_scene(
         ]
         values, requested, issues = check_user_edit(scene["date_mode"], request)
         character_issues = _character_issues(requested, {r["id"] for r in characters})
+        # 문제는 한 번에 모두 알려 준다. 캐릭터 ID 문제가 하나라도 있으면 캐릭터 코드로 응답한다.
         if character_issues:
-            raise SceneCharacterInvalidError(issues=character_issues)
+            raise SceneCharacterInvalidError(issues=issues + character_issues)
         if issues:
             raise SceneInvalidError(issues=issues)
         new_scene = {**{key: scene.get(key) for key in SCENE_FIELDS}, **values}

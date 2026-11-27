@@ -436,6 +436,8 @@ def load_prompt_context(conn: Connection, generation) -> PromptContext:
         session_character_names=[row["name"] or "" for row in session_characters],
         history=history,
         current=[_prompt_part(part, names) for part in parts[user_message["id"]]],
+        # 생성 작업의 claimed 행에는 id가 있다. 없으면(직접 구성한 행) 모든 완료 턴과 비교한다.
+        scene_user_edited=repository.scene_user_edited(conn, session_id, generation.get("id")),
     )
 
 

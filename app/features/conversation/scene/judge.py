@@ -11,7 +11,11 @@ from time import monotonic
 
 from app.core.config import settings
 from app.features.conversation.messaging import providers
-from app.features.conversation.messaging.prompt import PromptContext, label_parts
+from app.features.conversation.messaging.prompt import (
+    SCENE_USER_EDITED_NOTE,
+    PromptContext,
+    label_parts,
+)
 from app.features.conversation.scene.rules import ScenePatch, evidence_found, parse_judgement
 
 logger = logging.getLogger(__name__)
@@ -47,7 +51,8 @@ JUDGE_SYSTEM = "\n".join(
         (
             "- 장면의 기준은 이용자 캐릭터다. 장소·시각·날짜는 이용자 캐릭터가 있는 곳과 겪는 "
             "시간을 따른다. 다른 캐릭터만 다른 곳으로 떠나거나 다른 곳에 있다는 서술은 장소 "
-            "변화가 아니다. 이용자 캐릭터가 이동했을 때만 장소를 바꾼다."
+            "변화가 아니다. 이용자 캐릭터가 이동했을 때만 장소를 바꾼다. 이용자 캐릭터가 장면에 "
+            "나오지 않고 나레이터로만 진행하면 이야기가 이어지는 중심 장면을 따른다."
         ),
         (
             '- 시각: 시각이 분명히 바뀌었을 때만 쓴다(시각 언급, "한 시간 뒤", "다음 날 점심"'
@@ -100,7 +105,9 @@ def _value(value, suffix: str = "") -> str:
     return "미지정" if value is None or value == "" else f"{value}{suffix}"
 
 
-def describe_scene(scene: dict | None, character_states: list[dict]) -> str:
+def describe_scene(
+    scene: dict | None, character_states: list[dict], user_edited: bool = False
+) -> str:
     scene = scene or {}
     mode = scene.get("date_mode")
     lines = [f"날짜 방식: {DATE_MODE.get(mode, '없음(날짜를 다루지 않음)')}"]
@@ -125,6 +132,9 @@ def describe_scene(scene: dict | None, character_states: list[dict]) -> str:
             f"- {state['name']}: 착장 {_value(state.get('clothing'))} / "
             f"속마음 {_value(state.get('inner_thought'))}"
         )
+    if user_edited:
+        # 응답 요청과 같은 알림. 고친 장면을 지금 장면으로 보고 그 위에서 변화를 판단하게 한다.
+        lines.append(SCENE_USER_EDITED_NOTE)
     return "\n".join(lines)
 
 
@@ -133,7 +143,8 @@ def build_judge_messages(context: PromptContext, reply_text: str) -> list[dict]:
     content = "\n\n".join(
         [
             f"[이용자 캐릭터] {context.play_name or '이용자'}",
-            "[지금 저장된 장면]\n" + describe_scene(context.scene, context.character_states),
+            "[지금 저장된 장면]\n"
+            + describe_scene(context.scene, context.character_states, context.scene_user_edited),
             "[이번 턴 이용자 입력]\n" + user_turn,
             "[이번 턴 AI 응답]\n" + reply_text.strip(),
         ]

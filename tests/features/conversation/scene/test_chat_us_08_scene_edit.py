@@ -358,6 +358,7 @@ NO_DATE = {**ELAPSED, "reference_event": None, "elapsed_day": None}
             {"clothing": "셔츠\x00", "inner_thought": None},
             [("characters[0].clothing", "SCENE_TEXT_INVALID")],
         ),
+        ("calendar", {**CALENDAR, "place": "공\ud800원"}, None, [("place", "SCENE_TEXT_INVALID")]),
     ],
 )
 def test_chat_us_08_user_edit_invalid_values_are_rejected_without_change(
@@ -504,37 +505,93 @@ def test_chat_us_08_user_edit_blocked_while_generation_streaming(
     assert scene_snapshot(db, session) == seen["before"]
 
 
-def test_chat_us_08_user_edit_stale_generation_does_not_block(
-    client, db, session, recorder, deferred
-):
-    send(client, session, "멈춘 요청")
+def age_generations(db, session_id):
     db.execute(
         """UPDATE conversation_generations SET updated_at = clock_timestamp() - interval '1 day'
            WHERE session_id = %s""",
-        (session,),
+        (session_id,),
     )
-    response = put_scene(client, session, park_edit(client, session))
+
+
+def generation_state(db, generation_id):
+    row = db.execute(
+        "SELECT status, error_code FROM conversation_generations WHERE id = %s", (generation_id,)
+    ).fetchone()
+    return row["status"], row["error_code"]
+
+
+def test_chat_us_08_user_edit_stale_generation_does_not_block(
+    client, db, session, recorder, judge, deferred
+):
+    """멈춘 생성은 수정 전에 실패로 정리한다. 작업이 늦게 돌아도 고친 장면을 덮어쓰지 않는다."""
+    body = park_edit(client, session)
+    sent = send(client, session, "멈춘 요청")
+    assert sent.json()["status"] == "pending"
+    age_generations(db, session)
+    response = put_scene(client, session, body)
     assert response.status_code == 200, response.text
+    assert generation_state(db, sent.json()["id"]) == ("failed", "GENERATION_STALE")
+    edited = scene_snapshot(db, session)
+
+    # 늦게 집힌 작업: 이미 정리된 생성이라 실행하지 않고, 장면 판단도 적용하지 않는다.
+    judge.answers = [MOVE_TO_CAFE]
+    deferred.run()
+    assert recorder.requests == []
+    assert judge.requests == []
+    assert generation_state(db, sent.json()["id"]) == ("failed", "GENERATION_STALE")
+    assert scene_snapshot(db, session) == edited
+    assert [row["source"] for row in changes(db, session)] == ["user_edit"]
+
+
+def test_chat_us_08_user_edit_stale_streaming_generation_cannot_overwrite_edit(
+    client, db, session, judge, deferred, monkeypatch
+):
+    """응답 중 멈춘 것으로 보인 생성(작업은 살아 있음)이 수정 뒤에 완료 저장하지 못한다."""
+    body = park_edit(client, session)
+    seen = {}
+
+    class EditAfterStall:
+        def stream(self, request):
+            yield "@도경: 응답 "
+            age_generations(db, session)
+            seen["response"] = put_scene(client, session, body)
+            seen["edited"] = scene_snapshot(db, session)
+            yield "끝\n@나레이터: 다음 날 아침 공원 앞 카페로 갔다"
+
+    monkeypatch.setattr(providers, "get_provider", lambda: EditAfterStall())
+    judge.answers = [MOVE_TO_CAFE]
+    sent = send(client, session, "다음 날 아침 공원 앞 카페로 갔다.")
+    deferred.run()
+    assert seen["response"].status_code == 200, seen["response"].text
+    assert generation_state(db, sent.json()["id"]) == ("failed_partial", "GENERATION_STALE")
+    assert judge.requests == []
+    assert scene_snapshot(db, session) == seen["edited"]
+    assert [row["source"] for row in changes(db, session)] == ["user_edit"]
 
 
 # ---- 이용자 수정 뒤 AI 판단 ----
+
+MOVE_TO_CAFE = (
+    '{"changed": true, "place": "공원 앞 카페", "days_passed": 1, '
+    '"time": {"hour": 9, "minute": 30}, '
+    '"evidence": "다음 날 아침 공원 앞 카페로 갔다", "evidence_from": "user"}'
+)
+USER_EDITED_NOTE = "※ 이용자가 방금 이 장면을 직접 고쳤다. 앞 대화와 달라도 이 장면에서 이어 간다."
 
 
 def test_chat_us_08_user_edit_then_judge_continues_from_edited_scene(
     client, db, session, recorder, judge
 ):
     assert put_scene(client, session, park_edit(client, session)).status_code == 200
-    judge.answers = [
-        '{"changed": true, "place": "공원 앞 카페", "days_passed": 1, '
-        '"time": {"hour": 9, "minute": 30}, '
-        '"evidence": "다음 날 아침 공원 앞 카페로 갔다", "evidence_from": "user"}'
-    ]
+    judge.answers = [MOVE_TO_CAFE]
     sent = send(client, session, "다음 날 아침 공원 앞 카페로 갔다.")
     assert client.get(f"{GENERATIONS}/{sent.json()['id']}", headers=PLAYER).json()["status"] == (
         "completed"
     )
-    # 판단 요청도 고친 장면을 지금 장면으로 본다.
-    assert "장소: 공원\n" in judge.requests[0].messages[1]["content"]
+    # 판단 요청도 고친 장면을 지금 장면으로 보고, 직접 고쳤다는 알림을 받는다.
+    judged_scene = judge.requests[0].messages[1]["content"]
+    assert "장소: 공원\n" in judged_scene
+    assert USER_EDITED_NOTE in judged_scene
     scene = get_scene(client, session).json()
     assert (scene["month"], scene["day"], scene["hour"], scene["minute"], scene["place"]) == (
         11,
@@ -548,3 +605,76 @@ def test_chat_us_08_user_edit_then_judge_continues_from_edited_scene(
     assert (edit["source"], judged["source"]) == ("user_edit", "judge")
     assert judged["generation_id"] == sent.json()["id"]
     assert judged["before_state"] == edit["after_state"]
+
+
+def test_chat_us_08_user_edit_note_only_on_first_send_after_edit(client, db, session, recorder):
+    def scene_block():
+        return recorder.requests[-1].messages[-1]["content"].split("[현재 장면]\n")[1]
+
+    # 고친 적 없음: 알림 없음.
+    send(client, session, "첫 대화", request_id="turn-0001")
+    assert USER_EDITED_NOTE not in scene_block()
+
+    assert put_scene(client, session, park_edit(client, session)).status_code == 200
+    send(client, session, "고친 뒤 첫 전송", request_id="turn-0002")
+    assert scene_block().split("\n\n[이용자 입력]")[0].endswith("\n" + USER_EDITED_NOTE)
+    assert "장소: 공원" in scene_block()
+    assert all(USER_EDITED_NOTE not in m["content"] for m in recorder.requests[-1].messages[:-1])
+
+    # 고친 장면으로 한 턴이 완료된 뒤에는 알리지 않는다.
+    send(client, session, "다음 전송", request_id="turn-0003")
+    assert USER_EDITED_NOTE not in scene_block()
+    assert "장소: 공원" in scene_block()
+
+
+def test_chat_us_08_user_edit_note_kept_until_a_turn_completes(client, db, session, monkeypatch):
+    """고친 뒤 첫 턴이 실패하면 다시 시도한 요청에도 알림이 남는다(완료 턴이 아직 없으므로)."""
+    requests = []
+
+    class FailOnce:
+        def stream(self, request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise providers.ProviderError("STREAM_INTERRUPTED")
+            yield "@도경: 응답"
+
+    monkeypatch.setattr(providers, "get_provider", lambda: FailOnce())
+    assert put_scene(client, session, park_edit(client, session)).status_code == 200
+    failed = send(client, session, "고친 뒤 첫 전송").json()
+    retried = client.post(
+        f"{GENERATIONS}/{failed['id']}/retry", json={"request_id": "retry-0001"}, headers=PLAYER
+    )
+    assert retried.status_code in (200, 201, 202), retried.text
+    assert [USER_EDITED_NOTE in r.messages[-1]["content"] for r in requests] == [True, True]
+
+
+def test_chat_us_08_user_edit_reports_character_and_scene_issues_together(client, db, session):
+    before = scene_snapshot(db, session)
+    body = {
+        **PARK_EDIT,
+        "day": 31,
+        "month": 2,
+        "characters": [{"id": 2**40, "clothing": "가" * 301, "inner_thought": None}],
+    }
+    response = put_scene(client, session, body)
+    assert response.status_code == 422
+    assert response.json()["code"] == "CONVERSATION_SCENE_CHARACTER_INVALID"
+    assert [(i["field"], i["code"]) for i in response.json()["issues"]] == [
+        ("day", "SCENE_VALUE_OUT_OF_RANGE"),
+        ("characters[0].clothing", "SCENE_TEXT_TOO_LONG"),
+        ("characters[0].id", "SCENE_CHARACTER_NOT_FOUND"),
+    ]
+    assert scene_snapshot(db, session) == before
+
+
+def test_chat_us_08_user_edit_characters_list_is_bounded(client, db, session):
+    own = character_ids(client, session)["도경"]
+    row = {"id": own, "clothing": None, "inner_thought": None}
+    before = scene_snapshot(db, session)
+    response = put_scene(client, session, {**PARK_EDIT, "characters": [row] * 101})
+    assert response.status_code == 422
+    assert response.json()["code"] == "VALIDATION_ERROR"
+    assert scene_snapshot(db, session) == before
+    # 100개까지는 형식 검사를 지나 중복 ID로 거절된다.
+    response = put_scene(client, session, {**PARK_EDIT, "characters": [row] * 100})
+    assert response.json()["code"] == "CONVERSATION_SCENE_CHARACTER_INVALID"

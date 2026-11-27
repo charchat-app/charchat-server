@@ -3,7 +3,7 @@
 import pytest
 
 from app.features.conversation.messaging.prompt import PromptContext, PromptPart
-from app.features.conversation.scene.judge import build_judge_messages
+from app.features.conversation.scene.judge import build_judge_messages, describe_scene
 from app.features.conversation.scene.rules import (
     CharacterPatch,
     ScenePatch,
@@ -280,8 +280,17 @@ def test_chat_us_08_judge_anchors_scene_to_user_character():
     rule = (
         "- 장면의 기준은 이용자 캐릭터다. 장소·시각·날짜는 이용자 캐릭터가 있는 곳과 겪는 "
         "시간을 따른다. 다른 캐릭터만 다른 곳으로 떠나거나 다른 곳에 있다는 서술은 장소 "
-        "변화가 아니다. 이용자 캐릭터가 이동했을 때만 장소를 바꾼다."
+        "변화가 아니다. 이용자 캐릭터가 이동했을 때만 장소를 바꾼다. 이용자 캐릭터가 장면에 "
+        "나오지 않고 나레이터로만 진행하면 이야기가 이어지는 중심 장면을 따른다."
     )
     assert rule in system
     lines = system.splitlines()
     assert lines[lines.index(rule) - 1].startswith("- 장소: 다른 곳으로 이동한 것이 분명할 때만")
+
+
+def test_chat_us_08_user_edit_note_in_judge_scene_only_when_edited():
+    note = "※ 이용자가 방금 이 장면을 직접 고쳤다. 앞 대화와 달라도 이 장면에서 이어 간다."
+    states = [{"name": "도경", "clothing": "회색 셔츠", "inner_thought": None}]
+    edited = describe_scene({"place": "공원"}, states, user_edited=True)
+    assert edited.endswith("- 도경: 착장 회색 셔츠 / 속마음 미지정\n" + note)
+    assert note not in describe_scene({"place": "공원"}, states)

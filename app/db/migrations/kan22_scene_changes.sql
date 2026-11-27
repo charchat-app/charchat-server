@@ -2,6 +2,9 @@
 -- 서버 배포 전에 기존 DB에 독립적으로 적용한다. 기존 표는 바꾸지 않고 새 표 하나만 더한다.
 -- 다시 실행해도 결과가 같다. 같은 이름의 표가 다른 모양으로 있으면 예외로 전체를 되돌린다.
 -- 되돌리기: 서버를 이전 버전으로 돌린 뒤 DROP TABLE public.conversation_scene_changes;
+-- 이전 모양(source 열 없음)을 이미 적용한 로컬·개발 DB는 "unexpected columns"로 멈춘다. 그 DB는
+-- 위 DROP TABLE 뒤에 다시 적용한다(공용 DB에는 아직 적용 전이라 올리는 경로를 두지 않는다).
+-- 정의 검사는 DB 기본 정렬(로캘)에 기대지 않게 COLLATE "C"(바이트 순)로 모아 비교한다.
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 SET LOCAL statement_timeout = '60s';
@@ -21,7 +24,7 @@ CREATE TABLE IF NOT EXISTS public.conversation_scene_changes (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     session_id bigint NOT NULL REFERENCES public.conversation_sessions(id) ON DELETE CASCADE,
     -- judge = AI 판단(생성·메시지·근거 있음), user_edit = 이용자 직접 수정(모두 없음)
-    source text NOT NULL DEFAULT 'judge' CHECK (source IN ('judge', 'user_edit')),
+    source text NOT NULL CHECK (source IN ('judge', 'user_edit')),
     generation_id bigint REFERENCES public.conversation_generations(id),
     assistant_message_id bigint,
     evidence_message_id bigint,
@@ -50,7 +53,7 @@ BEGIN
     SELECT string_agg(
                format('%s %s%s', a.attname, format_type(a.atttypid, a.atttypmod),
                       CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END),
-               ',' ORDER BY a.attname)
+               ',' ORDER BY a.attname COLLATE "C")
       INTO actual
       FROM pg_attribute a
      WHERE a.attrelid = 'public.conversation_scene_changes'::regclass
@@ -58,19 +61,20 @@ BEGIN
     IF actual IS DISTINCT FROM expected THEN
         RAISE EXCEPTION 'KAN-22: conversation_scene_changes has unexpected columns: %', actual;
     END IF;
-    SELECT string_agg(pg_get_constraintdef(c.oid), ' | ' ORDER BY pg_get_constraintdef(c.oid))
+    SELECT string_agg(pg_get_constraintdef(c.oid), ' | '
+                      ORDER BY pg_get_constraintdef(c.oid) COLLATE "C")
       INTO actual
       FROM pg_constraint c
      WHERE c.conrelid = 'public.conversation_scene_changes'::regclass
        AND c.contype <> 'n';  -- PostgreSQL 18의 NOT NULL 제약은 컬럼 검사에서 이미 본다
     IF actual IS DISTINCT FROM
-        'CHECK ((evidence_from = ANY (ARRAY[''user''::text, ''assistant''::text])))'
-        || ' | CHECK ((source = ANY (ARRAY[''judge''::text, ''user_edit''::text])))'
-        || ' | CHECK ((((source = ''judge''::text) AND (generation_id IS NOT NULL)'
+        'CHECK ((((source = ''judge''::text) AND (generation_id IS NOT NULL)'
         || ' AND (assistant_message_id IS NOT NULL) AND (evidence_message_id IS NOT NULL)'
         || ' AND (evidence_from IS NOT NULL)) OR ((source = ''user_edit''::text)'
         || ' AND (generation_id IS NULL) AND (assistant_message_id IS NULL)'
         || ' AND (evidence_message_id IS NULL) AND (evidence_from IS NULL))))'
+        || ' | CHECK ((evidence_from = ANY (ARRAY[''user''::text, ''assistant''::text])))'
+        || ' | CHECK ((source = ANY (ARRAY[''judge''::text, ''user_edit''::text])))'
         || ' | FOREIGN KEY (generation_id) REFERENCES conversation_generations(id)'
         || ' | FOREIGN KEY (session_id) REFERENCES conversation_sessions(id) ON DELETE CASCADE'
         || ' | PRIMARY KEY (id)' THEN

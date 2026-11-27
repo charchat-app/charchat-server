@@ -835,7 +835,7 @@ CREATE TABLE auth_login_attempts (
 CREATE TABLE public.conversation_scene_changes (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     session_id bigint NOT NULL REFERENCES public.conversation_sessions(id) ON DELETE CASCADE,
-    source text NOT NULL DEFAULT 'judge' CHECK (source IN ('judge', 'user_edit')),
+    source text NOT NULL CHECK (source IN ('judge', 'user_edit')),
     generation_id bigint REFERENCES public.conversation_generations(id),
     assistant_message_id bigint,
     evidence_message_id bigint,

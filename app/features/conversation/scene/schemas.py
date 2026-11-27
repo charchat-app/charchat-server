@@ -6,9 +6,12 @@
 범위·글자 수·날짜 방식별 규칙은 세션 값이 필요해 서비스에서 검사한다(CONVERSATION_SCENE_INVALID).
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+
+# 한 요청에 고칠 수 있는 캐릭터 수 상한(요청 크기 제한).
+CHARACTERS_MAX = 100
 
 
 class SceneCharacterResponse(BaseModel):
@@ -57,5 +60,5 @@ class SceneUpdateRequest(BaseModel):
     hour: StrictInt | None
     minute: StrictInt | None
     place: StrictStr | None
-    # 목록에 없는 캐릭터는 그대로 둔다.
-    characters: list[SceneCharacterUpdateRequest]
+    # 목록에 없는 캐릭터는 그대로 둔다. 같은 ID는 한 번만 올 수 있어 세션 캐릭터 수를 넘지 않는다.
+    characters: Annotated[list[SceneCharacterUpdateRequest], Field(max_length=CHARACTERS_MAX)]

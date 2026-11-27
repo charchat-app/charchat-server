@@ -388,6 +388,21 @@ def get_scene(conn: Connection, session_id: int):
     ).fetchone()
 
 
+def scene_user_edited(conn: Connection, session_id: int, generation_id: int | None) -> bool:
+    """CHAT-US-08: 마지막 장면 변경이 이용자 직접 수정이고, 이번 생성을 뺀 마지막 완료 턴 뒤인지."""
+    row = conn.execute(
+        """SELECT c.source = 'user_edit' AND c.created_at > COALESCE(
+                      (SELECT max(g.updated_at) FROM conversation_generations g
+                       WHERE g.session_id = %(session)s AND g.status = 'completed'
+                         AND g.id IS DISTINCT FROM %(generation)s),
+                      '-infinity'::timestamptz) AS edited
+           FROM conversation_scene_changes c WHERE c.session_id = %(session)s
+           ORDER BY c.id DESC LIMIT 1""",
+        {"session": session_id, "generation": generation_id},
+    ).fetchone()
+    return bool(row and row["edited"])
+
+
 def list_affinities(conn: Connection, session_id: int):
     return conn.execute(
         """SELECT src.name_snapshot AS source, a.target_kind, dst.name_snapshot AS target,

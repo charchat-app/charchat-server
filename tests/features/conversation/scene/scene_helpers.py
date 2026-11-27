@@ -1,5 +1,7 @@
 """CHAT-US-08 장면 조회·직접 수정 테스트 도우미(저장 스토리·요청·가짜 공급자). 외부 호출 없음."""
 
+import json
+
 STORIES = "/api/v1/conversation/stories"
 SESSIONS = "/api/v1/conversation/sessions"
 GENERATIONS = "/api/v1/conversation/generations"
@@ -108,7 +110,12 @@ def get_scene(client, session_id, headers=PLAYER):
 
 
 def put_scene(client, session_id, body, headers=PLAYER):
-    return client.put(f"{SESSIONS}/{session_id}/scene", headers=headers, json=body)
+    # 짝 없는 서로게이트도 보낼 수 있게 ASCII 이스케이프 JSON으로 직접 보낸다(httpx json=은 UTF-8).
+    return client.put(
+        f"{SESSIONS}/{session_id}/scene",
+        headers={**headers, "Content-Type": "application/json"},
+        content=json.dumps(body),
+    )
 
 
 def editable(scene: dict) -> dict:

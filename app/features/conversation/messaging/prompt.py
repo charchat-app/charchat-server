@@ -43,8 +43,7 @@ def guardrail(play_name: str) -> str:
         "[현재 장면]은 지금의 날짜·시각·장소와 캐릭터별 착장·속마음이다. 이야기에서 이동이나 "
         "시간 경과가 분명히 서술되기 전까지 그 장면을 이어 가고, 근거 없이 다른 장소나 시간대로 "
         "건너뛰지 않는다. 그렇다고 장면을 멈춰 두지 않고 대화는 자연스럽게 진행한다. "
-        "[현재 장면]은 이용자 캐릭터가 있는 곳 기준이다. "
-        "[현재 장면]이 앞 대화와 다르면 [현재 장면]을 따른다(이용자가 장면을 직접 고쳤을 수 있다).",
+        "[현재 장면]은 이용자 캐릭터가 있는 곳 기준이다.",
         "착장과 속마음은 단순 정보가 아니라 응답에 반영할 지금의 상태다. 캐릭터의 행동·묘사는 "
         "지금 입은 옷과 어긋나지 않게 쓰고, 속마음은 그 캐릭터의 말투·태도·망설임·행동에 드러나게 "
         "한다. 속마음을 설명하듯 그대로 말하지는 않는다.",
@@ -183,6 +182,15 @@ class PromptContext:
     session_character_names: list[str]
     history: list[PromptHistoryMessage] = field(default_factory=list)
     current: list[PromptPart] = field(default_factory=list)
+    # CHAT-US-08: 지난 완료 턴 뒤에 이용자가 장면을 직접 고쳤다(이번 요청에만 알린다).
+    scene_user_edited: bool = False
+
+
+# 이용자가 장면을 직접 고친 뒤 첫 요청에서만 [현재 장면] 끝에 붙인다. 앞 대화와 장면이 달라도
+# 이 장면을 따르게 한다(판단이 놓친 이동까지 되돌리지 않도록 늘 붙이지는 않는다).
+SCENE_USER_EDITED_NOTE = (
+    "※ 이용자가 방금 이 장면을 직접 고쳤다. 앞 대화와 달라도 이 장면에서 이어 간다."
+)
 
 
 def _replace_user(text: str, play_name: str) -> str:
@@ -400,7 +408,8 @@ def _scene(ctx: PromptContext) -> str:
             lines.append(f"{state['name']} 착장: {state['clothing']}")
         if state.get("inner_thought"):
             lines.append(f"{state['name']} 속마음: {state['inner_thought']}")
-    return "\n".join(lines) if lines else "지정 없음"
+    text = "\n".join(lines) if lines else "지정 없음"
+    return f"{text}\n{SCENE_USER_EDITED_NOTE}" if ctx.scene_user_edited else text
 
 
 def build_first_block(ctx: PromptContext, include_scene: bool = True) -> str:
