@@ -460,6 +460,11 @@ def test_chat_us_08_ac01_guardrail_keeps_scene_until_change_is_stated():
 def test_chat_us_08_guardrail_scene_follows_user_character():
     guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
     assert "[현재 장면]은 이용자 캐릭터가 있는 곳 기준이다." in guide
+    # 실제 모델 시험(11-27): 이용자 캐릭터 혼자 편의점에 가도 책방에 남은 캐릭터 쪽을 이어 썼다.
+    assert (
+        "이용자 캐릭터가 다른 곳으로 가면 이야기도 이용자 캐릭터를 따라가 그곳에서 이어 쓰고, "
+        "남은 캐릭터 쪽에 머물지 않는다." in guide
+    )
 
 
 def test_chat_us_08_guardrail_uses_clothing_and_inner_thought_as_current_state():
@@ -522,12 +527,17 @@ def test_chat_us_08_info_block_rules_literal():
         "쓰지 않는다. 발화자 블록(@이름:)에는 info 내용을 쓰지 않는다.",
         "info는 이번 응답이 끝난 시점의 장면이다. 이번 응답에서 실제로 바뀐 것만 바꾸고, "
         "나머지는 [현재 장면] 값을 그대로 옮긴다. 계획·가정·회상은 장면을 바꾸지 않는다.",
-        "장면은 이용자 캐릭터(민서) 기준이다. 다른 캐릭터만 자리를 떠나면 장소는 그대로다.",
+        "장면은 이용자 캐릭터(민서) 기준이다. 다른 캐릭터만 자리를 떠나면 장소는 그대로다. "
+        "이용자 캐릭터(민서)가 다른 곳으로 가면 장소를 그곳으로 바꾼다.",
         "캐릭터 줄은 등장 캐릭터(도경, Bea)마다 한 줄씩 [이름]으로 쓰고, 값이 없는 항목은 -로 "
         "쓴다. 이용자 캐릭터(민서)의 줄은 쓰지 않는다.",
         "시간은 24시간제(19:30)로 쓰고, 분을 모르면 19시처럼 쓴다. "
         "[현재 장면]에 없는(미지정) 줄은 이야기에서 분명히 정해질 때만 채운다.",
         "글자 수: 장소 30자, 기준 사건 10자, 착장 300자, 속마음 100자 이내.",
+        # 실제 모델 시험(11-27): 그대로 옮기라는 말만 있으면 시간·속마음이 10턴 내내 멈췄다.
+        "그대로 옮긴다고 멈춰 두지는 않는다. 시간은 이번 응답 동안 흐른 만큼 앞으로 옮긴다"
+        "(몇 마디 대화면 몇 분, 식사·이동이면 그만큼). 시간을 되돌리지 않는다. "
+        "캐릭터의 감정·생각이 이번 응답에서 달라졌으면 속마음을 지금의 속마음으로 고친다.",
         # 블록이 같은 줄에 붙으면 말풍선에 남으므로 여는 줄은 새 줄에 따로 쓴다.
         "여는 줄 ```info는 발화자 블록이 끝난 뒤 새 줄에 따로 쓴다.",
         # 자리 표시·'미정'은 값이 아니다(info.py 규칙 10). 모르면 줄을 뺀다.
@@ -596,3 +606,14 @@ def test_chat_us_08_prompt_uses_one_word_for_time():
     system = build_messages(minimal_context(scene={"date_mode": "calendar", "hour": 9}))
     assert "시각" not in system[0]["content"]
     assert "시각" not in system[1]["content"]
+
+
+def test_chat_us_08_info_date_rule_advances_days_and_switches_reference_event():
+    # 실제 모델 시험(11-27): 규칙이 없으면 하룻밤·탈출 뒤에도 '감금 3일째'를 그대로 옮겼다.
+    elapsed = info_section(
+        scene={"date_mode": "elapsed", "reference_event": "감금", "elapsed_day": 3}
+    )
+    assert "밤이 지나 날이 바뀌면 하루를 늘린다(감금 3일째 → 감금 4일째)." in elapsed
+    assert "기준 사건을 그 사건으로 바꾸고 1일째로 쓴다(탈출 1일째)." in elapsed
+    calendar = info_section(scene={"date_mode": "calendar", "year": 2026, "month": 11, "day": 27})
+    assert "날이 바뀌면 그만큼 넘긴다(2월은 28일까지, 윤년 없음)." in calendar
