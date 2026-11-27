@@ -29,6 +29,7 @@ REFERENCE_EVENT_MAX_LENGTH = 10
 CLOTHING_MAX_LENGTH = 300
 INNER_THOUGHT_MAX_LENGTH = 100
 EVIDENCE_MAX_LENGTH = 500
+EVIDENCE_MIN_LENGTH = 4  # 공백·기호를 뺀 글자 수
 YEAR_MAX = 9999
 DAYS_PASSED_MAX = 3650
 SCENE_FIELDS = (
@@ -159,7 +160,10 @@ _NOISE = re.compile(r"[\s*\"'“”‘’.,!?…·~\-]+")
 def evidence_found(evidence: str, *sources: str) -> bool:
     """근거 문장이 이번 턴 입력이나 응답에 실제로 있는지(공백·기호를 빼고 비교)."""
     needle = _NOISE.sub("", evidence)
-    return bool(needle) and any(needle in _NOISE.sub("", source or "") for source in sources)
+    # 한두 글자는 아무 문장에나 들어 있으므로 근거로 보지 않는다.
+    return len(needle) >= EVIDENCE_MIN_LENGTH and any(
+        needle in _NOISE.sub("", source or "") for source in sources
+    )
 
 
 def advance_date(year: int | None, month: int, day: int, days: int):

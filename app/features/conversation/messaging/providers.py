@@ -182,8 +182,11 @@ class OpenAICompatibleProvider:
                 raise ProviderError("STREAM_INTERRUPTED", type(exc).__name__) from exc
 
 
-def get_provider() -> Provider:
-    """현재 설정의 공급자. 테스트는 이 함수를 바꿔 요청 내용을 기록하거나 실패를 흉내 낸다."""
+def get_provider(timeout: float | None = None) -> Provider:
+    """현재 설정의 공급자. 테스트는 이 함수를 바꿔 요청 내용을 기록하거나 실패를 흉내 낸다.
+
+    timeout을 주면 그 대기 시간(초)으로 만든다(CHAT-US-08 장면 판단).
+    """
     if settings.chat_llm_provider == "openai_compatible":
         if not settings.chat_llm_base_url:
             raise ProviderError("PROVIDER_NOT_CONFIGURED", "CHAT_LLM_BASE_URL을 설정하세요.")
@@ -192,6 +195,6 @@ def get_provider() -> Provider:
         return OpenAICompatibleProvider(
             settings.chat_llm_base_url,
             settings.chat_llm_api_key,
-            settings.chat_llm_timeout_seconds,
+            settings.chat_llm_timeout_seconds if timeout is None else timeout,
         )
     return FakeProvider(settings.chat_fake_chunk_delay_ms, settings.chat_fake_fail_mode)

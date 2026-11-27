@@ -53,7 +53,8 @@ BEGIN
     SELECT string_agg(pg_get_constraintdef(c.oid), ' | ' ORDER BY pg_get_constraintdef(c.oid))
       INTO actual
       FROM pg_constraint c
-     WHERE c.conrelid = 'public.conversation_scene_changes'::regclass;
+     WHERE c.conrelid = 'public.conversation_scene_changes'::regclass
+       AND c.contype <> 'n';  -- PostgreSQL 18의 NOT NULL 제약은 컬럼 검사에서 이미 본다
     IF actual IS DISTINCT FROM
         'CHECK ((evidence_from = ANY (ARRAY[''user''::text, ''assistant''::text])))'
         || ' | FOREIGN KEY (generation_id) REFERENCES conversation_generations(id)'

@@ -184,13 +184,13 @@ def test_chat_us_08_malformed_judgement_keeps_reply(client, db, session, judge):
     judge.answers = [
         (
             '{"changed": true, "characters": [{"name": ["도경"], "clothing": "x"}], '
-            '"evidence": "가자"}'
+            '"evidence": "같이 가자"}'
         ),
-        "[" * 5000 + "]" * 5000,
+        '{"changed": true, "x": ' + "[" * 50000 + "]" * 50000 + "}",  # RecursionError
     ]
     before = scene_row(db, session)
     for index in range(2):
-        response = send(client, session, [user_part("가자.")], request_id=f"bad-000{index}")
+        response = send(client, session, [user_part("같이 가자.")], request_id=f"bad-000{index}")
         assert generation_status(client, response) == "completed"
     assert scene_row(db, session) == before
     assert changes(db, session) == []
@@ -240,7 +240,7 @@ def test_chat_us_08_character_outfit_changes_only_that_character(client, db, ses
     assert (rows["도경"]["clothing"], rows["도경"]["inner_thought"]) == ("회색 셔츠", "피곤하다")
     assert rows["Bea"]["clothing"] is None
     (change,) = changes(db, session)
-    assert change["evidence_from"] == "assistant"
+    assert change["evidence_from"] == "user"  # 이용자가 쓴 나레이터 줄에서 찾은 근거
     assert scene_row(db, session)["place"] == "경찰서 옥상"
 
 
@@ -276,3 +276,18 @@ def test_chat_us_08_judge_sees_session_character_names(client, db, session, judg
     assert set(chars) == {"도경", "Bea"}
     send(client, session, [user_part("안녕.")])
     assert judge.requests[0].character_names == ["도경", "Bea"]
+
+
+def test_chat_us_08_evidence_source_is_where_it_was_found(client, db, session, judge):
+    # 판단이 "user"라고 해도 근거가 응답에만 있으면 응답 메시지를 근거로 남긴다.
+    judge.answers = [
+        '{"changed": true, "place": "옥상 계단", "evidence": "응답입니다", "evidence_from": "user"}'
+    ]
+    response = send(client, session, [user_part("배고프다.")])
+    (change,) = changes(db, session)
+    generation = db.execute(
+        "SELECT assistant_message_id FROM conversation_generations WHERE id = %s",
+        (response.json()["id"],),
+    ).fetchone()
+    assert change["evidence_from"] == "assistant"
+    assert change["evidence_message_id"] == generation["assistant_message_id"]

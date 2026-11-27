@@ -6,6 +6,7 @@
 """
 
 import logging
+from dataclasses import replace
 from time import monotonic
 
 from app.core.config import settings
@@ -136,16 +137,8 @@ def build_judge_messages(context: PromptContext, reply_text: str) -> list[dict]:
 
 
 def get_judge_provider() -> providers.Provider:
-    """판단 호출 공급자. 실제 공급자는 판단 전용 대기 시간으로 만든다. 테스트는 이 함수를 바꾼다."""
-    if settings.chat_llm_provider == "openai_compatible":
-        if not settings.chat_llm_base_url or not settings.chat_llm_api_key:
-            raise providers.ProviderError("PROVIDER_NOT_CONFIGURED", "장면 판단 공급자 설정 없음")
-        return providers.OpenAICompatibleProvider(
-            settings.chat_llm_base_url,
-            settings.chat_llm_api_key,
-            settings.chat_scene_judge_timeout_seconds,
-        )
-    return providers.get_provider()
+    """판단 호출 공급자(판단 전용 대기 시간). 테스트는 이 함수를 바꿔 판단 결과를 정한다."""
+    return providers.get_provider(timeout=settings.chat_scene_judge_timeout_seconds)
 
 
 def judge_turn(
@@ -176,12 +169,13 @@ def judge_turn(
         if patch is None:
             return None
         # 근거 문장은 이번 턴 입력이나 응답에 실제로 있어야 한다(지어낸 근거로 장면을 바꾸지 않게).
-        if not evidence_found(
-            patch.evidence, label_parts(context.current, context.play_name), reply_text
-        ):
-            logger.info("장면 판단 근거가 이번 턴에 없음: 장면을 바꾸지 않는다")
-            return None
-        return patch
+        # 근거 위치(이용자/응답)는 판단이 말한 값이 아니라 실제로 찾은 곳으로 정한다.
+        if evidence_found(patch.evidence, label_parts(context.current, context.play_name)):
+            return replace(patch, evidence_from="user")
+        if evidence_found(patch.evidence, reply_text):
+            return replace(patch, evidence_from="assistant")
+        logger.info("장면 판단 근거가 이번 턴에 없음: 장면을 바꾸지 않는다")
+        return None
     except Exception:
         logger.warning("장면 판단 실패: 장면을 바꾸지 않는다", exc_info=True)
         return None

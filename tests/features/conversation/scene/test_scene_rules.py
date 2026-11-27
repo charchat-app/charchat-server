@@ -247,6 +247,7 @@ def test_chat_us_08_year_never_passes_creation_limit():
         ("도경이 코트를 벗었다", ["코트 좀 벗어요.", "@도경: *도경이 코트를 벗었다.*"], True),
         ("둘은 바다로 갔다", ["카페에 있었다."], False),
         ("...", ["..."], False),
+        ("가자", ["가자."], False),  # 너무 짧은 근거
     ],
 )
 def test_chat_us_08_evidence_must_appear_in_this_turn(evidence, sources, found):
