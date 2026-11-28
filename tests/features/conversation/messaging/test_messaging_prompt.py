@@ -7,8 +7,10 @@ from app.features.conversation.messaging.prompt import (
     COMPOSITION_GUIDE,
     INFO_REMINDER,
     POINT_OF_VIEW_GUIDE,
+    SCENE_UNSPECIFIED_RULE,
     STYLE_GUIDE,
     TENSE_GUIDE,
+    UNSPECIFIED_NOTE,
     PromptContext,
     PromptHistoryMessage,
     PromptPart,
@@ -79,7 +81,8 @@ def test_chat_us_02_ac11_pure_later_turn_history_then_new_input():
     # CHAT-US-08: 이후 턴에는 현재 장면이 첫 블록이 아니라 새 입력 바로 앞에 붙는다.
     assert "[현재 장면]" not in messages[1]["content"]
     assert messages[3]["content"] == (
-        f"[현재 장면]\n장소: 옥상\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
+        f"[현재 장면]\n장소: 옥상\n\n{UNSPECIFIED_NOTE.format(items='시간')}\n{INFO_REMINDER}"
+        "\n\n[이용자 입력]\n[민서] 지금 입력"
     )
     # 이용자 입력의 {{user}}는 바꾸지 않는다.
     later = build_messages(minimal_context(current=[PromptPart("user", "민서", "{{user}}")]))
@@ -678,7 +681,8 @@ def test_chat_us_08_info_reminder_sits_right_after_latest_scene_block():
     ):
         last = messages[-1]["content"]
         assert last.endswith(
-            f"[현재 장면]\n장소: 옥상\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
+            f"[현재 장면]\n장소: 옥상\n\n{UNSPECIFIED_NOTE.format(items='시간')}\n"
+            f"{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
         )
         # 알림은 최신 입력 앞 한 곳에만 있다(이력·시스템에는 없다).
         assert sum(m["content"].count(INFO_REMINDER) for m in messages) == 1
@@ -711,3 +715,69 @@ def test_chat_us_08_descriptions_do_not_fill_unspecified_scene_lines():
     )
     assert rule in section
     assert section.index("[현재 장면]에 없는(미지정) 줄은") < section.index(rule)
+
+
+def test_chat_us_08_ac08_note_names_unspecified_scene_items_before_latest_input():
+    # 검수(11-28): 장소·시간 미지정 이야기에서 루나가 설명 속 카페로 장면을 정하고 시각을 지어냈다.
+    # [현재 장면] 바로 뒤에 아직 정해지지 않은 항목을 이름으로 짚는다.
+    assert UNSPECIFIED_NOTE.format(items="시간, 장소") == (
+        "※ 아직 정해지지 않은 것: 시간, 장소. 이용자 입력이나 이야기에서 지금 그렇게 분명히 "
+        "정해지기 전에는 응답에서 먼저 정하지 않고 info에도 쓰지 않는다."
+    )
+    cases = [
+        ({}, "시간, 장소"),
+        ({"date_mode": "calendar"}, "날짜, 시간, 장소"),
+        ({"date_mode": "elapsed", "elapsed_day": 3, "hour": 9}, "장소"),
+        ({"date_mode": "calendar", "year": 2026, "month": 11, "day": 27, "place": "서점"}, "시간"),
+        # 날짜 방식이 없으면 날짜 줄을 쓰지 않으므로 날짜는 짚지 않는다.
+        ({"place": "서점", "hour": 19, "minute": None}, None),
+        # 0시도 정해진 시간이다. 공백뿐인 장소는 정해지지 않은 것이다.
+        ({"place": "서점", "hour": 0, "minute": 0}, None),
+        ({"place": "  \n ", "hour": 9}, "장소"),
+        (
+            {
+                "date_mode": "calendar",
+                "year": 2026,
+                "month": 11,
+                "day": 27,
+                "place": "서점",
+                "hour": 7,
+            },
+            None,
+        ),
+    ]
+    for scene, items in cases:
+        last = build_messages(minimal_context(scene=scene))[-1]["content"]
+        scene_part = last.split("[현재 장면]\n")[1].split("[이용자 입력]")[0]
+        if items is None:
+            assert "아직 정해지지 않은 것" not in last
+            assert scene_part.endswith(f"\n\n{INFO_REMINDER}\n\n")
+        else:
+            assert scene_part.endswith(
+                f"\n\n{UNSPECIFIED_NOTE.format(items=items)}\n{INFO_REMINDER}\n\n"
+            ), scene
+    # 이력이 있어도 최신 입력 앞 한 곳에만 있다.
+    history = [
+        PromptHistoryMessage("user", [PromptPart("user", "민서", "앞 입력")]),
+        PromptHistoryMessage("assistant", [PromptPart("narrator", None, "앞 응답")]),
+    ]
+    messages = build_messages(minimal_context(scene={}, history=history))
+    assert sum(m["content"].count("아직 정해지지 않은 것") for m in messages) == 1
+    assert "아직 정해지지 않은 것" in messages[-1]["content"]
+
+
+def test_chat_us_08_ac08_guardrail_does_not_pick_scene_from_descriptions():
+    system = build_messages(minimal_context())[0]["content"].split("## 지침")[1]
+    rule = (
+        "[현재 장면]에 장소나 시간이 없으면 응답에서 먼저 정하지 않는다. 세계관·캐릭터 설명에 "
+        "나오는 장소로 장면을 옮겨 시작하거나, 구체적인 시간을 지어내지 않는다. 이용자 입력이나 "
+        "이야기에서 지금 그곳·그 시간이라고 분명히 정해질 때까지 장소·시간은 정하지 않은 채로 "
+        "이어 쓴다. 다만 이용자가 데려가 달라고 이동을 맡겨 함께 도착했다면, 도착한 곳은 이름을 "
+        "붙여 분명히 쓴다."
+    )
+    assert SCENE_UNSPECIFIED_RULE == rule
+    assert f"- {rule}" in system
+    # 장면 지침 묶음(장면 유지 → 착장·속마음) 바로 뒤에 둔다.
+    lines = system.splitlines()
+    at = lines.index(f"- {rule}")
+    assert lines[at - 1].startswith("- 착장과 속마음은 단순 정보가 아니라")
