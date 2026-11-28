@@ -226,6 +226,69 @@ def list_messages(conn: Connection, session_id: int, before_position: int | None
     ).fetchall()
 
 
+def list_completed_texts(conn: Connection, session_id: int, before_position: int | None = None):
+    """CHAT-US-08: 정상 완료된 생성의 assistant 메시지 ID와 생성 원문(맨 끝 info 포함), 순서대로.
+
+    실패·일부 실패·진행 중 생성의 원문은 넣지 않는다. before_position이 있으면 그 앞 메시지만.
+    """
+    return conn.execute(
+        """SELECT m.id AS message_id, m.position, g.text
+           FROM conversation_generations g
+           JOIN conversation_messages m
+             ON m.session_id = g.session_id AND m.id = g.assistant_message_id
+           WHERE g.session_id = %s AND g.status = 'completed'
+             AND (%s::bigint IS NULL OR m.position < %s)
+           ORDER BY m.position""",
+        (session_id, before_position, before_position),
+    ).fetchall()
+
+
+def get_reply(conn: Connection, session_id: int, message_id: int):
+    """CHAT-US-08 info 수정 대상: 세션의 메시지와 (assistant면) 그 메시지를 만든 생성의 상태·원문.
+
+    생성이 없으면(이용자 메시지) generation_id·generation_status·text는 null이다.
+    """
+    return conn.execute(
+        """SELECT m.id, m.role, m.status, m.position,
+                  g.id AS generation_id, g.status AS generation_status, g.text
+           FROM conversation_messages m
+           LEFT JOIN conversation_generations g
+             ON g.session_id = m.session_id AND g.assistant_message_id = m.id
+           WHERE m.session_id = %s AND m.id = %s""",
+        (session_id, message_id),
+    ).fetchone()
+
+
+def get_latest_completed_reply_id(conn: Connection, session_id: int) -> int | None:
+    """CHAT-US-08: 정상 완료된 생성의 assistant 메시지 중 가장 뒤 것의 ID(없으면 None).
+
+    list_completed_texts(현재 장면을 만드는 응답 목록)의 마지막과 같은 조건이다.
+    """
+    row = conn.execute(
+        """SELECT m.id
+           FROM conversation_generations g
+           JOIN conversation_messages m
+             ON m.session_id = g.session_id AND m.id = g.assistant_message_id
+           WHERE g.session_id = %s AND g.status = 'completed'
+           ORDER BY m.position DESC LIMIT 1""",
+        (session_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def update_completed_text(conn: Connection, generation_id: int, text: str) -> bool:
+    """CHAT-US-08: 완료된 생성의 원문만 바꾼다(info 수정). 상태·청구·시각(updated_at)은 그대로 둔다.
+
+    updated_at은 AI 메시지의 created_at으로 쓰이므로 바꾸지 않는다. 완료가 아니면 False.
+    """
+    row = conn.execute(
+        """UPDATE conversation_generations SET text = %s
+           WHERE id = %s AND status = 'completed' RETURNING id""",
+        (text, generation_id),
+    ).fetchone()
+    return row is not None
+
+
 def list_parts(conn: Connection, session_id: int, message_ids: list[int]) -> dict[int, list]:
     """메시지 ID → 부분 목록(작성 순서). 키 character_id는 세션 캐릭터 ID다."""
     parts: dict[int, list] = {message_id: [] for message_id in message_ids}
@@ -242,22 +305,35 @@ def list_parts(conn: Connection, session_id: int, message_ids: list[int]) -> dic
     return parts
 
 
-def expire_stale_generations(conn: Connection, session_id: int, stale_seconds: float) -> None:
-    """서버 중단 등으로 갱신이 멈춘 진행 중 생성을 실패로 정리해 세션이 막히지 않게 한다."""
+def lock_stale_generations(conn: Connection, session_id: int, stale_seconds: float):
+    """서버 중단 등으로 갱신이 멈춘 진행 중 생성(id, 원문)을 잠가 읽는다. 트랜잭션 안에서 부른다.
+
+    실패 상태(보이는 글이 있는지)는 서비스가 원문으로 정하고 expire_generation으로 바꾼다.
+    """
+    return conn.execute(
+        """SELECT id, text FROM conversation_generations
+           WHERE session_id = %s AND status IN ('pending', 'streaming')
+             AND updated_at < clock_timestamp() - make_interval(secs => %s)
+           ORDER BY id
+           FOR UPDATE""",
+        (session_id, stale_seconds),
+    ).fetchall()
+
+
+def expire_generation(conn: Connection, generation_id: int, status: str) -> None:
+    """lock_stale_generations로 잠근 생성을 GENERATION_STALE 실패로 끝낸다(assistant 메시지도)."""
     conn.execute(
         """WITH expired AS (
                UPDATE conversation_generations
-               SET status = CASE WHEN text = '' THEN 'failed' ELSE 'failed_partial' END,
-                   error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
-               WHERE session_id = %s AND status IN ('pending', 'streaming')
-                 AND updated_at < clock_timestamp() - make_interval(secs => %s)
-               RETURNING session_id, assistant_message_id, status
+               SET status = %s, error_code = 'GENERATION_STALE', updated_at = clock_timestamp()
+               WHERE id = %s AND status IN ('pending', 'streaming')
+               RETURNING session_id, assistant_message_id
            )
            UPDATE conversation_messages m
-           SET status = CASE e.status WHEN 'failed_partial' THEN 'interrupted' ELSE 'failed' END
+           SET status = %s
            FROM expired e
            WHERE m.session_id = e.session_id AND m.id = e.assistant_message_id""",
-        (session_id, stale_seconds),
+        (status, generation_id, MESSAGE_STATUS[status]),
     )
 
 

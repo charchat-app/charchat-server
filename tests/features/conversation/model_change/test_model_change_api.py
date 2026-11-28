@@ -476,7 +476,7 @@ def test_chat_us_13_ac03_retry_after_switch_uses_current_model_and_same_prompt(
         "- 도경: 무뚝뚝한 형사",
         "관계 파트너",
         "장소: 경찰서 옥상",
-        "도경 착장: 젖은 코트",
+        "[도경] 착장: 젖은 코트",
     ):
         assert expected in prompt
     assert generation_row(db, failed["id"])["model_id"] == luna
@@ -570,7 +570,7 @@ def test_chat_us_13_ac03_build_messages_identical_before_and_after_model_switch(
     after = messages()
     assert after == before
     prompt = "\n".join(m["content"] for m in after)
-    for expected in ("장소: 지하 주차장", "관계 파트너", "도경 속마음: 피곤하다", "[민서] 첫 대화"):
+    for expected in ("장소: 지하 주차장", "관계 파트너", "속마음: 피곤하다", "[민서] 첫 대화"):
         assert expected in prompt
 
 

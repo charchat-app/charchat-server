@@ -55,3 +55,15 @@ def send(client, session_id, parts, request_id="req-00000001", headers=PLAYER):
 
 def user_part(body):
     return {"speaker_kind": "user", "character_id": None, "body": body}
+
+
+def info_reply(body: str, info: str | None) -> list[str]:
+    """CHAT-US-08 응답 조각. info가 있으면 본문 뒤 맨 끝에 ```info 블록을 붙인다."""
+    text = body if info is None else f"{body}\n\n```info\n{info}\n```"
+    return [text[:10], text[10:]]
+
+
+def scene_block(request) -> str:
+    """CHAT-US-08: 모델 요청 마지막 user 메시지의 [현재 장면] 블록."""
+    content = request.messages[-1]["content"]
+    return "[현재 장면]\n" + content.split("[현재 장면]\n")[-1].split("\n\n")[0]

@@ -118,8 +118,8 @@ def iter_sse_content(
 
     `data: [DONE]` 또는 choice의 `finish_reason`을 받아야 정상 완료로 본다. 완료 신호 없이
     스트림이 끝나면(연결 끊김·프록시 절단 등) 응답이 잘렸을 수 있으므로 STREAM_INTERRUPTED로
-    실패시킨다. 이미 보낸 조각이 있으면 작업이 failed_partial, 없으면 failed로 기록하고
-    청구하지 않는다.
+    실패시킨다. 이미 보낸 조각에 보이는 글(맨 끝 info 블록 제외, service.has_visible_text)이
+    있으면 작업이 failed_partial, 없으면 failed로 기록하고 청구하지 않는다.
     """
     finished = False
     for raw in lines:

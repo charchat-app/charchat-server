@@ -5,6 +5,7 @@ from messaging_helpers import send, session_characters, user_part
 
 from app.features.conversation.messaging.prompt import (
     COMPOSITION_GUIDE,
+    INFO_REMINDER,
     POINT_OF_VIEW_GUIDE,
     STYLE_GUIDE,
     TENSE_GUIDE,
@@ -75,7 +76,11 @@ def test_chat_us_02_ac11_pure_later_turn_history_then_new_input():
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
     assert messages[1]["content"].endswith("[이용자 입력]\n[민서] 처음")
     assert messages[2]["content"] == "@도경: 답\n@나레이터: 서술"
-    assert messages[3]["content"] == "[민서] 지금 입력"
+    # CHAT-US-08: 이후 턴에는 현재 장면이 첫 블록이 아니라 새 입력 바로 앞에 붙는다.
+    assert "[현재 장면]" not in messages[1]["content"]
+    assert messages[3]["content"] == (
+        f"[현재 장면]\n장소: 옥상\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
+    )
     # 이용자 입력의 {{user}}는 바꾸지 않는다.
     later = build_messages(minimal_context(current=[PromptPart("user", "민서", "{{user}}")]))
     assert later[1]["content"].endswith("[민서] {{user}}")
@@ -129,11 +134,10 @@ def test_kan16_ac27_ac28_first_request_uses_saved_settings_in_order(client, db, 
         "[나레이터] 비가 내린다.",
         "[도경] 왔어, 민서?",
         "[현재 장면]",
-        "장소: 경찰서 옥상",
         "날짜: 2026년 11월 22일",
-        "시각: 21:05",
-        "도경 착장: 젖은 코트",
-        "도경 속마음: 피곤하다",
+        "시간: 21:05",
+        "장소: 경찰서 옥상",
+        "[도경] 착장: 젖은 코트 | 속마음: 피곤하다",
         "[이용자 입력]",
     )
     assert first.endswith(
@@ -192,7 +196,11 @@ def test_kan16_ac29_chat_us_02_ac11_second_request_rereads_latest_saved_settings
     assert messages[1]["content"].endswith("[이용자 입력]\n[민서] 첫 입력")
     # 저장된 이전 응답이 발화자·순서를 유지한 이력으로 들어간다(AC09·AC11).
     assert messages[2] == {"role": "assistant", "content": "@도경: 응답 1번\n@나레이터: 끝"}
-    assert messages[3] == {"role": "user", "content": "[민서] 두 번째"}
+    assert messages[3]["role"] == "user"
+    assert messages[3]["content"].startswith(
+        "[현재 장면]\n날짜: 2026년 11월 22일\n시간: 21:05\n장소: 경찰서 옥상"
+    )
+    assert messages[3]["content"].endswith("[이용자 입력]\n[민서] 두 번째")
     # 첫 요청은 당시 설정 그대로였다.
     assert "제목: 비 오는 도시" in first_request.messages[0]["content"]
 
@@ -481,3 +489,225 @@ def test_chat_us_06_ac11_balanced_guide_literal():
 
 def test_chat_us_06_ac06_first_person_format_example_uses_na():
     assert "*나는 창밖을 바라보았다.*" in system_for(point_of_view="first_person")
+
+
+def test_chat_us_08_ac01_guardrail_keeps_scene_until_change_is_stated():
+    guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
+    assert "[현재 장면]은 지금의 날짜·시간·장소와 캐릭터별 착장·속마음이다" in guide
+    assert "근거 없이 다른 장소나 시간대로" in guide
+    assert "장면을 멈춰 두지 않고 대화는 자연스럽게 진행한다" in guide
+
+
+def test_chat_us_08_guardrail_scene_follows_user_character():
+    guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
+    assert "[현재 장면]은 이용자 캐릭터가 있는 곳 기준이다." in guide
+    # 실제 모델 시험(11-27): 이용자 캐릭터 혼자 편의점에 가도 책방에 남은 캐릭터 쪽을 이어 썼다.
+    assert (
+        "이용자 캐릭터가 다른 곳으로 가면 이야기도 이용자 캐릭터를 따라가 그곳에서 이어 쓰고, "
+        "남은 캐릭터 쪽에 머물지 않는다." in guide
+    )
+
+
+def test_chat_us_08_guardrail_uses_clothing_and_inner_thought_as_current_state():
+    guide = build_messages(minimal_context())[0]["content"].split("## 기본 정보")[0]
+    assert (
+        "착장과 속마음은 단순 정보가 아니라 응답에 반영할 지금의 상태다. 캐릭터의 행동·묘사는 "
+        "지금 입은 옷과 어긋나지 않게 쓰고, 속마음은 그 캐릭터의 말투·태도·망설임·행동에 드러나게 "
+        "한다. 속마음을 설명하듯 그대로 말하지는 않는다."
+    ) in guide
+    # 장면 지침 바로 다음 줄이다.
+    lines = guide.splitlines()
+    scene_line = next(i for i, line in enumerate(lines) if line.startswith("- [현재 장면]은"))
+    assert lines[scene_line + 1].startswith("- 착장과 속마음은 단순 정보가 아니라")
+
+
+def test_chat_us_08_scene_block_uses_info_line_format_for_every_character():
+    states = [
+        {"name": "도경", "clothing": "젖은 코트", "inner_thought": "피곤하다"},
+        {"name": "Bea", "clothing": "노란 우비", "inner_thought": None},
+        {"name": "하린", "clothing": None, "inner_thought": None},
+    ]
+    scene = {"date_mode": "calendar", "year": 2026, "month": 11, "day": 27, "hour": 19}
+    scene |= {"minute": 30, "place": "헌책방"}
+    block = build_messages(minimal_context(scene=scene, character_states=states))[1]["content"]
+    assert block.endswith(
+        "[현재 장면]\n"
+        "날짜: 2026년 11월 27일\n"
+        "시간: 19:30\n"
+        "장소: 헌책방\n"
+        "[도경] 착장: 젖은 코트 | 속마음: 피곤하다\n"
+        "[Bea] 착장: 노란 우비 | 속마음: -\n"
+        "[하린] 착장: - | 속마음: -\n\n"
+        f"{INFO_REMINDER}\n\n"
+        "[이용자 입력]\n[민서] 지금 입력"
+    )
+
+
+def test_chat_us_08_scene_block_has_no_invented_defaults():
+    hour_only = build_messages(minimal_context(scene={"place": "옥상", "hour": 21, "minute": None}))
+    assert "시간: 21시" in hour_only[1]["content"]
+    assert "21:00" not in hour_only[1]["content"]
+    elapsed = build_messages(
+        minimal_context(scene={"date_mode": "elapsed", "reference_event": None, "elapsed_day": 3})
+    )
+    assert "날짜: 3일째" in elapsed[1]["content"]
+    assert "시작" not in elapsed[1]["content"].split("[현재 장면]")[1]
+    with_event = build_messages(
+        minimal_context(scene={"date_mode": "elapsed", "reference_event": "감금", "elapsed_day": 3})
+    )
+    assert "날짜: 감금 3일째" in with_event[1]["content"]
+
+
+def info_section(**overrides) -> str:
+    return build_messages(minimal_context(**overrides))[0]["content"].split("## 장면 정보(info)")[1]
+
+
+def test_chat_us_08_info_block_rules_literal():
+    section = info_section(session_character_names=["도경", "Bea"])
+    for literal in (
+        "매 응답의 맨 마지막에 아래 형식의 info 블록을 한 번 쓴다. info 블록 뒤에는 아무것도 "
+        "쓰지 않는다. 발화자 블록(@이름:)에는 info 내용을 쓰지 않는다.",
+        "info는 이번 응답이 끝난 시점의 장면이다. 이번 응답에서 실제로 바뀐 것만 바꾸고, "
+        "나머지는 [현재 장면] 값을 그대로 옮긴다. 계획·가정·회상은 장면을 바꾸지 않는다.",
+        "장면은 이용자 캐릭터(민서) 기준이다. 다른 캐릭터만 자리를 떠나면 장소는 그대로다. "
+        "이용자 캐릭터(민서)가 다른 곳으로 가면 장소를 그곳으로 바꾼다.",
+        "캐릭터 줄은 등장 캐릭터(도경, Bea)마다 한 줄씩 [이름]으로 쓰고, 값이 없는 항목은 -로 "
+        "쓴다. 이용자 캐릭터(민서)의 줄은 쓰지 않는다.",
+        "시간은 24시간제(19:30)로 쓰고, 분을 모르면 19시처럼 쓴다. "
+        "[현재 장면]에 없는(미지정) 줄은 이야기에서 분명히 정해질 때만 채운다.",
+        "글자 수: 장소 30자, 기준 사건 10자, 착장 300자, 속마음 100자 이내.",
+        # 실제 모델 시험(11-27): 그대로 옮기라는 말만 있으면 시간·속마음이 10턴 내내 멈췄다.
+        "그대로 옮긴다고 멈춰 두지는 않는다. 시간은 이번 응답 동안 흐른 만큼 앞으로 옮긴다"
+        "(몇 마디 대화면 몇 분, 식사·이동이면 그만큼). 시간을 되돌리지 않는다. "
+        "캐릭터의 감정·생각이 이번 응답에서 달라졌으면 속마음을 지금의 속마음으로 고친다.",
+        # 블록이 같은 줄에 붙으면 말풍선에 남으므로 여는 줄은 새 줄에 따로 쓴다.
+        "여는 줄 ```info는 발화자 블록이 끝난 뒤 새 줄에 따로 쓴다.",
+        # 자리 표시·'미정'은 값이 아니다(info.py 규칙 10). 모르면 줄을 뺀다.
+        "모르는 날짜·시간·장소 줄은 쓰지 않고 뺀다. 미정·모름·없음 같은 말이나 <...> 자리 "
+        "표시를 값으로 쓰지 않는다.",
+    ):
+        assert literal in section
+    # 형식 예시가 그대로 들어 있고 시스템 메시지의 맨 끝이다. <...>는 옮겨 쓰지 않는 자리다.
+    assert section.endswith(
+        "형식(<...>는 실제 값으로 바꿔 쓸 자리다. <...>를 그대로 옮겨 쓰지 않는다):\n"
+        "```info\n시간: <시>:<분>\n장소: <장소>\n"
+        "[도경] 착장: <착장> | 속마음: <속마음>\n[Bea] 착장: <착장> | 속마음: <속마음>\n```"
+    )
+    # 날짜 방식이 없는 세션은 날짜 줄을 쓰지 않는다.
+    assert "날짜 줄은 쓰지 않는다." in section
+    assert "날짜:" not in section
+
+
+def test_chat_us_08_info_block_date_line_follows_session_date_mode():
+    for mode, line in (
+        ("calendar", "날짜: <연>년 <월>월 <일>일"),
+        ("world", "날짜: <연호> <연>년 <월>월 <일>일"),
+        ("elapsed", "날짜: <기준 사건> <N>일째"),
+    ):
+        section = info_section(scene={"date_mode": mode})
+        assert f"```info\n{line}\n시간: <시>:<분>" in section
+        assert "날짜를 쓰는 방식은 바꾸지 않는다." in section
+        assert "날짜 줄은 쓰지 않는다." not in section
+
+
+def test_chat_us_08_response_length_excludes_info_block():
+    expression = build_messages(minimal_context())[0]["content"].split("## 표현 설정")[1]
+    expression = expression.split("## 이용자 캐릭터")[0]
+    assert "  맨 끝 info 블록은 분량에 포함하지 않는다." in expression
+
+
+def test_chat_us_08_info_is_not_in_first_block_or_history():
+    history = [
+        PromptHistoryMessage("user", [PromptPart("user", "민서", "앞 입력")]),
+        PromptHistoryMessage("assistant", [PromptPart("narrator", None, "앞 응답")]),
+    ]
+    messages = build_messages(minimal_context(history=history))
+    assert all("```info" not in m["content"] for m in messages[1:])
+    assert [m["content"].count("[현재 장면]") for m in messages[1:]] == [0, 0, 1]
+
+
+def test_chat_us_08_output_format_puts_info_block_last_without_contradiction():
+    output = build_messages(minimal_context())[0]["content"].split("## 출력 형식")[1]
+    output = output.split("## 장면 정보(info)")[0]
+    assert "발화자별 블록으로만" not in output
+    assert (
+        "응답은 발화자별 블록으로 쓰고, 맨 끝에 장면 정보(info) 블록 하나를 붙인다(형식은 "
+        "아래 장면 정보 규칙). 각 발화자 블록은 새 줄에서 `@이름: ` 태그로 시작한다."
+    ) in output
+
+
+def test_chat_us_08_info_block_is_required_even_though_history_hides_it():
+    # 이력의 앞 응답은 info를 뗀 말풍선이라, 매 응답에 info를 쓰라는 지침을 따로 둔다.
+    assert (
+        "대화 이력의 앞 응답들은 info 블록을 뗀 채로 보이지만, 이번 응답을 포함해 모든 응답 "
+        "끝에 info 블록을 빠짐없이 쓴다."
+    ) in info_section()
+
+
+def test_chat_us_08_prompt_uses_one_word_for_time():
+    system = build_messages(minimal_context(scene={"date_mode": "calendar", "hour": 9}))
+    assert "시각" not in system[0]["content"]
+    assert "시각" not in system[1]["content"]
+
+
+def test_chat_us_08_info_date_rule_advances_days_and_switches_reference_event():
+    # 실제 모델 시험(11-27): 규칙이 없으면 하룻밤·탈출 뒤에도 '감금 3일째'를 그대로 옮겼다.
+    elapsed = info_section(
+        scene={"date_mode": "elapsed", "reference_event": "감금", "elapsed_day": 3}
+    )
+    assert "밤이 지나 날이 바뀌면 하루를 늘린다(감금 3일째 → 감금 4일째)." in elapsed
+    assert "기준 사건을 그 사건으로 바꾸고 1일째로 쓴다(탈출 1일째)." in elapsed
+    calendar = info_section(scene={"date_mode": "calendar", "year": 2026, "month": 11, "day": 27})
+    assert "날이 바뀌면 그만큼 넘긴다(2월은 28일까지, 윤년 없음)." in calendar
+
+
+# ---- 실제 모델 65턴 실행 뒤 고친 문구(11-27) ----
+
+
+def test_chat_us_08_info_reminder_sits_right_after_latest_scene_block():
+    # 긴 대화에서 info 블록을 빠뜨리는 턴이 이어졌다.
+    # 최신 입력 바로 앞 [현재 장면] 뒤에 한 줄 알린다.
+    assert INFO_REMINDER == "※ 이번 응답의 맨 끝에도 info 블록을 한 번 쓴다."
+    history = [
+        PromptHistoryMessage("user", [PromptPart("user", "민서", "앞 입력")]),
+        PromptHistoryMessage("assistant", [PromptPart("narrator", None, "앞 응답")]),
+    ]
+    for messages in (
+        build_messages(minimal_context()),
+        build_messages(minimal_context(history=history)),
+    ):
+        last = messages[-1]["content"]
+        assert last.endswith(
+            f"[현재 장면]\n장소: 옥상\n\n{INFO_REMINDER}\n\n[이용자 입력]\n[민서] 지금 입력"
+        )
+        # 알림은 최신 입력 앞 한 곳에만 있다(이력·시스템에는 없다).
+        assert sum(m["content"].count(INFO_REMINDER) for m in messages) == 1
+
+
+def test_chat_us_08_world_date_rule_has_no_ad_year():
+    # 실제 모델이 '광무 2년 1898년 3월 3일'처럼 서기 연도를 덧붙여 날짜를 읽지 못했다.
+    section = info_section(scene={"date_mode": "world", "era": "광무", "year": 2, "month": 3})
+    assert (
+        "날짜는 [현재 장면] 날짜 줄과 똑같은 모양으로 연호, 그 연호의 연도, 월, 일만 쓴다"
+        "(광무 2년 3월 3일 모양). 서기 연도 같은 다른 연도를 따로 덧붙이지 않는다."
+    ) in section
+    assert "1898" not in section
+
+
+def test_chat_us_08_info_block_is_written_once_only_at_the_end():
+    # 실제 모델이 응답 중간에 info 블록을 한 번 더 썼다.
+    assert (
+        "info 블록은 응답 전체에서 정확히 한 번, 맨 끝에만 쓴다. 응답 중간(발화자 블록 사이)에는 "
+        "info 블록을 쓰지 않는다."
+    ) in info_section()
+
+
+def test_chat_us_08_descriptions_do_not_fill_unspecified_scene_lines():
+    # 장소·시간 미지정 이야기에서 첫 응답이 캐릭터 설명의 가게 이름을 장소로 채웠다.
+    section = info_section()
+    rule = (
+        "세계관이나 캐릭터 설명에 나오는 장소·시간은, 이야기에서 지금 그곳·그 시간이라고 정해지기 "
+        "전에는 미지정 줄을 채우지 않는다."
+    )
+    assert rule in section
+    assert section.index("[현재 장면]에 없는(미지정) 줄은") < section.index(rule)
