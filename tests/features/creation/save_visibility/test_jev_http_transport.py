@@ -19,15 +19,15 @@ from app.features.creation.save_visibility.jev_decisions import (
     DecisionsRequest,
     JevDecisionsEvaluator,
 )
+from app.features.creation.save_visibility.jev_http_transport import (
+    JevHttpTransport,
+    JevTransportError,
+)
 from app.features.creation.save_visibility.review_verdict import (
     Eligibility,
     EligibilityReason,
     EligibilityVerdict,
     unavailable,
-)
-from tests.features.creation.save_visibility.jev_http_transport import (
-    JevHttpTransport,
-    JevTransportError,
 )
 from tests.features.creation.save_visibility.test_jev_decisions import (
     encode,

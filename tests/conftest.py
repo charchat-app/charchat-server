@@ -3,20 +3,29 @@
 DB 테스트는 `TEST_DATABASE_URL`(이름이 `_test`로 끝나는 DB)에서만 돈다.
 세션 시작 시 public 스키마를 지우고 `app/db/schema.sql`로 다시 만들며, 테스트마다 데이터를 비운다.
 설정이 없으면 DB 테스트는 건너뛴다. 공용 DB를 가리키지 않는다.
+
+CREATE-US-08-AC02: `.env`나 셸에 `RATING_REVIEW_ENABLED=true`가 있어도 일반 pytest는 등급 검토를
+끈 채로 시작한다(픽스처 내용을 외부 평가기로 보내지 않는다). `app.main`은 import 때 기본 앱을
+만들므로 앱을 import하기 전에 환경변수로 덮어쓴다(환경변수가 `.env`보다 우선한다). 켜야 하는
+테스트는 가짜 전송과 함께 그 테스트 범위에서만 명시적으로 켠다(`test_rating_runtime.py`).
 """
 
-from collections.abc import Iterator
-from pathlib import Path
+import os
 
-import psycopg
-import pytest
-from fastapi.testclient import TestClient
-from psycopg import sql
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
-from psycopg.rows import dict_row
+os.environ["RATING_REVIEW_ENABLED"] = "false"
 
-from app.core.config import Settings, settings
-from app.main import create_app
+from collections.abc import Iterator  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import psycopg  # noqa: E402
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from psycopg import sql  # noqa: E402
+from psycopg.conninfo import conninfo_to_dict, make_conninfo  # noqa: E402
+from psycopg.rows import dict_row  # noqa: E402
+
+from app.core.config import Settings, settings  # noqa: E402
+from app.main import create_app  # noqa: E402
 
 SCHEMA_SQL = Path(__file__).resolve().parents[1] / "app" / "db" / "schema.sql"
 # schema.sql이 넣는 기준 데이터 표. 테스트마다 비우지 않는다.

@@ -14,9 +14,9 @@ import pytest
 from app.core.common_safety import CommonSafety
 from app.db import session
 from app.features.creation.save_visibility.jev_decisions import ENDPOINT
+from app.features.creation.save_visibility.jev_http_transport import JevHttpTransport
 from app.features.creation.save_visibility.jev_story_safety import QUESTION, build_request
 from tests.features.creation.save_visibility import jev_session_safety_live as live
-from tests.features.creation.save_visibility.jev_http_transport import JevHttpTransport
 from tests.features.creation.save_visibility.jev_session_safety_live import (
     EXPECTED_SURFACE,
     PLAY_NAME,
