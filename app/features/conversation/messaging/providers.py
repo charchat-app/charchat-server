@@ -152,10 +152,19 @@ def iter_sse_content(
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, base_url: str, api_key: str | None, timeout: float) -> None:
+    def __init__(
+        self, base_url: str, api_key: str | None, timeout: float, model_prefix: str = ""
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.model_prefix = model_prefix
+
+    def model_id(self, model: str) -> str:
+        """공급자에 보낼 모델 ID. 접두사가 이미 붙어 있으면 다시 붙이지 않는다."""
+        if not self.model_prefix or model.startswith(self.model_prefix):
+            return model
+        return f"{self.model_prefix}{model}"
 
     def stream(self, request: ProviderRequest) -> Iterator[str]:
         if request.provider not in SUPPORTED_PROVIDERS:
@@ -163,7 +172,7 @@ class OpenAICompatibleProvider:
                 "PROVIDER_NOT_CONFIGURED", f"지원하지 않는 공급자입니다: {request.provider}"
             )
         body = json.dumps(
-            {"model": request.model, "messages": request.messages, "stream": True}
+            {"model": self.model_id(request.model), "messages": request.messages, "stream": True}
         ).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if self.api_key:
@@ -193,5 +202,6 @@ def get_provider() -> Provider:
             settings.chat_llm_base_url,
             settings.chat_llm_api_key,
             settings.chat_llm_timeout_seconds,
+            settings.chat_llm_model_prefix,
         )
     return FakeProvider(settings.chat_fake_chunk_delay_ms, settings.chat_fake_fail_mode)
